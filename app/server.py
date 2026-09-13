@@ -3,6 +3,7 @@
 Инструменты поверх tc1c.TestClient. На Windows для NTLM используется SSPI.
 """
 import re, os, sys, glob, socket, time, base64, subprocess, inspect, typing, functools, threading
+from contextvars import ContextVar
 from mcp.server.fastmcp import FastMCP
 import tc1c
 import guids as G
@@ -44,24 +45,77 @@ _pool = _connections.Pool(_state)
 
 _ACTIONS = {}          # группа -> {действие: функция-обработчик}
 
+_SPREADSHEET_ACTIONS = frozenset({
+    'set_current_area', 'get_current_area_address', 'get_current_area_text',
+    'get_area_text', 'get_current_area_field', 'begin_edit_current_area',
+    'end_edit_current_area', 'included_in_merged_area', 'text_within_area_bounds',
+    'get_doc_area_horizontal_size', 'get_doc_area_vertical_size',
+})
+_spreadsheet_checked = ContextVar('spreadsheet_checked', default=None)
+
 def _action(group):
     """Пометить функцию действием группы. В MCP она сама НЕ регистрируется: группа публикуется
     одним инструментом (см. _register_groups). В модуле остаётся функция с той же сигнатурой и
     обычными dict, поэтому прямые Python-вызовы и внутренний контур записи работают как раньше.
 
-    Мутирующие действия оборачиваются предполётной проверкой цели ЗДЕСЬ, а не в диспетчере:
-    иначе защиту получал бы только MCP-путь, а документированные прямые вызовы (пример в README,
-    запись сценария) — нет."""
+    Проверка цели оборачивает мутирующее действие, чтобы работать и при вызове через MCP,
+    и при прямом Python-вызове, включая запись сценария."""
     def deco(fn):
         name = fn.__name__[3:]
         target = _verified(fn, name) if name in _VERIFY_ACTIONS else fn
         if name in ('expand', 'collapse', 'can_be_expanded', 'is_expanded',
                     'go_one_level_up', 'go_one_level_down'):
             target = _with_tree_criterion(target)
+        if name in _SPREADSHEET_ACTIONS:
+            target = _with_spreadsheet_target(target)
         target = _addressed(target, name)
+        target = _with_operation_errors(target)
         _ACTIONS.setdefault(group, {})[name] = target
         return target
     return deco
+
+
+def _with_operation_errors(fn):
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except tc1c.OperationError as exc:
+            return exc.result()
+    return wrapped
+
+
+def _with_spreadsheet_target(fn):
+    """Reject known incompatible editors before observation, input or recording."""
+    sig = inspect.signature(fn)
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        bound = sig.bind(*args, **kwargs)
+        key = bound.arguments.get('key')
+        c, error = _need_ver(TOOL_MIN_VERSION.get(fn.__name__, '8.3.1'))
+        if error:
+            return error
+        area = bound.arguments.get('area')
+        if (fn.__name__ in ('tc_get_area_text', 'tc_get_current_area_text')
+                and area and ':' in area and not _guid_available(c, G.INCLUDED_IN_MERGED_AREA)):
+            return _range_refused(key, area)
+        # MoxelEditField is the spreadsheet's editing subobject, not a tree child.
+        kind = 'SpreadsheetDocumentField' if _key_class(key) == 'MoxelEditField' else _kind_of(c, key)
+        if kind and kind != 'SpreadsheetDocumentField':
+            result = {'ok': False, 'target': key, 'code': 'unsupported_element_type',
+                      'kind': kind, 'error': 'This action requires a spreadsheet-document field.'}
+            if kind == 'TextDocumentField':
+                result['suggested_action'] = 'get_data_presentation'
+            elif kind in ('FormattedDocumentField', 'HTMLDocumentField'):
+                result['suggested_action'] = 'get_html'
+            return result
+        # Unknown types are not evidence of incompatibility (older clients/subobjects).
+        token = _spreadsheet_checked.set((c, key))
+        try:
+            return fn(*bound.args, **bound.kwargs)
+        finally:
+            _spreadsheet_checked.reset(token)
+    return wrapped
 
 class _TreeCriterionError(ValueError):
     def __init__(self, code, message):
@@ -131,7 +185,7 @@ def _vt(s):
 
 # Методы, после которых активное окно может смениться (открылась форма/диалог, закрылось
 # окно): кэш window_key после них недействителен — иначе следующая команда уйдёт старому окну.
-_WINDOW_CHANGING = {G.CLICK, G.START_CHOOSING, G.OPEN_FIELD, G.CREATE, G.CHOOSE_ROW,
+_WINDOW_CHANGING = {G.CLICK, G.CLICK_FIELD, G.CLICK_DECORATION, G.CLICK_CI, G.START_CHOOSING, G.OPEN_FIELD, G.CREATE, G.CHOOSE_ROW,
                     G.CLICK_HTML_DOC_HYPERLINK, G.CLICK_FORMATTED_DOC_HYPERLINK,
                     G.CLICK_FORMATTED_STRING_HYPERLINK, G.DELETE_ROW, G.COPY_ROW,
                     G.SWITCH_ROW_DELETE_MARK, G.EXECUTE_COMMAND, G.CLOSE,
@@ -160,9 +214,8 @@ def _need_ver(minv):
     return c, None
 
 # ================= предполётная проверка объекта-цели =======================
-# Кадр действия не несёт признака ошибки (Click=0x00, InputText=0x31 одинаково для реального и
-# выдуманного адреса), поэтому опечатка в адресе неотличима от успеха. Признак существования есть
-# только в кадрах ЧТЕНИЯ, и проверка делается отдельным read-кадром ПЕРЕД логической операцией.
+# CurrentVisible проверяет наличие и видимость цели до изменения состояния.
+# Отказы самой операции дополнительно обрабатываются в TestClient.send_cmd.
 VERIFY_TARGET = os.environ.get('TC1C_VERIFY_TARGET', 'true').strip().lower() \
                 not in ('false', '0', 'no', 'off')
 
@@ -203,6 +256,8 @@ def _verify_target(c, key, handle):
     try:
         c._track = None      # диагностический кадр — не действие пользователя, в запись не идёт
         r = c.send_cmd(G.CURRENT_VISIBLE, key, kind='read', middle=RS, handle=handle)
+    except tc1c.OperationError as exc:
+        return ('absent', None) if exc.status == 7 else ('unknown', None)
     except Exception:
         return 'unknown', None
     finally:
@@ -271,10 +326,13 @@ def _field_scalar_text(c, key, r, cmd):
         G.GET_PROPERTY: b'\x81\x81\x81\xe0\x4b\x53\x81\x20\x20\xa1\xa3',
     }
     tail = tails.get(cmd)
-    if (tail and r['raw'].startswith(b'\x42') and r['raw'].endswith(tail + tc1c.TR)
-            and _key_class(key) == 'EditField' and '.Table[' not in key
-            and _kind_of(c, key) == 'InputField'):
-        return ''
+    if tail and r['raw'].startswith(b'\x42') and r['raw'].endswith(tail + tc1c.TR):
+        cls = _key_class(key)
+        if cls == 'EditField' and '.Table[' not in key and _kind_of(c, key) == 'InputField':
+            return ''
+        if (cls == 'Additional' and cmd == G.GET_EDIT_TEXT
+                and _kind_of(c, key) == 'SearchStringRepresentation'):
+            return ''
     return None
 
 
@@ -362,7 +420,7 @@ _VERIFY_ACTIONS = frozenset({
 # Те же операции на уровне ПРОТОКОЛА — для воспроизведения сценария, где действие известно по
 # GUID, а не по имени инструмента. Перечни обязаны совпадать по составу операций.
 _VERIFY_GUIDS = frozenset({
-    G.INPUT_TEXT, G.INPUT_HTML, G.CLICK, G.SET_CHECK, G.CLEAR, G.CANCEL_EDIT, G.CREATE,
+    G.INPUT_TEXT, G.INPUT_HTML, G.CLICK, G.CLICK_FIELD, G.CLICK_DECORATION, G.CLICK_CI, G.SET_CHECK, G.CLEAR, G.CANCEL_EDIT, G.CREATE,
     G.OPEN_FIELD, G.START_CHOOSING, G.START_CHOOSING_FROM_CHOICE_LIST, G.SELECT_OPTION,
     G.GOTO_VALUE, G.INCREASE_VALUE, G.DECREASE_VALUE, G.ACTIVATE,
     G.OPEN_DROP_LIST, G.CLOSE_DROP_LIST, G.CHOOSE_FROM_DROP_LIST, G.EXECUTE_CHOICE_FROM_CHOICE_LIST,
@@ -460,10 +518,8 @@ _DOC_READS = ('get_html', 'get_doc_area_vertical_size', 'get_doc_area_horizontal
               'included_in_merged_area', 'text_within_area_bounds')
 
 def _doc_read(c, key, handle, result, empty):
-    """Ответ документного чтения. Пока результат содержательный, лишних кадров нет. Пустой ответ
-    объясняется видом элемента ОДНИМ адресованным кадром; законно пустой ответ настоящего
-    документа и неразрешённый вид оставляют ответ как есть."""
-    if not empty:
+    """Объяснить пустой ответ видом элемента, если его ещё не проверила обёртка действия."""
+    if not empty or _spreadsheet_checked.get() == (c, key):
         return result
     return _not_a_document(c, key, handle) or result
 
@@ -979,14 +1035,19 @@ def tc_connect(port: int, host: str = '127.0.0.1', version: str = None) -> str:
     A different host/port creates another connection. The same host/port reconnects that client;
     its connection_id is retained, but find elements again before using them."""
     c = tc1c.TestClient(host, port)
+    c._io_deadline = _state.get('_launch_deadline')
     if version:
         c.platform_version = version
     try:
         sess = c.connect()
         c.attach()                          # attach (программный кадр рукопожатия)
+        if getattr(c, 's', None) is not None:
+            c.s.settimeout(c._recv_timeout())
     except Exception:
         c.close()
         raise
+    finally:
+        c._io_deadline = None
     old = _state.get('client')
     if old is not None:
         old.close()
@@ -1086,7 +1147,7 @@ def tc_launch_client(base: str, port: int = None, server: bool = False, user: st
             return {'ok': False, 'pid': proc.pid,
                     'error': 'the test client exited (code %s) — check the base, credentials and flags'
                 % proc.returncode}
-        s = socket.socket(); s.settimeout(1)
+        s = socket.socket(); s.settimeout(max(0.001, min(1, deadline - time.monotonic())))
         try:
             if s.connect_ex(('127.0.0.1', port)) == 0:
                 up = True
@@ -1096,7 +1157,7 @@ def tc_launch_client(base: str, port: int = None, server: bool = False, user: st
             s.close()
         if up:
             break
-        time.sleep(0.5)
+        time.sleep(max(0, min(0.5, deadline - time.monotonic())))
     if not up:
         return {'ok': False, 'pid': proc.pid, 'error': 'the client did not start listening on port %d within %d s' % (port, wait)}
     out = {'ok': True, 'pid': proc.pid, 'port': port, 'exe': exe, 'version': version}
@@ -1106,6 +1167,9 @@ def tc_launch_client(base: str, port: int = None, server: bool = False, user: st
         # есть признак пригодности
         while True:
             try:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('Test-client startup deadline expired.')
+                _state['_launch_deadline'] = deadline
                 out['connected'] = tc_connect(port, version=version)
                 break
             except Exception as e:
@@ -1114,7 +1178,9 @@ def tc_launch_client(base: str, port: int = None, server: bool = False, user: st
                     out['ok'] = False
                     out['connect_error'] = str(e)
                     break
-                time.sleep(0.5)
+                time.sleep(max(0, min(0.5, deadline - time.monotonic())))
+            finally:
+                _state.pop('_launch_deadline', None)
     return out
 
 @_action('tc_session')
@@ -1204,8 +1270,10 @@ def tc_activate_window() -> dict:
     w = _window(c)
     if not w['key']:
         return {'ok': False, 'error': 'no active window'}
-    r = c.send_cmd(G.ACTIVATE, w['key'], kind='action', middle=b'')
-    return {'ok': r['ok'], 'window': w['key']}
+    ok = True
+    for kind in ('action', 'commit'):
+        ok = c.send_cmd(G.ACTIVATE, w['key'], kind=kind, middle=b'')['ok'] and ok
+    return {'ok': ok, 'window': w['key']}
 
 @_action('tc_app')
 def tc_get_child_objects(key: str = None) -> dict:
@@ -1224,7 +1292,7 @@ def tc_get_child_objects(key: str = None) -> dict:
         target = _window(c)['key']
     if not target:
         return {'ok': False, 'error': 'no object key'}
-    r = c.send_cmd(G.GET_CHILD_OBJECTS, target, kind='read', middle=CHILD_MIDDLE)
+    r = _read_children(c, target)
     return {'ok': r['ok'], 'parent': target, 'children': _coll(r, target)}
 
 # ============================== ввод / клик ==================================
@@ -1316,9 +1384,16 @@ def tc_input_text(key: str, text: str, handle: str, finish: bool = True) -> dict
     c = _need()
     guid, middle = _input_text_command(text, c, key)
     ok = True
-    for kind in ('action', 'commit'):
-        r = c.send_cmd(guid, key, kind=kind, middle=middle, handle=handle)
-        ok = ok and r['ok']
+    try:
+        for kind in ('action', 'commit'):
+            r = c.send_cmd(guid, key, kind=kind, middle=middle, handle=handle)
+            ok = ok and r['ok']
+    except tc1c.OperationError as exc:
+        if exc.status != 10 or _kind_of(c, key) != 'InputField':
+            raise
+        return dict(exc.result(), input_status='rejected', committed=None,
+                    suggested_action='start_choosing',
+                    message='Text input was refused. If this field selects an object, use start_choosing to select a value.')
     result = {'ok': ok, 'target': key, 'text': text}
     if ok and finish and text and _key_class(key) == 'EditField' and '.Table[' not in key:
         if _kind_of(c, key) == 'InputField':
@@ -1364,15 +1439,24 @@ def tc_activate(key: str, handle: str) -> dict:
         ok = c.send_cmd(G.ACTIVATE, key, kind=kind, middle=b'', handle=handle)['ok'] and ok
     return {'ok': ok, 'target': key, 'action': 'activate'}
 
+def _click_guid(key):
+    return {'Button': G.CLICK, 'EditField': G.CLICK_FIELD,
+            'Decoration': G.CLICK_DECORATION, 'CIButton': G.CLICK_CI}.get(_key_class(key))
+
+
 @_action('tc_field')
 def tc_click(key: str, handle: str) -> dict:
-    """Click a form element (button, cell, etc.). A click PRESSES the element; it does not make it
-    current — clicking a page does not switch to it and clicking a cell does not make it the
-    current cell. Use tc_activate for that."""
+    """Click a button, field, decoration or command-interface button. The element must support
+    clicking. To focus an input, table cell or page, use activate."""
     c = _need()
+    guid = _click_guid(key)
+    if guid is None:
+        return {'ok': False, 'target': key, 'code': 'unsupported_element_type',
+                'error': 'Click requires a button, field, decoration or command-interface button.',
+                'suggested_action': 'activate'}
     ok = True
     for kind in ('action', 'commit'):
-        r = c.send_cmd(G.CLICK, key, kind=kind, middle=b'', handle=handle)
+        r = c.send_cmd(guid, key, kind=kind, middle=b'', handle=handle)
         ok = ok and r['ok']
     _state['window_key'] = None          # клик мог открыть новое окно — кэш недействителен
     return {'ok': ok, 'target': key}
@@ -1397,10 +1481,20 @@ def tc_get_text(key: str, handle: str) -> dict:
     If text is unavailable, the answer explains the limitation and suggests another reading
     action where applicable. null does not confirm an empty field."""
     c = _need()
-    r = c.send_cmd(G.GET_DISPLAYED_TEXT, key, kind='read', middle=RS, handle=handle)
+    try:
+        r = c.send_cmd(G.GET_DISPLAYED_TEXT, key, kind='read', middle=RS, handle=handle)
+    except tc1c.OperationError as exc:
+        if exc.status not in (10, 17) and not (
+                exc.status == 11 and '.Table[' in key and _key_class(key) == 'EditField'):
+            raise
+        return _display_text_alternative(c, key, dict(exc.result(), text=None))
     result = {'ok': r['ok'], 'text': _field_scalar_text(c, key, r, G.GET_DISPLAYED_TEXT)}
     if result['text'] is not None or not r['ok']:
         return _unavailable_read(result, 'text')
+    return _display_text_alternative(c, key, result)
+
+
+def _display_text_alternative(c, key, result):
     if '.Table[' in key and _key_class(key) == 'EditField':
         return _unavailable_read(result, 'text', suggested_action='get_cell_text',
                                  message='Read this column through its table, using the column element name.')
@@ -1505,16 +1599,13 @@ def tc_get_selected_rows(key: str, handle: str) -> dict:
 
 @_action('tc_field')
 def tc_get_choice_list(key: str, handle: str) -> dict:
-    """Get a field's choice list. Read it while the drop-down list is OPEN: with the list closed the
-    answer is empty and status is 'unknown', which is normal, not an error. The answer describes
-    the list that is currently OPEN, not the element you addressed — with one field list open,
-    any other field key returns that same list with status='ok'. Open the list on the field you
-    are asking about (tc_open_drop_list) and read it immediately. 'items' holds {presentation,
-    text} per entry; 'presentations' is just their texts, which is exactly what
-    tc_choose_from_drop_list accepts."""
+    """Read radio-button options or an input's open drop-down list. For an input, open its list
+    immediately before reading: the answer describes whichever drop-down is currently open.
+    items contains {presentation, text}; presentations contains the displayed texts to select.
+    A closed input list may return items=[] with status=unknown."""
     c = _need()
     r = c.send_cmd(G.GET_CHOICE_LIST, key, kind='read818', middle=CHOICE_READ, handle=handle)
-    items, status = tc1c.decode_choice_items(_vals(r))
+    items, status = tc1c.decode_choice_items(r['raw'])
     return {'ok': r['ok'], 'target': key, 'items': items, 'status': status,
             'presentations': [i['text'] for i in items]}
 
@@ -1904,7 +1995,7 @@ def tc_end_edit_row(key: str, handle: str, cancel: bool = False) -> dict:
     c = _need()
     ok = True
     for kind in ('action', 'commit'):
-        mid = (b'\xe2' if (cancel and kind == 'action') else RS)
+        mid = b'\xe2' if cancel else RS
         ok = c.send_cmd(G.END_EDIT_ROW, key, kind=kind, middle=mid, handle=handle)['ok'] and ok
     return {'ok': ok, 'target': key, 'action': 'end_edit_row'}
 
@@ -1927,7 +2018,7 @@ def tc_expand(key: str, handle: str, row_column: str = None, row_value=None, sub
         guid, middle = G.EXPAND_TABLE, tc1c.mk_tree_middle(base, row_column, row_value)
     ok = True
     # Для узла таблицы действие применяется только после завершающего кадра.
-    for kind in (('action',) if is_group else ('action', 'commit')):
+    for kind in ('action', 'commit'):
         ok = c.send_cmd(guid, key, kind=kind, middle=middle, handle=handle,
                         pad=None if is_group else tc1c.tree_row_pad(row_column))['ok'] and ok
     return {'ok': ok, 'target': key, 'action': 'expand'}
@@ -1949,7 +2040,7 @@ def tc_collapse(key: str, handle: str, row_column: str = None, row_value=None) -
         guid = G.COLLAPSE_TABLE
         mid = tc1c.mk_tree_middle(RC, row_column, row_value)
     ok = True
-    for kind in (('action',) if is_group else ('action', 'commit')):
+    for kind in ('action', 'commit'):
         ok = c.send_cmd(guid, key, kind=kind, middle=mid, handle=handle,
                         pad=None if is_group else tc1c.tree_row_pad(row_column))['ok'] and ok
     return {'ok': ok, 'target': key, 'action': 'collapse'}
@@ -1981,39 +2072,33 @@ def _winkey(c):
 
 @_action('tc_window')
 def tc_goto_next_window() -> dict:
-    """Ask for the next application window. The command is accepted, but no measurement has shown it switching
-    anything: the platform runs it on the MAIN application window only, and that window is
-    not addressable here. To go to another window, activate its form —
-    tc_field(action="activate") on that window's ManagedForm key, measured to work both
-    ways."""
+    """Go to the next open window from the active main application window. The client returns an error if navigation is unavailable."""
     c = _need()
-    r = c.send_cmd(G.GOTO_NEXT_WINDOW, _winkey(c), kind='action', middle=b'')
+    wk = _winkey(c); ok = True
+    for kind in ('action', 'commit'):
+        ok = c.send_cmd(G.GOTO_NEXT_WINDOW, wk, kind=kind, middle=b'')['ok'] and ok
     _state['window_key'] = None          # активным стало ДРУГОЕ окно — кэш ключа недействителен
-    return {'ok': r['ok'], 'action': 'next_window'}
+    return {'ok': ok, 'action': 'next_window'}
 
 @_action('tc_window')
 def tc_goto_previous_window() -> dict:
-    """Ask for the previous application window. The command is accepted, but no measurement has shown it switching
-    anything: the platform runs it on the MAIN application window only, and that window is
-    not addressable here. To go to another window, activate its form —
-    tc_field(action="activate") on that window's ManagedForm key, measured to work both
-    ways."""
+    """Go to the previous open window from the active main application window. The client returns an error if navigation is unavailable."""
     c = _need()
-    r = c.send_cmd(G.GOTO_PREVIOUS_WINDOW, _winkey(c), kind='action', middle=b'')
+    wk = _winkey(c); ok = True
+    for kind in ('action', 'commit'):
+        ok = c.send_cmd(G.GOTO_PREVIOUS_WINDOW, wk, kind=kind, middle=b'')['ok'] and ok
     _state['window_key'] = None
-    return {'ok': r['ok'], 'action': 'prev_window'}
+    return {'ok': ok, 'action': 'prev_window'}
 
 @_action('tc_window')
 def tc_goto_start_page() -> dict:
-    """Ask for the start page. The command is accepted, but no measurement has shown it switching
-    anything: the platform runs it on the MAIN application window only, and that window is
-    not addressable here. To go to another window, activate its form —
-    tc_field(action="activate") on that window's ManagedForm key, measured to work both
-    ways."""
+    """Go to the start page from the active main application window. The client returns an error if navigation is unavailable."""
     c = _need()
-    r = c.send_cmd(G.GOTO_START_PAGE, _winkey(c), kind='action', middle=b'')
+    wk = _winkey(c); ok = True
+    for kind in ('action', 'commit'):
+        ok = c.send_cmd(G.GOTO_START_PAGE, wk, kind=kind, middle=b'')['ok'] and ok
     _state['window_key'] = None
-    return {'ok': r['ok'], 'action': 'start_page'}
+    return {'ok': ok, 'action': 'start_page'}
 
 @_action('tc_window')
 def tc_close_window() -> dict:
@@ -2076,7 +2161,15 @@ def tc_get_user_message_texts() -> dict:
     session: a complaint from an earlier attempt is still listed after a later attempt succeeded.
     To judge one action, call tc_close_user_messages_panel first, then the action, then this."""
     c = _need()
-    r = c.send_cmd(G.GET_USER_MESSAGE_TEXTS, _winkey(c), kind='read', middle=RC)
+    try:
+        r = c.send_cmd(G.GET_USER_MESSAGE_TEXTS, _winkey(c), kind='read', middle=RC)
+    except tc1c.OperationError as exc:
+        if exc.status != 17:
+            raise
+        return dict(exc.result(), code='user_messages_unavailable', messages=None,
+                    error='The user-message panel is unavailable in this window.',
+                    message='The message panel is closed or unavailable in this window. '
+                            'This does not establish that the last action had no validation errors.')
     vals = _vals(r)
     return {'ok': r['ok'], 'messages': vals}
 
@@ -2162,11 +2255,9 @@ def tc_execute_choice_from_list(key: str, index: int | str, handle: str) -> dict
 
 @_action('tc_form')
 def tc_execute_choice_from_menu(key: str, index: int | str, handle: str) -> dict:
-    """Pick an item from an OPEN menu by 0-based index or display text; nested submenus are not
-    supported. This works for a menu the form put up, and for the menu a spreadsheet document
-    raises over a cell that has DETAILS — address the form or the field, either reaches the
-    menu that is open. It selects from a menu that is ALREADY open: if none is, nothing happens.
-    On a spreadsheet-document field this needs platform 8.3.25 or newer."""
+    """Choose an item from an open menu by 0-based index or display text. For a submenu,
+    call again to choose its item. Address the form or the spreadsheet field that opened
+    the menu. A spreadsheet field requires platform 8.3.25 or newer."""
     c = _need()
     ok = True
     for kind in ('action', 'commit'):
@@ -2302,12 +2393,9 @@ def tc_get_current_area_field(key: str, handle: str) -> dict:
 
 @_action('tc_doc')
 def tc_begin_edit_current_area(key: str, handle: str) -> dict:
-    """Start editing the current spreadsheet-document area. Follow with input_text then
-    end_edit_current_area to commit a new cell value.
-    On a field that does NOT allow editing this does something else entirely: it runs the current
-    cell's DETAILS — the platform's drill-down. It opens the object behind the cell, or a field
-    chooser for a total, and choosing a row there gives the drill-down report. Set the current cell
-    with set_current_area first."""
+    """Start editing the current spreadsheet area; follow with input_text and end_edit_current_area.
+    In view mode this can instead open a drill-down menu, object or field chooser.
+    A menu may leave the active window unchanged; use execute_choice_from_menu to continue."""
     c = _need()
     ok = True
     for kind in ('action', 'commit'):
@@ -2419,7 +2507,12 @@ def _area_text_read(c, guid, key, handle, area):
     r = c.send_cmd(guid, key, kind='read', middle=mid, handle=handle)
     text = _area_value(_body(r), area, guid)
     if not rng:
-        return _doc_read(c, key, handle, {'ok': r['ok'], 'text': text}, text is None)
+        result = _doc_read(c, key, handle, {'ok': r['ok'], 'text': text}, text is None)
+        if 'text' in result:
+            return _unavailable_read(result, 'text', suggested_action='read_document',
+                                     message='No cell text is available; this does not establish that the area is empty. '
+                                             'Use read_document to locate readable cells.')
+        return result
     if text is None:
         return _doc_read(c, key, handle, _range_refused(key, area), True)
     merged, _ok = _merged_area(c, key, handle, area.split(':')[0])
@@ -2490,9 +2583,17 @@ def tc_current_check(key: str, handle: str) -> dict:
 
 @_action('tc_field')
 def tc_current_mode_is_edit(key: str, handle: str) -> dict:
-    """Whether a table is currently in edit mode."""
+    """Whether a table row or spreadsheet-document field is currently in edit mode."""
     c = _need()
-    r = c.send_cmd(G.CURRENT_MODE_IS_EDIT, key, kind='read', middle=RS, handle=handle)
+    cls = _key_class(key)
+    if cls == 'Table':
+        guid = G.CURRENT_MODE_IS_EDIT
+    elif cls == 'EditField' and _kind_of(c, key) == 'SpreadsheetDocumentField':
+        guid = G.CURRENT_MODE_IS_EDIT_FIELD
+    else:
+        return {'ok': False, 'target': key, 'code': 'unsupported_element_type',
+                'error': 'Edit mode can be read for a table row or spreadsheet-document field.'}
+    r = c.send_cmd(guid, key, kind='read', middle=RS, handle=handle)
     return {'ok': r['ok'], 'edit_mode': _scalar(r, _bool_from_resp)}
 
 @_action('tc_form')
@@ -2538,6 +2639,14 @@ def tc_start_choosing(key: str, handle: str) -> dict:
     """Open a reference field's choice form. Handles focus and table-cell editing.
     Returns opened and the active window; use that window to continue choosing."""
     c = _need()
+    if not _guid_available(c, G.CURRENT_VISIBLE):
+        # The native choice action predates the focus/edit-state inspection methods.
+        ok = True
+        for kind in ('action', 'commit'):
+            ok = c.send_cmd(G.START_CHOOSING, key, kind=kind, middle=b'', handle=handle)['ok'] and ok
+        _state['window_key'] = None
+        return {'ok': ok, 'target': key, 'opened': None,
+                'message': 'Choice requested; this platform cannot verify the opened window.'}
     stage = 'check_target'
     try:
         before = _cell_window(c)
@@ -2753,27 +2862,39 @@ def tc_get_cell_text(key: str, column: str | int, handle: str) -> dict:
     correct one; members of other kinds in the same group answer null instead."""
     c = _need()
     column = _as_index(column)          # '0' — это индекс, а не имя: имя не начинается с цифры
-    error = _column_error(c, key, column)
+    resolved = []
+    error = _column_error(c, key, column, resolved=resolved)
     if error:
         return error
     r = c.send_cmd(G.GET_CELL_TEXT, key, kind='read', middle=tc1c.mk_cell(column), handle=handle)
     decoded, text = tc1c.decode_cell_text(r['raw']) if r.get('ok') else (False, None)
-    if decoded:
-        return {'ok': True, 'column': column, 'text': text}
-    vals = _vals(r)
-    if vals and vals[-1] == column:
-        vals = vals[:-1]
-    text = vals[-1] if vals else _scalar_text_only_tail(r, G.GET_CELL_TEXT)
-    return {'ok': r['ok'], 'column': column, 'text': text}
+    if not decoded:
+        vals = _vals(r)
+        if vals and vals[-1] == column:
+            vals = vals[:-1]
+        text = vals[-1] if vals else _scalar_text_only_tail(r, G.GET_CELL_TEXT)
+    result = _unavailable_read({'ok': r['ok'], 'column': column, 'text': text}, 'text',
+                               message='No displayed cell text is available. The column may be hidden or the cell empty; '
+                                       'null alone does not distinguish these cases.')
+    if text is None and r['ok']:
+        if len(resolved) == 1:
+            result['suggested_call'] = {'tool': 'tc_field', 'arguments': {
+                'action': 'is_visible', 'key': resolved[0]['key'], 'handle': resolved[0]['handle']}}
+        else:
+            result['suggested_call'] = {'tool': 'tc_find', 'arguments': {
+                'action': 'find_objects', 'root_key': key}}
+    return result
 
 
-def _column_error(c, key, column):
+def _column_error(c, key, column, *, resolved=None):
     """Validate a column before reading or moving the cursor."""
     if _key_class(key) != 'Table':
         return {'ok': False, 'column': column, 'code': 'invalid_table', 'error': 'Address the table containing the cell.'}
     if isinstance(column, str):
         cols = _table_columns(c, key)
         matches = [o for o in cols if o.get('name') == column]
+        if resolved is not None:
+            resolved.extend(matches)
         if len(matches) != 1:
             result = {'ok': False, 'column': column,
                       'code': 'ambiguous_column' if matches else 'column_not_found',
@@ -2819,7 +2940,8 @@ def tc_goto_row(key: str, column: str | int = None, value=None, handle: str = No
                 direction: str = 'down', toggle_selection: bool = False, fields: dict = None) -> dict:
     """Go to the table row where column equals value (int or string; the wildcards * and ? work).
     column is the column TITLE; an index is not accepted here. Pass fields ({column: value}) to
-    match several columns at once. Seeks directly, so there is no need to walk rows. Matching is
+    match several columns at once; do not combine fields with column/value. Seeks directly,
+    so there is no need to walk rows. Matching is
     CASE-SENSITIVE and compares the value as SHOWN ("Встреча агента (Совещание)"), so a wildcard
     is often what you want. The search starts at the CURRENT row, runs in direction (down by
     default, or up) to the end of the list and does NOT wrap; the current row is itself a
@@ -2835,6 +2957,9 @@ def tc_goto_row(key: str, column: str | int = None, value=None, handle: str = No
     # индекса в критерии не принимает — отказываем внятно, а не питоновской ошибкой
     if _is_index(column):
         return {'ok': False, 'target': key, 'error': _COLUMN_BY_TITLE}
+    if fields is not None and (column is not None or value is not None):
+        return {'ok': False, 'target': key, 'code': 'conflicting_row_criteria',
+                'error': 'Use either fields or column/value. Put all search conditions in fields.'}
     pairs = list(fields.items()) if fields else ([(column, value)] if column is not None else [])
     mid = tc1c.mk_gotorow(fields=pairs, toggle_selection=toggle_selection, direction=direction)
     r = c.send_cmd(G.GOTO_ROW, key, kind='read', middle=mid,
@@ -2961,7 +3086,14 @@ def tc_get_linked_window(key: str, handle: str) -> dict:
     no linked window — but only when `target_check` says the button itself is there; a wrong key
     answers empty too, and the check is what tells the two apart."""
     c = _need()
-    r = c.send_cmd(G.GET_LINKED_WINDOW, key, kind='read', middle=RC, handle=handle)
+    try:
+        r = c.send_cmd(G.GET_LINKED_WINDOW, key, kind='read', middle=RC, handle=handle)
+    except tc1c.OperationError as exc:
+        # The native method also reports ObjectNotFound when the button exists
+        # but its linked window does not. Do not blame a valid button reference.
+        if exc.status == 7 and _key_class(key) == 'CIButton' and _ref_live_object(c, key) is not None:
+            return {'ok': True, 'target': key, 'target_check': 'present', 'window': []}
+        raise
     win = _coll(r, key)
     if win:
         return {'ok': r['ok'], 'target': key, 'window': win}
@@ -2990,17 +3122,31 @@ def tc_set_file_dialog_result(result: bool = True, filename: str | list = None,
     file, result=False to cancel. Pass a list of names to simulate a multi-file selection.
     filter_index selects which dialog filter is active (0-based).
     Replaces any previous pending answer. The next file dialog consumes it;
-    clear_file_dialog_result cancels an unused answer."""
+    clear_file_dialog_result cancels an unused answer. Call BEFORE opening the dialog;
+    this cannot answer a file dialog that is already open."""
     c = _need()
     middle = tc1c.mk_set_file_dialog_result(result, filename, filter_index)
-    cleared = c.send_cmd(G.CLEAR_FILE_DIALOG_RESULT, None, kind='commit', middle=b'')
+    try:
+        # Setting the next answer can succeed even while an already-open native dialog
+        # blocks normal commands. Check responsiveness before changing the pending answer.
+        ready = c.send_cmd(G.GET_ACTIVE_WINDOW, None, kind='read', middle=RC)
+        if not ready.get('ok'):
+            return {'ok': False, 'prepared': False, 'code': 'client_state_unavailable',
+                    'error': 'The client state could not be checked; no file selection was prepared.'}
+        cleared = c.send_cmd(G.CLEAR_FILE_DIALOG_RESULT, None, kind='commit', middle=b'')
+    except tc1c.OperationError as exc:
+        return dict(exc.result(), prepared=False)
     if not cleared.get('ok'):
-        return {'ok': False, 'code': 'file_dialog_reset_failed',
+        return {'ok': False, 'prepared': False, 'code': 'file_dialog_reset_failed',
                 'error': 'The previous file selection could not be cleared; no new selection was prepared.'}
-    r = c.send_cmd(G.SET_FILE_DIALOG_RESULT, None, kind='commit',
-                   middle=middle, pad=4)
+    try:
+        r = c.send_cmd(G.SET_FILE_DIALOG_RESULT, None, kind='commit',
+                       middle=middle, pad=4)
+    except tc1c.OperationError as exc:
+        return dict(exc.result(), prepared=False)
     return {'ok': r['ok'], 'result': result, 'filename': filename if result else None,
-            'filter_index': filter_index, 'replaces_pending': True}
+            'filter_index': filter_index, 'replaces_pending': True,
+            'prepared': bool(r['ok']), 'applies_to': 'next_dialog'}
 
 @_action('tc_app')
 def tc_clear_file_dialog_result() -> dict:
@@ -3043,7 +3189,8 @@ def _synth_step(guid, key, middle):
     """(guid, key, middle) -> (tag, attrs, fields) для uilog, либо None (не действие сценария)."""
     m = middle or b''
     def after(pfx): return m[len(pfx):] if m.startswith(pfx) else m
-    simple = {G.SET_CHECK: 'setCheck', G.CLICK: 'click', G.CLEAR: 'clear',
+    simple = {G.SET_CHECK: 'setCheck', G.CLICK: 'click', G.CLICK_FIELD: 'click',
+              G.CLICK_DECORATION: 'click', G.CLICK_CI: 'click', G.CLEAR: 'clear',
               G.INCREASE_VALUE: 'increaseValue', G.DECREASE_VALUE: 'decreaseValue',
               G.OPEN_DROP_LIST: 'openDropList', G.START_CHOOSING: 'startChoosing',
               G.CHOOSE_ROW: 'choose', G.ADD_ROW: 'addRow', G.DELETE_ROW: 'deleteRow',
@@ -3177,7 +3324,7 @@ def _synth_unhandled(tracked):
     return out
 
 def _synth_form_id(key):
-    m = re.search(r'ManagedForm\[[^\]]+\]', key or '')
+    m = re.search(r'(?:ManagedForm|UnmanagedForm)\[[^\]]+\]', key or '')
     return m.group(0) if m else (key or '')
 
 def _synth_elem(key):
@@ -3267,12 +3414,13 @@ def _synth_uilog(tracked):
         if i in confirms:
             attrs = dict(attrs); attrs['confirm'] = confirms[i]
         parsed.append({'form': _synth_form_id(key), 'elem': _synth_elem(key),
+                       'ci_path': key.split('.CI.', 1)[1] if _key_class(key) == 'CIButton' and '.CI.' in key else None,
                        # таблица — это САМА цель, а не любой предок: строка поиска живёт по адресу
                        # Table[Список].Additional[…] и таблицей не является
                        'table': bool(re.search(r'\.Table\[[^\]]+\]$', key or '')),
                        'tag': tag, 'attrs': attrs, 'fields': fields,
                        # получатель — сама форма: элемента с таким именем (UUID формы) не существует
-                       'formlevel': bool(re.search(r'ManagedForm\[[^\]]+\]$', key or ''))})
+                       'formlevel': bool(re.search(r'(?:ManagedForm|UnmanagedForm)\[[^\]]+\]$', key or ''))})
     out = ['<?xml version="1.0" encoding="UTF-8"?>', '<uilog xmlns:d1p1="http://v8.1c.ru/8.3/uilog">']
     st = {'win': False, 'form': object(), 'elem': None, 'etag': None}
     def close_elem():
@@ -3313,10 +3461,11 @@ def _synth_uilog(tracked):
             astr = ''.join(' %s=%s' % (k, quoteattr(str(v))) for k, v in (p['attrs'] or {}).items())
             out.append('\t\t\t<%s%s/>' % (p['tag'], astr)); continue
         etag = 'FormTable' if p['table'] else 'FormField'
-        if p['elem'] != st['elem'] or etag != st['etag']:
+        if p['elem'] != st['elem'] or etag != st['etag'] or p.get('ci_path') != st.get('ci_path'):
             close_elem()
-            out.append('\t\t\t<%s name=%s>' % (etag, quoteattr(p['elem'] or '')))
-            st['elem'] = p['elem']; st['etag'] = etag
+            locator = ' ciPath=%s' % quoteattr(p['ci_path']) if p.get('ci_path') else ''
+            out.append('\t\t\t<%s name=%s%s>' % (etag, quoteattr(p['elem'] or ''), locator))
+            st['elem'] = p['elem']; st['etag'] = etag; st['ci_path'] = p.get('ci_path')
         astr = ''.join(' %s=%s' % (k, quoteattr(str(v))) for k, v in (p['attrs'] or {}).items())
         if p['fields']:
             out.append('\t\t\t\t<%s%s>' % (p['tag'], astr))
@@ -3472,6 +3621,32 @@ def tc_record_cancel() -> dict:
 # ============ клиент-сторонний поиск (Find*/Wait*) — обход GetChildObjects ============
 # Эти методы НЕ имеют отдельного кадра протокола: штатный менеджер реализует их
 # рекурсивным обходом дерева + фильтром. Здесь — то же, композитно.
+def _read_children(c, key, *, observed=False):
+    """Preserve traversal failures except the native ordinary-form leaf case."""
+    try:
+        return c.send_cmd(G.GET_CHILD_OBJECTS, key, kind='read', middle=CHILD_MIDDLE)
+    except tc1c.OperationError as exc:
+        if exc.status not in (7, 17) or _key_class(key) not in ('Button', 'EditField'):
+            raise
+        parent = _collection_parent(key)
+        while parent and _key_class(parent) != 'UnmanagedForm':
+            parent = _collection_parent(parent)
+        # The native manager returns an empty collection for these leaves locally.
+        # A caller-supplied address still needs membership verification.
+        if exc.status == 7:
+            # Ordinary table label columns report ObjectNotFound for child enumeration,
+            # while their native GetChildObjects returns []. Recheck membership first.
+            if not parent or _key_class(key) != 'EditField':
+                raise
+            live = _ref_live_object(c, key)
+            if not live or live.get('type') != 'LabelField':
+                raise
+            return {'ok': True, 'raw': b''}
+        if parent and (observed or _ref_live_object(c, key) is not None):
+            return {'ok': True, 'raw': b''}
+        raise
+
+
 def _walk_tree(c, root_key=None):
     """Все подчинённые объекты (рекурсивно) от root_key (или активного окна)."""
     start = root_key or _window(c)['key']
@@ -3480,7 +3655,7 @@ def _walk_tree(c, root_key=None):
     seen = {start}; out = []; stack = [start]
     while stack:
         key = stack.pop()
-        r = c.send_cmd(G.GET_CHILD_OBJECTS, key, kind='read', middle=CHILD_MIDDLE)
+        r = _read_children(c, key, observed=key != start)
         if not r.get('ok'):
             raise RuntimeError('Could not read the complete element tree; retry the search.')
         for it in _coll(r, key):
@@ -3647,6 +3822,12 @@ def _empty_find_diag(cls, type, seen_classes, seen_types):
                             else 'and the server does not know it — check the spelling'))
     if notes:
         out['error_detail'] = '; '.join(notes)
+    if type and type in _collection.known_classes() and type not in _collection.known_types():
+        out['suggested_parameters'] = {'cls': type, 'type': None}
+        out['error_detail'] = '%r is an object class. Pass cls=%r and omit type.' % (type, type)
+    elif cls and cls in _collection.known_types() and cls not in _collection.known_classes():
+        out['suggested_parameters'] = {'cls': None, 'type': cls}
+        out['error_detail'] = '%r is an element type. Pass type=%r and omit cls.' % (cls, cls)
     return out
 
 
@@ -3737,8 +3918,9 @@ def _form_elements(c):
     if not wk:
         return {}
     def kids(key):
-        return _body(c.send_cmd(G.GET_CHILD_OBJECTS, key, kind='read', middle=CHILD_MIDDLE))
-    forms = [k for k in tc1c.extract_object_keys(kids(wk[0])) if 'ManagedForm' in k]
+        return _body(_read_children(c, key))
+    forms = [k for k in tc1c.extract_object_keys(kids(wk[0]))
+             if _key_class(k) in ('ManagedForm', 'UnmanagedForm')]
     if not forms:
         return {}
     out = {}; seen = set(); stack = [(forms[0], 0)]
@@ -3755,6 +3937,35 @@ def _form_elements(c):
                 stack.append((k, d + 1))
     return out
 
+def _command_interface_element(c, path):
+    """Resolve a recorded CI path against the current client's windows, without session IDs."""
+    if not isinstance(path, str) or _key_class(path) != 'CIButton':
+        return None
+    windows = _coll(c.send_cmd(G.GET_CHILD_OBJECTS, None, kind='read', middle=CHILD_MIDDLE))
+    matches = []
+    for window in windows:
+        wk = window.get('key', '')
+        if _key_class(wk) not in ('MainFrame', 'SecondaryFrame'):
+            continue
+        roots = _coll(c.send_cmd(G.GET_COMMAND_INTERFACE, wk, kind='read', middle=RC), wk)
+        parent = next((o for o in roots if o.get('key') == wk + '.CI'), None)
+        target = wk + '.CI.' + path
+        chain = []; part = target
+        while part and part != wk + '.CI':
+            chain.append(part); part = _collection_parent(part)
+        if part is None:
+            continue
+        for expected in reversed(chain):
+            if parent is None:
+                break
+            children = _coll(c.send_cmd(G.GET_CHILD_OBJECTS, parent['key'], kind='read',
+                             middle=CHILD_MIDDLE, handle=parent.get('handle')), parent['key'])
+            parent = next((o for o in children if o.get('key') == expected), None)
+        if parent and parent.get('key') == target and parent.get('handle'):
+            matches.append(parent)
+    return matches[0] if len(matches) == 1 else None
+
+
 def _form_object(c):
     """Объект формы (ManagedForm) активного окна: {key, handle} или None."""
     wk = tc1c.extract_object_keys(
@@ -3763,7 +3974,7 @@ def _form_object(c):
         return None
     raw = _body(c.send_cmd(G.GET_CHILD_OBJECTS, wk[0], kind='read', middle=CHILD_MIDDLE))
     for key, h in tc1c.object_handles(raw, wk[0]).items():
-        if 'ManagedForm' in key:
+        if _key_class(key) in ('ManagedForm', 'UnmanagedForm'):
             return {'key': key, 'handle': h}
     return None
 
@@ -3842,6 +4053,11 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
 
     class _VerErr(Exception):
         """Шаг сценария выполнить нельзя: метод новее платформы либо цели нет по адресу."""
+        @property
+        def details(self):
+            cause = self.__cause__
+            return ({'code': cause.code, 'status_code': cause.status}
+                    if isinstance(cause, tc1c.OperationError) else {})
 
     class _TgtErr(_VerErr):
         """Объекта по адресу шага не существует (предполётная проверка)."""
@@ -3869,7 +4085,10 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
         if single:
             _obs['applies'] = True
         desc, before = _observe_guid(c, guid, key, handle, _obs['args']) if single else (None, None)
-        r = c.send_cmd(guid, key, kind=kind, middle=middle, handle=handle, pad=pad)
+        try:
+            r = c.send_cmd(guid, key, kind=kind, middle=middle, handle=handle, pad=pad)
+        except tc1c.OperationError as exc:
+            raise _VerErr(str(exc)) from exc
         if desc is not None:
             _obs['v'] = (desc, before,
                          _observe_guid(c, guid, key, handle, _obs['args'], prepared=desc)[1])
@@ -3932,7 +4151,9 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
             guid, middle = _input_text_command('', c, key)
             return _ac(guid, key, handle, middle)
         if a == 'setCheck':      return _ac(G.SET_CHECK, key, handle)
-        if a == 'click':         return _ac(G.CLICK, key, handle)
+        if a == 'click':
+            guid = _click_guid(key)
+            return _ac(guid, key, handle) if guid is not None else False
         if a == 'increaseValue': return _ac(G.INCREASE_VALUE, key, handle)
         if a == 'decreaseValue': return _ac(G.DECREASE_VALUE, key, handle)
         if a == 'openDropList':  return _ac(G.OPEN_DROP_LIST, key, handle)
@@ -3974,8 +4195,8 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
         if a == 'openField':  return _ac(G.OPEN_FIELD, key, handle)
         if a == 'cancelEdit': return _ac(G.CANCEL_EDIT, key, handle)
         if a == 'create':        return _ac(G.CREATE, key, handle)
-        if a == 'expand':        return _send(G.EXPAND_GROUP, key, kind='action', middle=b'', handle=handle)['ok']
-        if a == 'collapse':      return _send(G.COLLAPSE_GROUP, key, kind='action', middle=b'', handle=handle)['ok']
+        if a == 'expand':        return _ac(G.EXPAND_GROUP, key, handle)
+        if a == 'collapse':      return _ac(G.COLLAPSE_GROUP, key, handle)
         if a == 'closeDropList': return _ac(G.CLOSE_DROP_LIST, key, handle)
         if a == 'FormField':     # вложенное редактирование области табличного документа: begin + ввод в ту же область
             ok = _ac(G.BEGIN_EDIT_CURRENT_AREA, key, handle)
@@ -4017,7 +4238,9 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
             for node in list(container):
                 tag = node.tag.split('}')[-1]
                 if tag in ('FormField', 'FormButton'):
-                    name = node.get('name'); el = elems.get(name)
+                    name = node.get('name')
+                    el = (_command_interface_element(c, node.get('ciPath'))
+                          if 'ciPath' in node.attrib else elems.get(name))
                     for act in list(node):
                         a = act.tag.split('}')[-1]
                         if not el:
@@ -4025,7 +4248,7 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
                         try:
                             res = _replay(el['key'], el['handle'], act)
                         except _VerErr as e:
-                            _step({'target': name, 'action': a, 'ok': False, 'error': str(e)}); continue
+                            _step({'target': name, 'action': a, 'ok': False, 'error': str(e), **e.details}); continue
                         _step({'target': name, 'action': a, 'ok': bool(res), 'skipped': res is None})
                         if a in ('click', 'startChoosing'):
                             _t.sleep(0.8)            # дать открыться новой форме/выбору
@@ -4081,7 +4304,7 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
                                 cancel = (act.get('cancel', 'false') == 'true')
                                 ok = True
                                 for kind in ('action', 'commit'):
-                                    mid = b'\xe2' if (cancel and kind == 'action') else RS
+                                    mid = b'\xe2' if cancel else RS
                                     ok = _send(G.END_EDIT_ROW, tel['key'], kind=kind, middle=mid, handle=tel['handle'])['ok'] and ok
                                 _step({'target': tname, 'action': 'endEditRow', 'ok': ok})
                             elif a == 'deleteRow':
@@ -4142,13 +4365,13 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
                         except _TreeCriterionError as e:
                             _step({'target': tname, 'action': a, 'ok': False, 'code': e.code, 'error': str(e)})
                         except _VerErr as e:   # метод новее подключённой платформы
-                            _step({'target': tname, 'action': a, 'ok': False, 'error': str(e)})
+                            _step({'target': tname, 'action': a, 'ok': False, 'error': str(e), **e.details})
                 elif tag in FORM_ACTIONS:
                     try:
                         res = _replay_form(formobj, node)
                         _step({'target': '<form>', 'action': tag, 'ok': bool(res), 'skipped': res is None})
                     except _VerErr as e:
-                        _step({'target': '<form>', 'action': tag, 'ok': False, 'error': str(e)})
+                        _step({'target': '<form>', 'action': tag, 'ok': False, 'error': str(e), **e.details})
                     _t.sleep(0.4)
                 elif len(list(node)) > 0:            # контейнер (FormGroup, командная панель, страницы) — вглубь
                     _walk(node)
@@ -4168,13 +4391,13 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
         elif tag in ('gotoNextWindow', 'gotoPreviousWindow', 'gotoStartPage'):
             guid = {'gotoNextWindow': G.GOTO_NEXT_WINDOW, 'gotoPreviousWindow': G.GOTO_PREVIOUS_WINDOW,
                     'gotoStartPage': G.GOTO_START_PAGE}[tag]
-            r = _send(guid, _winkey(c), kind='action', middle=b'')
+            ok = _ac(guid, _winkey(c), None)
             _state['window_key'] = None
-            _step({'target': '<window>', 'action': tag, 'ok': r['ok']})
+            _step({'target': '<window>', 'action': tag, 'ok': ok})
             _t.sleep(0.8)
         elif tag == 'activateWindow':
-            r = _send(G.ACTIVATE, _winkey(c), kind='action', middle=b'')
-            _step({'target': '<window>', 'action': tag, 'ok': r['ok']})
+            ok = _ac(G.ACTIVATE, _winkey(c), None)
+            _step({'target': '<window>', 'action': tag, 'ok': ok})
         elif tag == 'closeUserMessagesPanel':
             wk = _winkey(c); ok = True
             for kind in ('action', 'commit'):
@@ -4209,7 +4432,7 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
             try:
                 _window_action(node, tag)
             except _VerErr as e:
-                _step({'target': '<window>', 'action': tag, 'ok': False, 'error': str(e)})
+                _step({'target': '<window>', 'action': tag, 'ok': False, 'error': str(e), **e.details})
 
     unsupported = sorted(set(s['action'] for s in steps if s.get('skipped')))
     played = [s for s in steps if not s.get('skipped')]
@@ -4217,12 +4440,14 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
             'played': len(played), 'total': len(steps), 'unsupported': unsupported, 'steps': steps}
 
 class _CellEditFailure(Exception):
-    pass
+    def __init__(self, message, details=None):
+        super().__init__(message)
+        self.details = details or {}
 
 
 def _cell_step(result, message):
     if not result.get('ok'):
-        raise _CellEditFailure(result.get('error') or message)
+        raise _CellEditFailure(result.get('error') or message, result)
     return result
 
 
@@ -4289,11 +4514,14 @@ def tc_set_cell_text(key: str, column: str, text: str, handle: str) -> dict:
     then reads the result. Empty text clears the cell. Returns verified, changed and
     value_before/value_after. Numeric formatting can return verified=null with
     verification=numeric_equivalent. Continues an existing row edit, including a newly added row,
-    and finishes it without discarding other cells' edits."""
+    and finishes it without discarding other cells' edits. If validation or reference selection
+    keeps the row in edit mode, returns row_edit_pending with the current editor; continue
+    there or cancel explicitly with end_edit_row(cancel=true)."""
     c = _need()
     stage, before, after, editing, window = 'check_target', None, None, False, None
     existing_edit = False
     redirected = None
+    columns = []
     try:
         if _key_class(key) != 'Table':
             raise _CellEditFailure('key must address a table')
@@ -4308,8 +4536,8 @@ def tc_set_cell_text(key: str, column: str, text: str, handle: str) -> dict:
         if mode is None:
             raise _CellEditFailure('the current row edit mode could not be determined')
         existing_edit = mode is True
-        cols = [o for o in _walk_tree(c, key) if o.get('class') == 'EditField'
-                and o.get('name') == column and o.get('key', '').startswith(key + '.')]
+        columns = _table_columns(c, key)
+        cols = [o for o in columns if o.get('name') == column]
         if len(cols) != 1:
             raise _CellEditFailure('column is missing or ambiguous; use its element name')
         col = cols[0]
@@ -4356,14 +4584,65 @@ def tc_set_cell_text(key: str, column: str, text: str, handle: str) -> dict:
         return _cell_result(key, before, after, text, 'done')
     except _CellEditFailure as exc:
         result = _cell_result(key, before, after, text, stage, str(exc))
+        for name in ('code', 'status_code', 'suggested_action', 'message', 'recovery'):
+            if name in exc.details:
+                result[name] = exc.details[name]
     except Exception as exc:
         result = _cell_result(key, before, after, text, stage, str(exc))
+        if isinstance(exc, tc1c.OperationError):
+            result.update(exc.result())
+    if stage == 'input' and result.get('suggested_action') == 'start_choosing':
+        # The composite result addresses the table, while choosing addresses its editor.
+        result.update(suggested_action='get_current_item',
+                      message='Text input was refused. Read the table\'s current editor; '
+                              'if it selects an object, choose a value there.')
+    if stage == 'finish_edit' and editing:
+        try:
+            _cell_window(c, window)
+            if _cell_flag(c, G.CURRENT_MODE_IS_EDIT, key, handle) is True:
+                current = tc_get_current_item(key, handle)
+                result.update(code='row_edit_pending', edit_mode=True, edit_cancelled=False,
+                              requested_column=column, current_item=current.get('item', []),
+                              suggested_action='get_user_message_texts',
+                              message='The row still needs validation or value selection. Input was left in edit mode. '
+                                      'Inspect current_item and validation messages, then finish or explicitly cancel the row.')
+                matches = [o for o in columns if len(current.get('item', [])) == 1
+                           and o.get('key') == current['item'][0].get('key') and o.get('type') == 'InputField']
+                if current.get('ok') and len(matches) == 1:
+                    actual = matches[0]
+                    _cell_ready(c, actual['key'], actual['handle'])
+                    result['suggested_call'] = {'tool': 'tc_field', 'arguments': {
+                        'action': 'start_choosing', 'key': actual['key'], 'handle': actual['handle']}}
+                    result['message'] += ' If the current editor selects an object, use suggested_call to choose it.'
+                return result
+        except Exception:
+            # A changed window or unreadable state must not be presented as a verified editor.
+            if result.get('edit_mode') is True:
+                return result
     if redirected is not None:
         result.update(code='column_focus_redirected' if redirected else 'current_column_unavailable',
+                      requested_column=column,
                       current_item=redirected,
                       suggested_action='set_cell_text' if redirected else 'get_current_item',
                       message=('Inspect current_item and use its column name if it is the intended field. No text was entered.'
-                               if redirected else 'The current column could not be read; no text was entered.'))
+                                if redirected else 'The current column could not be read; no text was entered.'))
+        # A focus change does not prove that two columns have the same meaning.
+        # Offer an explicit retry only for one verified editable column of this table.
+        if len(redirected) == 1:
+            matches = [o for o in columns if o.get('key') == redirected[0].get('key')]
+            if len(matches) == 1 and matches[0].get('type') == 'InputField':
+                actual = matches[0]
+                try:
+                    _cell_window(c, window)
+                    _cell_ready(c, actual['key'], actual['handle'])
+                    if sum(o.get('name') == actual.get('name') for o in columns) == 1:
+                        result['suggested_call'] = {'tool': 'tc_table', 'arguments': {
+                            'action': 'set_cell_text', 'key': key, 'handle': handle,
+                            'column': actual['name'], 'text': text}}
+                        result['message'] = ('The form focused another column. No text was entered. '
+                                             'Use suggested_call only if current_item is the intended column.')
+                except Exception:
+                    pass  # A stale, disabled or unreadable editor must not become a suggested write.
     if editing and not existing_edit:
         try:
             _cell_window(c, window)
@@ -4730,9 +5009,9 @@ def _ref_live_object(c, key):
     """Re-read the exact object through its native source, including non-tree subobjects."""
     parent = _collection_parent(key)
     if not parent:
-        r = c.send_cmd(G.GET_CHILD_OBJECTS, key, kind='read', middle=CHILD_MIDDLE)
-        children = tc1c.decode_collection(r['raw'], key) if r.get('ok') else []
-        return {'key': key, 'handle': None} if children else None
+        r = c.send_cmd(G.GET_CHILD_OBJECTS, None, kind='read', middle=CHILD_MIDDLE)
+        windows = tc1c.decode_collection(r['raw'], None) if r.get('ok') else []
+        return next((w for w in windows if w.get('key') == key), None)
     # Named groups/fields use ordinary enumeration even if their names contain dots.
     suffix = key[len(parent) + 1:]
     source = _DERIVED_REF_SOURCES.get(suffix)
@@ -4776,10 +5055,16 @@ def _dispatch_connected_action(acts, group, kw, connection_id=None):
             res = _refs.present(res, name, _refs.for_client(_state['client']))
     except _refs.RefError as exc:
         res = {'ok': False, 'code': exc.code, 'error': str(exc)}
+    except tc1c.OperationError as exc:
+        res = exc.result()
+        if _response.REF_MODE == 'id':
+            res.pop('target', None)
     if connection_id is not None:
         if not isinstance(res, dict):
             res = {'ok': True, 'message': res}
         res = {**res, 'connection_id': connection_id}
+        if name in ('set_cell_text', 'get_cell_text') and isinstance(res.get('suggested_call'), dict):
+            res['suggested_call']['arguments']['connection_id'] = connection_id
     return _response.respond(res, addrs=('tc_' + name) in _response.ADDR_TOOLS)
 
 

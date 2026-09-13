@@ -130,7 +130,7 @@ _HANDLE_LEN = 16                               # запись: <handle 16 бай
 _CLASSES = frozenset((
     'Additional', 'Button', 'CI', 'CIButton', 'CommandPanel', 'ContextMenu', 'Decoration',
     'EditField', 'Group', 'HomePage', 'MainFrame', 'ManagedForm', 'MoxelEditField',
-    'Navigation', 'SecondaryFrame', 'SubSystems', 'SWINOpened', 'Table',
+    'Navigation', 'SecondaryFrame', 'SubSystems', 'SWINOpened', 'Table', 'UnmanagedForm',
 ))
 
 def _record_bounds(raw, spans, idx):

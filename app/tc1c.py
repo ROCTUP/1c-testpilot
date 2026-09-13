@@ -386,10 +386,82 @@ def mk_gotorow(column=None, value=None, toggle_selection=False, direction='down'
 
 _RESULT_EPILOGUE = b'\x20\xa1\xa3'   # хвост ответа: <значение> 20 a1 a3 <трейлер>
 
+
+def _reply_status_offset(raw, method_guid=None):
+    """Locate the reply body by consuming the envelope, including both binary GUIDs."""
+    if not raw.startswith(b'\x42') or not raw.endswith(TR) or len(raw) < 50:
+        return None
+    size = 1 if 0x81 <= raw[1] <= 0x8a else value_size(raw, 1)
+    if not size or raw[1] not in range(0x81, 0x90):
+        return None
+    p = 1 + size
+    if raw[p:p+7] != b'\x84\x83\x81\x83\xcb\x23\x95':
+        return None
+    p += 7
+    if method_guid and raw[p:p+16] != uuid.UUID(method_guid).bytes_le:
+        return None
+    p += 16
+    if raw[p:p+1] != b'\xd5':
+        return None
+    p += 17
+    if raw[p:p+1] not in (b'\x81', b'\x97', b'\x98', b'\x9a', b'\x9b'):
+        return None
+    if p + 3 > len(raw) - len(TR):
+        return None
+    size = 1 if raw[p] == 0x81 else value_size(raw, p)
+    if not size or p + size >= len(raw) - 4:
+        return None
+    return p + size
+
+
+def decode_operation_status(raw, method_guid=None):
+    """Status immediately after the receiver in a complete method-reply envelope.
+
+    A 0x42 frame acknowledges the RPC; its status can still reject the operation.
+    Do not search payload text for status bytes: field values may contain any bytes.
+    """
+    p = _reply_status_offset(raw, method_guid)
+    if p is None:
+        return None
+    tag = raw[p]
+    if 0x81 <= tag <= 0x8a:
+        return tag - 0x81
+    widths = {0x8b: 1, 0x8d: 2, 0x8f: 4}
+    width = widths.get(tag)
+    if width and p + 1 + width <= len(raw) - 4:
+        return int.from_bytes(raw[p+1:p+1+width], 'little')
+    return None
+
+
+class OperationError(RuntimeError):
+    """A complete RPC reply rejected the requested operation."""
+    def __init__(self, status, key):
+        self.status, self.key = status, key
+        known = {
+            7: ('target_unavailable', 'The target element is unavailable. Find it again.'),
+            8: ('target_hidden', 'The target element is not visible.'),
+            9: ('target_not_interactive', 'The element is unavailable for interaction. Check the active window and any open dialogs.'),
+            10: ('unsupported_element_type', 'The test client does not support this action for this element type.'),
+            11: ('invalid_element_state', 'The element is not in a state that permits this action.'),
+            12: ('value_not_found', 'The requested value is not present in this element.'),
+            15: ('client_busy', 'The test client cannot process commands in its current state. Check for an open dialog on the client computer.'),
+            17: ('unsupported_receiver', 'The test client does not support this action on this object.'),
+        }
+        self.code, message = known.get(status, ('client_operation_rejected',
+            'The test client rejected this operation (status %d).' % status))
+        super().__init__(message)
+
+    def result(self):
+        result = {'ok': False, 'target': self.key, 'code': self.code,
+                  'error': str(self), 'status_code': self.status}
+        if self.status == 15:
+            result['recovery'] = 'Complete or cancel any open dialog on the client computer, then retry. For a file dialog, prepare set_file_dialog_result before opening it.'
+        return result
+
 # Признак существования объекта-получателя в ответе на кадр ЧТЕНИЯ: байт за 4 позиции до эпилога.
 # Это признак НАЛИЧИЯ объекта, а не значение «Ложь»: у скрытого элемента он тоже 0x81.
-# В кадрах ДЕЙСТВИЙ признака нет (Click=0x00, InputText=0x31 одинаково для любого адреса),
-# поэтому декодировать существование оттуда невозможно.
+# Это смещение относится только к CurrentVisible; общий статус операции читается
+# отдельно из заголовка ответа функцией decode_operation_status.
 TARGET_PRESENT_BYTE = 0x81
 TARGET_ABSENT_BYTE  = 0x88
 
@@ -433,6 +505,48 @@ def decode_choice_items(strings):
     status: 'ok' — пункты распознаны; 'unknown' — разметки нет. Отдельного «распознанная пустота»
     нет намеренно: достоверного признака пустого списка в кадрах не найдено, а обещать различие,
     которого нет, нельзя. Пустой ответ закрытого выпадающего списка — штатный случай 'unknown'."""
+    if isinstance(strings, bytes):
+        # Both fields are strings; even a numeric presentation uses the compact
+        # single-character encoding. A flattened string scan drops that value.
+        raw = strings
+        if not raw.startswith(b'\x42') or not raw.endswith(TR):
+            return [], 'unknown'
+        first = b'\xc0\x4b\x53' + _enc_key(CHOICE_FIELDS[0]) + b'\xeb\x53'
+        second = b'\x20\xe0\x4b\x53' + _enc_key(CHOICE_FIELDS[1]) + b'\xeb\x53'
+        items, start = [], 0
+        def value(pos):
+            if pos >= len(raw):
+                return None
+            tag = raw[pos]
+            if tag == 0x81:
+                return '', pos + 1
+            if tag == 0x8b:
+                return (chr(raw[pos + 1]), pos + 2) if pos + 1 < len(raw) else None
+            if tag not in (0x97, 0x98, 0x9a, 0x9b):
+                return None
+            header = 3 if tag in (0x98, 0x9b) else 2
+            if pos + header > len(raw):
+                return None
+            size = value_size(raw, pos)
+            if pos + size > len(raw):
+                return None
+            try:
+                return raw[pos + header:pos + size].decode('utf-16le' if tag in (0x97, 0x98) else 'latin1'), pos + size
+            except UnicodeDecodeError:
+                return None
+        while (pos := raw.find(first, start)) >= 0:
+            presentation = value(pos + len(first))
+            if presentation is None:
+                return [], 'unknown'
+            text_pos = presentation[1]
+            if raw[text_pos:text_pos + len(second)] != second:
+                return [], 'unknown'
+            text = value(text_pos + len(second))
+            if text is None:
+                return [], 'unknown'
+            items.append(dict(presentation=presentation[0], text=text[0]))
+            start = text[1]
+        return (items, 'ok') if items else ([], 'unknown')
     items, cur = [], {}
     i = 0
     while i + 1 < len(strings):
@@ -819,8 +933,9 @@ def _value_at(raw, i, *, text=False):
     (пусто/Неопределено кодируется одиночным 81 — его НЕЛЬЗЯ терять, иначе колонки
     и значения разъезжаются). Режем РОВНО по объявленной длине значения: длина ячейки
     ничем не ограничена, а обрезка буфера дала бы префикс вместо полного текста."""
-    if text and raw[i:i + 1] == b'\x8b' and i + 1 < len(raw):
-        return chr(raw[i + 1])
+    size, value = _text_at(raw, i, compact=text)
+    if size:
+        return value
     n = value_size(raw, i)
     toks = decode_stream(raw[i:i + n] if n else raw[i:i + 16])
     if not toks:
@@ -831,6 +946,29 @@ def _value_at(raw, i, *, text=False):
     if kind in ('int', 'date'):
         return str(val)
     return ''                      # raw-маркер (81 = пусто и т.п.)
+
+
+def _text_at(raw, i, *, compact=True):
+    """Decode a length-delimited text value at a known boundary, without content heuristics."""
+    if i >= len(raw):
+        return 0, None
+    tag = raw[i]
+    if compact and tag == 0x8b and i + 2 <= len(raw):
+        return 2, chr(raw[i + 1])
+    if tag not in (0x9a, 0xba, 0xda, 0xfa, 0x97, 0xb7, 0xd7, 0xf7,
+                   0x9b, 0xbb, 0xdb, 0xfb, 0x98, 0xb8, 0xd8, 0xf8):
+        return 0, None
+    prefix = 3 if tag & 15 in (11, 8) else 2
+    if i + prefix > len(raw):
+        return 0, None
+    size = value_size(raw, i)
+    if i + size > len(raw):
+        return 0, None
+    try:
+        value = raw[i + prefix:i + size].decode('utf-16le' if tag & 15 in (7, 8) else 'latin1')
+    except UnicodeDecodeError:
+        return 0, None
+    return size, value
 
 def decode_cell_text(raw):
     """GetCellText returns text before the echoed column; compact bytes are characters."""
@@ -857,21 +995,21 @@ def decode_cell_text(raw):
                 return True, None
             if raw[p] == 0x8b and size == 2:
                 return True, chr(raw[p + 1])
-            tokens = decode_stream(raw[p:q])
-            if len(tokens) == 1 and tokens[0][0] in ('str', 'ustr'):
-                return True, tokens[0][1]
+            size, value = _text_at(raw, p)
+            if size and p + size == q:
+                return True, value
         except (IndexError, ValueError, struct.error):
             continue
 
 
 def decode_area_text(raw, area):
-    """Read an addressed area's text between its echoed argument and the frame end.
+    """Read area text after its echoed address or current-area marker, up to the frame end.
     This position contains data, so Unicode and key-like text must not be filtered.
     Unknown layouts return None for the caller's compatibility decoder.
     """
-    if not area or not raw.startswith(b'\x42') or not raw.endswith(b'\x20\xa1\xa3' + TR):
+    if not raw.startswith(b'\x42') or not raw.endswith(b'\x20\xa1\xa3' + TR):
         return None
-    marker = b'\x81\x81\x81' + _enc_like(0xf0, area)
+    marker = b'\x81\x81\x81' + (_enc_like(0xf0, area) if area else b'\xe1')
     start, end = 0, len(raw) - 7
     while True:
         p = raw.find(marker, start)
@@ -902,19 +1040,43 @@ def decode_rows(raw):
     Разбор ПО СТРУКТУРЕ: строку открывает c0 4b, внутри пары <колонка> eb 53 <значение>.
     Так пустые и нестроковые значения сохраняют своё место (попарное «склеивание» подряд
     идущих строк давало заголовок соседней колонки вместо пустого значения)."""
-    rows = []
-    for part in raw.split(_ROW_MARK)[1:]:
-        row = {}; i = 0
-        while True:
-            q = part.find(_PAIR_MARK, i)
-            if q < 0:
-                break
-            col = _str_ending_at(part, q)
-            if col and '[' not in col and not is_cjk_garble(col):
-                row[col] = _value_at(part, q + 2, text=True)
-            i = q + 2
-        if row:
-            rows.append(row)
+    # A receiver UUID can contain row markers and apparently valid text lengths.
+    # Consume the envelope first; never scan its GUIDs or echoed object address.
+    i = _reply_status_offset(raw) if raw.startswith(b'\x42') else 0
+    if i is None:
+        raise ValueError('Cannot read table rows: unrecognized reply envelope')
+    rows = []; row = None
+    while i < len(raw):
+        # Collection/type identifiers in the body are binary GUID values too.
+        if raw.startswith(b'\x23\x95', i):
+            i += 18
+            continue
+        if raw.startswith(_ROW_MARK, i):
+            if row:
+                rows.append(row)
+            row = {}; i += len(_ROW_MARK)
+            continue
+        size, col = _text_at(raw, i)
+        if size:
+            q = i + size
+            if row is not None and raw.startswith(_PAIR_MARK, q):
+                p = q + len(_PAIR_MARK)
+                if p >= len(raw):
+                    break
+                try:
+                    n = value_size(raw, p) or 1
+                except IndexError:
+                    break
+                if p + n > len(raw):
+                    break
+                row[col] = _value_at(raw, p, text=True)
+                i = p + n
+            else:
+                i = q
+        else:
+            i += 1
+    if row:
+        rows.append(row)
     return rows
 
 def is_byteswapped_ascii(s):
@@ -1031,10 +1193,24 @@ class TestClient:
         self._track=None             # если список — сюда пишутся GUIDʼы отправленных команд (для контроля записи сценария)
         self._direct_session = False
         self._first_binary = False
+        self._io_deadline = None
 
     RECV_TIMEOUT = 30            # базовый таймаут ожидания ответа на команду, с
     CONNECT_TIMEOUT = 10         # ожидание кадров рукопожатия (retries × это время до отказа)
     RESYNC_TIMEOUT = 3           # ожидание запоздавших ответов после таймаута, с
+
+    def _io_timeout(self, timeout):
+        deadline = self._io_deadline
+        if deadline is None:
+            return timeout
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('Test-client startup deadline expired.')
+        return remaining if timeout is None else min(timeout, remaining)
+
+    def _handshake_send(self, data):
+        self.s.settimeout(self._io_timeout(self.CONNECT_TIMEOUT))
+        self.s.sendall(data)
 
     def _recv_timeout(self):
         """Таймаут ожидания ответа. По умолчанию RECV_TIMEOUT; если задан max_action_time
@@ -1050,8 +1226,9 @@ class TestClient:
         При таймауте недочитанное остаётся в self._buf. При EOF/обрыве соединение закрывается."""
         self._require_socket()
         try:
-            self.s.settimeout(timeout)
+            self.s.settimeout(self._io_timeout(timeout))
             while TR not in self._buf:
+                self.s.settimeout(self._io_timeout(timeout))
                 d=self.s.recv(65536)
                 if not d:
                     size = len(self._buf)
@@ -1109,6 +1286,7 @@ class TestClient:
         """Read a network preamble component, retaining any coalesced SCOM bytes."""
         self._require_socket()
         while len(self._buf) < size:
+            self.s.settimeout(self._io_timeout(self.CONNECT_TIMEOUT))
             data = self.s.recv(65536)
             if not data:
                 raise ConnectionError('The test client closed the connection during network negotiation.')
@@ -1124,13 +1302,13 @@ class TestClient:
         the response avoids guessing from host names, IP addresses or short waits.
         """
         self.close()
-        self.s = socket.create_connection((self.host, self.port), timeout=5)
-        self.s.settimeout(self.CONNECT_TIMEOUT)
+        self.s = socket.create_connection((self.host, self.port), timeout=self._io_timeout(5))
+        self.s.settimeout(self._io_timeout(self.CONNECT_TIMEOUT))
         try:
             if self._read_exact(len(NETWORK_GREETING)) != NETWORK_GREETING:
                 raise ConnectionError('Unexpected test-client network greeting.')
             key = _network_key()
-            self.s.sendall(build_network_preamble(key) + frame)
+            self._handshake_send(build_network_preamble(key) + frame)
             size = int.from_bytes(self._read_exact(2), 'little')
             if not 16 <= size <= 4096:
                 raise ConnectionError('Invalid test-client network preamble length.')
@@ -1156,10 +1334,10 @@ class TestClient:
             return build_scom(conn_guid, n, sub_guid, pc, base64.b64encode(tok), ver)
         for _ in range(retries):
             try:
-                self.s=socket.create_connection((self.host,self.port),timeout=5)
+                self.s=socket.create_connection((self.host,self.port),timeout=self._io_timeout(5))
                 self._buf=b''; self._pending=0      # новый сокет — прошлый поток кадров не в счёт
                 self._direct_session=False; self._first_binary=False
-                self.s.sendall(_scom(intro_ticket(user, pc))); ack=self._recv(self.CONNECT_TIMEOUT)
+                self._handshake_send(_scom(intro_ticket(user, pc))); ack=self._recv(self.CONNECT_TIMEOUT)
                 if ack == NETWORK_GREETING + TR:
                     num[0] = 22548
                     ack = self._network_intro(_scom(intro_ticket(user, pc)))
@@ -1168,7 +1346,7 @@ class TestClient:
             except OSError:
                 self.close()
                 num[0]=22548
-            time.sleep(1)
+            time.sleep(self._io_timeout(1))
         else:
             raise RuntimeError('intro handshake failed')
         # The peer may supply a session in intro (native Linux client), or require NTLM.
@@ -1177,9 +1355,9 @@ class TestClient:
         if not self._direct_session:
             if sspi is None:
                 try:
-                    self.s.sendall(_scom(_anonymous_ntlm_negotiate()))
+                    self._handshake_send(_scom(_anonymous_ntlm_negotiate()))
                     challenge = self._get_tok(self._recv(self.CONNECT_TIMEOUT))
-                    self.s.sendall(_scom(_anonymous_ntlm_authenticate(challenge)))
+                    self._handshake_send(_scom(_anonymous_ntlm_authenticate(challenge)))
                     auth = self._recv(self.CONNECT_TIMEOUT)
                 except Exception:
                     self.close()
@@ -1189,7 +1367,7 @@ class TestClient:
                                sspicon.ISC_REQ_REPLAY_DETECT|sspicon.ISC_REQ_SEQUENCE_DETECT)
                 ib=None
                 for _ in range(3):
-                    err,out=ca.authorize(ib); self.s.sendall(_scom(out[0].Buffer)); auth=self._recv(self.CONNECT_TIMEOUT)
+                    err,out=ca.authorize(ib); self._handshake_send(_scom(out[0].Buffer)); auth=self._recv(self.CONNECT_TIMEOUT)
                     if err==0: break
                     ch=self._get_tok(auth); sb=win32security.PySecBufferDescType()
                     bb=win32security.PySecBufferType(len(ch),sspicon.SECBUFFER_TOKEN); bb.Buffer=ch; sb.append(bb); ib=sb
@@ -1201,7 +1379,7 @@ class TestClient:
                                   'The test client did not grant a session after authentication.')
         self.sess=session.group(1).decode()
         # установка сессии (программный кадр)
-        self.s.sendall(build_session_frame(self.sess, num[0])); self._recv(self.CONNECT_TIMEOUT)
+        self._handshake_send(build_session_frame(self.sess, num[0])); self._recv(self.CONNECT_TIMEOUT)
         if self._direct_session:self._counter = num[0]
         return self.sess
 
@@ -1210,7 +1388,7 @@ class TestClient:
         if self._direct_session:
             try:
                 for frame in _intro_attach_frames(self.sess, self._counter + 1):
-                    self.s.sendall(frame)
+                    self._handshake_send(frame)
                     reply = self._recv()
                     if not reply.startswith(b'\xef\xbb\xbf{1,') or not reply.endswith(b'},0},2' + TR):
                         raise ConnectionError('The test client rejected session initialization.')
@@ -1220,7 +1398,7 @@ class TestClient:
             except Exception:
                 self.close()
                 raise
-        self.s.sendall(build_attach(self.sess)); return self._recv()
+        self._handshake_send(build_attach(self.sess)); return self._recv()
 
     def send_cmd(self, method_guid, key, kind='read', middle=b'', handle=None, per_call=None, pad=None,
                  timeout=0):
@@ -1246,6 +1424,9 @@ class TestClient:
             self.close()
             raise
         r=self._recv(timeout)
+        status = decode_operation_status(r, method_guid)
+        if status not in (None, 0):
+            raise OperationError(status, key)
         if self._track is not None:
             self._track.append((method_guid, key, middle, kind))
         return {'opcode': r[0], 'ok': r[0]==0x42, 'raw': r,

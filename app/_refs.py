@@ -149,6 +149,15 @@ def present(payload, action, registry):
         if _collection.is_object_key(key):
             pairs.setdefault(key, registry.get(key))
             echoes[field] = key
+    suggestion = payload.get('suggested_call') if action in ('set_cell_text', 'get_cell_text') else None
+    args = suggestion.get('arguments') if isinstance(suggestion, dict) else None
+    argument_targets = {}
+    if isinstance(args, dict):
+        for field in ('key', 'root_key'):
+            key = args.get(field)
+            if _collection.is_object_key(key):
+                pairs.setdefault(key, args.get('handle') or registry.get(key))
+                argument_targets[field] = key
     refs = registry.publish(pairs)
     def node(obj):
         if not isinstance(obj, dict) or obj.get('key') not in refs:
@@ -161,4 +170,11 @@ def present(payload, action, registry):
         out[slot] = [node(v) for v in value] if isinstance(value, list) else node(value)
     for field, key in echoes.items():
         out[field] = refs[key]
+    if argument_targets:
+        converted = dict(args)
+        for field, key in argument_targets.items():
+            converted.pop(field)
+            converted['root_ref' if field == 'root_key' else 'ref'] = refs[key]
+        converted.pop('handle', None)
+        out['suggested_call'] = {**suggestion, 'arguments': converted}
     return out

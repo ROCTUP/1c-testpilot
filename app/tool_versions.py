@@ -130,6 +130,10 @@ TOOL_MIN_VERSION = {
 }
 
 GUID_MIN_VERSION = {
+    '3ddbc6b6-bef1-4a8b-962f-f762cecf6caa': '8.3.1',
+    '318d6f6b-a021-42b0-acf8-125671dfa516': '8.3.3',
+    '76f01cfd-5645-4ca0-92ba-e6f06cb4a879': '8.3.1',
+    'edf3e1b5-cb4c-4dd6-9b64-495fd4879456': '8.3.1',
     '025c6c82-c67f-4d9c-9e18-7cb8b94f898e': '8.3.1',
     '0e65b6e0-e285-486a-9329-ef9e66822fe4': '8.3.1',
     '0eeadd59-c9c4-48d1-ad06-d05d08020e2d': '8.3.1',
