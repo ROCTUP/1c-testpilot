@@ -77,6 +77,7 @@
 | `goto_previous_row` | `ТестируемаяТаблицаФормы` · ПерейтиКПредыдущейСтроке (`GotoPreviousRow`) | `ТестируемаяТаблицаФормы` | `ref*, toggle_selection=False, column=None` |
 | `goto_row` | `ТестируемаяТаблицаФормы` · ПерейтиКСтроке (`GotoRow`) | `ТестируемаяТаблицаФормы` | `ref*, column=None, value=None, direction='down', toggle_selection=False, fields=None` |
 | `is_expanded` | `ТестируемаяТаблицаФормы` · Развернут (`Expanded`) | `ТестируемаяТаблицаФормы` | `ref*, row_column=None, row_value=None` |
+| `read_rows` | Составное действие MCP: SelectAllRows, GetSelectedRows, очистка выделения | `ТестируемаяТаблицаФормы` | `ref*, max_rows=500` |
 | `select_all_rows` | `ТестируемаяТаблицаФормы` · ВыделитьВсеСтроки (`SelectAllRows`) | `ТестируемаяТаблицаФормы` | `ref*` |
 | `select_row` | `ТестируемаяТаблицаФормы` · `SelectRow` | `ТестируемаяТаблицаФормы` | `ref*` |
 | `set_cell_text` | — | `ТестируемаяТаблицаФормы` | `ref*, column*, text*` |

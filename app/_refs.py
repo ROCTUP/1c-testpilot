@@ -114,7 +114,7 @@ OBJECT_SLOTS = {
     'get_command_interface': 'commands', 'get_current_page': 'page',
     'find_default_button': 'button', 'get_current_item': 'item', 'get_current_element': 'item',
     'get_linked_window': 'window', 'get_current_area_field': 'field',
-    'start_choosing': 'window',
+    'start_choosing': 'window', 'execute_command': 'window',
     'set_cell_text': 'current_item',
 }
 
@@ -168,6 +168,8 @@ def present(payload, action, registry):
         out['ref'] = out.pop('key')  # unavailable window: null stays null
     if slot and slot in payload:
         out[slot] = [node(v) for v in value] if isinstance(value, list) else node(value)
+        if slot == 'window' and isinstance(value, dict) and 'key' in value and value['key'] is None:
+            out[slot] = {'ref': None, **{k: v for k, v in value.items() if k not in ('key', 'handle')}}
     for field, key in echoes.items():
         out[field] = refs[key]
     if argument_targets:

@@ -45,7 +45,7 @@ ADDR_TOOLS = frozenset({
     'tc_get_parent', 'tc_get_command_bar', 'tc_get_command_interface',
     'tc_get_current_page', 'tc_find_default_button', 'tc_get_current_item', 'tc_get_current_element',
     'tc_get_linked_window', 'tc_get_current_area_field',
-    'tc_start_choosing',
+    'tc_start_choosing', 'tc_execute_command',
 })
 # Параметры инструментов, несущие адрес объекта: только их проверяем на неразвёрнутые ссылки,
 # чтобы не отклонять обычный текст, начинающийся с '@'.

@@ -82,6 +82,8 @@ def _with_operation_errors(fn):
             return fn(*args, **kwargs)
         except tc1c.OperationError as exc:
             return exc.result()
+        except _PlatformVersionError as exc:
+            return exc.result
     return wrapped
 
 
@@ -166,6 +168,27 @@ def _with_tree_criterion(fn):
     return wrapped
 
 
+class _PlatformVersionError(RuntimeError):
+    def __init__(self, result):
+        super().__init__(result['error'])
+        self.result = result
+
+
+def _version_refusal(action, minv, cur):
+    result = {'ok': False, 'code': 'unsupported_platform_version',
+              'error': 'this method needs 1C platform %s+, connected to %s' % (minv, cur),
+              'available_since': minv, 'connected_version': cur}
+    alternatives = {
+        'tc_get_current_row': ('get_cell_text', 'Read the current row with get_cell_text and a column name; use read_rows for the table.'),
+        'tc_select_row': ('goto_row', 'Use goto_row with toggle_selection=true to toggle the current row.'),
+        'tc_deselect_row': ('goto_row', 'Use goto_row with toggle_selection=true to toggle the current row.'),
+        'tc_deselect_all_rows': ('goto_row', 'Use goto_row without a search condition to leave only the current row selected.'),
+    }
+    if action in alternatives:
+        result['suggested_action'], result['message'] = alternatives[action]
+    return result
+
+
 def _need():
     """Подключённый клиент. Заодно сверяет версию ПОДКЛЮЧЕНИЯ с минимальной версией
     вызывающего инструмента (TOOL_MIN_VERSION): старому клиенту нельзя слать неизвестный
@@ -173,10 +196,11 @@ def _need():
     if not _state['client']:
         raise RuntimeError('not connected — call tc_connect first')
     c = _state['client']
-    minv = TOOL_MIN_VERSION.get(sys._getframe(1).f_code.co_name)
+    action = sys._getframe(1).f_code.co_name
+    minv = TOOL_MIN_VERSION.get(action)
     cur = _conn_ver(c)
     if minv and _vt(cur) and _vt(minv) and _vt(cur) < _vt(minv):
-        raise RuntimeError('this method needs 1C platform %s+, connected to %s' % (minv, cur))
+        raise _PlatformVersionError(_version_refusal(action, minv, cur))
     return c
 
 def _vt(s):
@@ -209,8 +233,7 @@ def _need_ver(minv):
     c = _need()
     cur = _conn_ver(c)
     if _vt(cur) and _vt(minv) and _vt(cur) < _vt(minv):
-        return None, {'ok': False, 'error': 'this method needs 1C platform %s+, connected to %s' % (minv, cur),
-                      'available_since': minv, 'connected_version': cur}
+        return None, _version_refusal(sys._getframe(1).f_code.co_name, minv, cur)
     return c, None
 
 # ================= предполётная проверка объекта-цели =======================
@@ -274,7 +297,8 @@ def _verify_target(c, key, handle):
 def _rec_reset():
     """Сбросить всё состояние записи сценария: признаков несколько, и рассыпанный сброс уже
     приводил к тому, что «запись идёт» переживала потерю накопленного."""
-    for k in ('rec_paused_track', 'rec_obs', 'rec_obs_paused', 'rec_active'):
+    for k in ('rec_paused_track', 'rec_obs', 'rec_obs_paused', 'rec_active',
+              'rec_native_parts', 'rec_native_stopped', 'rec_native_errors'):
         _state.pop(k, None)
 
 
@@ -304,6 +328,10 @@ def _scalar_text(r, cmd):
     """Значение-строка из ответа на команду `cmd`. Если обычный разбор ничего не дал, пробуем
     компактную форму «один байт» из хвоста: односимвольное значение приходит именно ею, и без
     этого «в поле один символ» неотличимо от «поле пусто»."""
+    if r.get('ok') and cmd in (G.GET_DISPLAYED_TEXT, G.GET_EDIT_TEXT, G.GET_PROPERTY):
+        text = tc1c.decode_field_text(r['raw'], property_value=cmd == G.GET_PROPERTY)
+        if text is not None:
+            return text
     vals = _vals(r)
     if vals:
         return vals[-1]
@@ -909,6 +937,9 @@ def _verified(fn, action):
             # получено, ответ null. Иначе ошибка чтения превратилась бы в доказательство эффекта
             res['changed'] = (before != after) if (before is not None and after is not None) else None
             res['value_before'], res['value_after'] = before, after
+            if res.get('ok') and action in ('goto_next_row', 'goto_previous_row') and res['changed'] is False:
+                res.update(suggested_action='read_rows',
+                           message='Equal cell text does not establish a row boundary. Use read_rows to check the table contents and count.')
             if action == 'input_text' and 'committed' not in res:
                 res['committed'] = _committed(c, b.arguments, after) if res.get('ok') else None
                 res['input_status'] = ('accepted' if res['committed'] is True else
@@ -1576,13 +1607,10 @@ def tc_get_parent(key: str, handle: str) -> dict:
 
 @_action('tc_table')
 def tc_get_selected_rows(key: str, handle: str) -> dict:
-    """Get the selected table rows as a list of {column: value} maps, one per selected row, in LIST
-    order — the current row is NOT put first, so do not read rows[0] as "the first row of the
-    list". The keys are column TITLES; the column titled "Вид" can be EditField[ЮрФизЛицо], so
-    match by title, not by name. Which columns a row carries is decided by the platform: a
-    column missing from the answer does not mean the row has no value there, and an empty string
-    is ambiguous — it can be a value the platform sent as empty or a filler for a column it did
-    not send. Values may include search-highlight markup."""
+    """Read selected rows as {column title: displayed value} maps. Row order is not guaranteed.
+    The platform chooses the columns. Missing columns are unread, not empty; empty text can also
+    represent an omitted value. Values may contain search highlighting.
+    Use read_rows to read all selectable rows of the current table."""
     c = _need()
     r = c.send_cmd(G.GET_SELECTED_ROWS, key, kind='read', middle=RC, handle=handle)
     # ответ = массив Соответствий: маркер c04b начинает СТРОКУ, внутри пары <колонка> eb53 <значение>
@@ -1625,7 +1653,7 @@ def tc_is_visible(key: str, handle: str) -> dict:
 
 @_action('tc_field')
 def tc_is_enabled(key: str, handle: str) -> dict:
-    """Whether an element is currently enabled."""
+    """Read the element's availability. A command can still refuse execution in the current form state."""
     c = _need()
     r = c.send_cmd(G.CURRENT_ENABLE, key, kind='read', middle=RS, handle=handle)
     return {'ok': r['ok'], 'enabled': _scalar(r, _bool_from_resp)}
@@ -1870,6 +1898,77 @@ def tc_deselect_all_rows(key: str, handle: str) -> dict:
     for kind in ('action', 'commit'):
         ok = c.send_cmd(G.DESELECT_ALL_ROWS, key, kind=kind, middle=b'', handle=handle)['ok'] and ok
     return {'ok': ok, 'target': key, 'action': 'deselect_all_rows'}
+
+
+@_action('tc_table')
+def tc_read_rows(key: str, handle: str, max_rows: int = 500) -> dict:
+    """Read all selectable rows of the current table, respecting its filters and collapsed groups.
+    Returns row_count and up to max_rows rows (0 for count only); row order is not guaranteed.
+    Temporarily selects rows, then clears selection without navigating to another row.
+    Previous selection is cleared. Refuses unfinished row edits. Column keys are titles."""
+    c, error = _need_ver('8.3.6')
+    if error:
+        return error
+    if _key_class(key) != 'Table':
+        return {'ok': False, 'code': 'invalid_table', 'error': 'Read rows requires a table.'}
+    if type(max_rows) is not int or not 0 <= max_rows <= 10000:
+        return {'ok': False, 'code': 'invalid_row_limit', 'error': 'max_rows must be an integer from 0 to 10000.'}
+    result = {'ok': False, 'target': key, 'rows': [], 'row_count': None,
+              'selection_cleared': None, 'scope': 'selectable_rows'}
+    attempted = False
+    window = None
+    record_mark = None
+    try:
+        window = _cell_window(c)
+        mode = _cell_flag(c, G.CURRENT_MODE_IS_EDIT, key, handle)
+        if mode is not False:
+            return dict(result, code='row_edit_pending' if mode is True else 'edit_state_unavailable',
+                        error='Finish or explicitly cancel row editing before reading the table.',
+                        edit_mode=mode, selection_changed=False)
+        record_mark = _native_composite_begin(c)
+        attempted = True
+        _cell_step(tc_select_all_rows(key, handle), 'The table rows could not be selected.')
+        rows = _cell_step(tc_get_selected_rows(key, handle), 'The selected rows could not be read.')['rows']
+        result.update(ok=True, rows=rows[:max_rows], row_count=len(rows),
+                      returned_rows=min(len(rows), max_rows), truncated=len(rows) > max_rows)
+    except Exception as exc:
+        details = exc.result() if isinstance(exc, tc1c.OperationError) else getattr(exc, 'details', {})
+        result.update(details, ok=False, error=str(exc))
+    finally:
+        if attempted:
+            try:
+                _cell_window(c, window)
+                if _cell_flag(c, G.CURRENT_MODE_IS_EDIT, key, handle) is not False:
+                    raise RuntimeError('Row editing started or could not be checked; it was left untouched.')
+                if _guid_available(c, G.DESELECT_ALL_ROWS):
+                    _cell_step(tc_deselect_all_rows(key, handle), 'Selection could not be cleared.')
+                elif result.get('row_count') != 0:
+                    # No search condition: the cursor stays on the same row, even for duplicate rows.
+                    _cell_step(tc_goto_row(key, handle=handle), 'Selection could not be reduced to the current row.')
+                    remaining = _cell_step(tc_get_selected_rows(key, handle), 'Selection could not be checked.')['rows']
+                    if remaining:
+                        if len(remaining) != 1:
+                            raise RuntimeError('The table did not leave only the current row selected.')
+                        _cell_step(tc_goto_row(key, handle=handle, toggle_selection=True), 'Selection could not be cleared.')
+                remaining = _cell_step(tc_get_selected_rows(key, handle), 'Selection could not be checked.')['rows']
+                if remaining:
+                    raise RuntimeError('The table still has selected rows.')
+                result['selection_cleared'] = True
+            except Exception as exc:
+                if result.get('error'):
+                    result['read_error'] = result['error']
+                result.update(ok=False, code='selection_cleanup_failed', selection_cleared=False,
+                              error='Table selection could not be cleared: ' + str(exc),
+                              suggested_action='get_selected_rows')
+        if record_mark is not None:
+            try:
+                _native_composite_end(c, record_mark)
+            except Exception as exc:
+                if result.get('error'):
+                    result['operation_error'] = result['error']
+                result.update(ok=False, code='recording_incomplete',
+                              error='Scenario recording could not continue after this action: ' + str(exc))
+    return result
 
 @_action('tc_table')
 def tc_copy_row(key: str, handle: str, confirm: bool = None) -> dict:
@@ -2135,17 +2234,43 @@ def _close_active_window(c, send=None, native_only=False):
 
 @_action('tc_window')
 def tc_execute_command(command: str) -> dict:
-    """Run a window command by name, or open an object by a navigation link. Both forms are
-    accepted: a command-interface command name, and a link such as
-    'e1cib/list/Справочник.Контрагенты' (list), 'e1cib/app/Обработка.Имя' or
-    'e1cib/command/...'. The navigation link is usually how a scenario starts, since it opens a
-    list or form without hunting through the command interface first."""
+    """Open a navigation link, e.g. 'e1cib/list/Справочник.Контрагенты', 'e1cib/app/Обработка.Имя'
+    or a URL returned by the command interface. For a button name or title, find it and use click.
+    Returns the resulting window; an opened error window is a failure."""
     c = _need()
+    if not isinstance(command, str) or not re.fullmatch(
+            r'(?:e1cib/\S.*|(?:e1c|https?)://\S.*)', command.strip(), re.IGNORECASE) or any(
+                ord(ch) < 32 for ch in command):
+        return {'ok': False, 'code': 'invalid_navigation_link',
+                'error': 'Pass a navigation link, not a button name or title.',
+                'suggested_action': 'find_objects',
+                'message': 'Find the button by name or title, then call click on its ref.'}
+    command = command.strip()
     wk = _winkey(c); ok = True
     for kind in ('action', 'commit'):
         ok = c.send_cmd(G.EXECUTE_COMMAND, wk, kind=kind, middle=tc1c.mk_command(command))['ok'] and ok
     _state['window_key'] = None          # команда могла открыть/переключить окно
-    return {'ok': ok, 'command': command}
+    result = {'ok': ok, 'command': command}
+    if ok:
+        try:
+            window = _window(c)
+            result['window'] = window
+            if window.get('key'):
+                title, form = _form_title(c, window['key'])
+                if title is not None:
+                    window['title'] = title
+                if form:
+                    window['form_name'] = form
+                if form == 'ErrorWindow':
+                    result.update(ok=False, code='navigation_failed',
+                                  error='1C opened an error window instead of completing navigation.',
+                                  suggested_action='find_objects',
+                                  message='Read the fields of the returned error window for details.')
+            else:
+                result['verification'] = 'window_unavailable'
+        except Exception:
+            result['verification'] = 'window_unavailable'
+    return result
 
 @_action('tc_window')
 def tc_get_command_interface() -> dict:
@@ -2397,14 +2522,44 @@ def tc_begin_edit_current_area(key: str, handle: str) -> dict:
     In view mode this can instead open a drill-down menu, object or field chooser.
     A menu may leave the active window unchanged; use execute_choice_from_menu to continue."""
     c = _need()
+    before = _area_action_window(c)
     ok = True
     for kind in ('action', 'commit'):
         ok = c.send_cmd(G.BEGIN_EDIT_CURRENT_AREA, key, kind=kind, middle=b'', handle=handle)['ok'] and ok
+    result = {'ok': ok, 'target': key}
     if ok:
+        after = _area_action_window(c)
+        changed = before != after if before and after else None
+        result['window_changed'] = changed
+        mode = None
+        if changed is False and _guid_available(c, G.CURRENT_MODE_IS_EDIT_FIELD):
+            try:
+                mode = _cell_flag(c, G.CURRENT_MODE_IS_EDIT_FIELD, key, handle)
+            except Exception:
+                pass
+        result['edit_mode'] = mode
         pending = getattr(c, '_pending_area_edits', set())
-        pending.add(key)
+        if mode is not False and changed is not True:
+            pending.add(key)
+        else:
+            pending.discard(key)
         c._pending_area_edits = pending
-    return {'ok': ok, 'target': key}
+        if changed is True:
+            result.update(suggested_action='get_active_window',
+                          message='The action changed the active window. Inspect it to continue.')
+        elif mode is False:
+            result.update(suggested_action='execute_choice_from_menu',
+                          message='Cell editing did not start. If this area opens a drill-down menu, use execute_choice_from_menu on this field.')
+    return result
+
+
+def _area_action_window(c):
+    if not _guid_available(c, G.GET_ACTIVE_WINDOW):
+        return None
+    try:
+        return _window(c).get('key')
+    except Exception:
+        return None
 
 @_action('tc_doc')
 def tc_end_edit_current_area(key: str, handle: str, cancel: bool = False) -> dict:
@@ -2488,7 +2643,12 @@ def _merged_area(c, key, handle, address):
     адреса — снимаем его, иначе одиночная ячейка выглядела бы объединённой областью."""
     r = c.send_cmd(G.INCLUDED_IN_MERGED_AREA, key, kind='read',
                    middle=tc1c.mk_area(address), handle=handle)
-    vals = [x for x in _vals(r) if x != address]
+    text = tc1c.decode_area_text(_body(r), address)
+    if text is not None:
+        return text, r['ok']
+    vals = _vals(r)
+    if vals and vals[0] == address:
+        vals = vals[1:]  # Remove only the argument echo, even when the result is identical.
     return (vals[-1] if vals else None), r['ok']
 
 def _area_text_read(c, guid, key, handle, area):
@@ -2980,7 +3140,8 @@ def tc_write_content_to_file(key: str, handle: str, filename: str = None,
                             save_as: bool = None) -> dict:
     """Save an HTML, formatted, spreadsheet or text document field. PDF fields do not support
     this action. With filename, Save As is used even for a previously saved document; this call
-    replaces pending file-dialog answers and clears its answer afterwards.
+    replaces pending file-dialog answers and clears its answer afterwards on 8.3.25+.
+    Older platforms cannot clear unused answers; prepare only the next dialog.
     For spreadsheets choose file_format: mxl, html, pdf, xls, xlsx, ods or docx. Example:
     filename="C:/exports/report.xlsx", file_format="xlsx". The extension alone does not select
     a format. Alternatively filter_index selects a dialog's file type (0-based); do not combine
@@ -3017,13 +3178,18 @@ def tc_write_content_to_file(key: str, handle: str, filename: str = None,
             return {'ok': False, 'error': 'the filename extension does not match the selected format; '
                     'use file_format="%s" or change the filename' % ext}
     use_save_as = bool(filename) if save_as is None else save_as
+    can_clear = _guid_available(c, G.CLEAR_FILE_DIALOG_RESULT)
     out = {'ok': False, 'target': key, 'filename': filename, 'save_as': use_save_as}
     if filename:
         out['filter_index'] = index
         if file_format: out['file_format'] = file_format
-        cleared = c.send_cmd(G.CLEAR_FILE_DIALOG_RESULT, None, kind='commit', middle=b'')
-        if not cleared['ok']:
-            return dict(out, error='previous file-dialog answers could not be cleared; save was not sent')
+        if can_clear:
+            cleared = c.send_cmd(G.CLEAR_FILE_DIALOG_RESULT, None, kind='commit', middle=b'')
+            if not cleared['ok']:
+                return dict(out, error='previous file-dialog answers could not be cleared; save was not sent')
+        else:
+            out.update(dialog_answer_cleared=False,
+                       message='This platform cannot clear pending file-dialog answers; prepare only the next dialog.')
     try:
         if filename:
             pre = c.send_cmd(G.SET_FILE_DIALOG_RESULT, None, kind='commit',
@@ -3038,7 +3204,7 @@ def tc_write_content_to_file(key: str, handle: str, filename: str = None,
         out['ok'] = ok
         return out
     finally:
-        if filename:
+        if filename and can_clear:
             cleaned = c.send_cmd(G.CLEAR_FILE_DIALOG_RESULT, None, kind='commit', middle=b'')
             out['dialog_answer_cleared'] = cleaned['ok']
             if not cleaned['ok']:
@@ -3121,11 +3287,13 @@ def tc_set_file_dialog_result(result: bool = True, filename: str | list = None,
     """Predefine the next file dialog's result: result=True + filename to simulate picking a
     file, result=False to cancel. Pass a list of names to simulate a multi-file selection.
     filter_index selects which dialog filter is active (0-based).
-    Replaces any previous pending answer. The next file dialog consumes it;
-    clear_file_dialog_result cancels an unused answer. Call BEFORE opening the dialog;
+    On 8.3.25+, replaces pending answers; clear_file_dialog_result cancels an unused answer.
+    Older platforms cannot clear unused answers; prepare only the next dialog.
+    Each answer is consumed once. Call BEFORE opening the dialog;
     this cannot answer a file dialog that is already open."""
     c = _need()
     middle = tc1c.mk_set_file_dialog_result(result, filename, filter_index)
+    can_clear = _guid_available(c, G.CLEAR_FILE_DIALOG_RESULT)
     try:
         # Setting the next answer can succeed even while an already-open native dialog
         # blocks normal commands. Check responsiveness before changing the pending answer.
@@ -3133,7 +3301,8 @@ def tc_set_file_dialog_result(result: bool = True, filename: str | list = None,
         if not ready.get('ok'):
             return {'ok': False, 'prepared': False, 'code': 'client_state_unavailable',
                     'error': 'The client state could not be checked; no file selection was prepared.'}
-        cleared = c.send_cmd(G.CLEAR_FILE_DIALOG_RESULT, None, kind='commit', middle=b'')
+        cleared = (c.send_cmd(G.CLEAR_FILE_DIALOG_RESULT, None, kind='commit', middle=b'')
+                   if can_clear else {'ok': True})
     except tc1c.OperationError as exc:
         return dict(exc.result(), prepared=False)
     if not cleared.get('ok'):
@@ -3145,7 +3314,7 @@ def tc_set_file_dialog_result(result: bool = True, filename: str | list = None,
     except tc1c.OperationError as exc:
         return dict(exc.result(), prepared=False)
     return {'ok': r['ok'], 'result': result, 'filename': filename if result else None,
-            'filter_index': filter_index, 'replaces_pending': True,
+            'filter_index': filter_index, 'replaces_pending': can_clear,
             'prepared': bool(r['ok']), 'applies_to': 'next_dialog'}
 
 @_action('tc_app')
@@ -3498,6 +3667,56 @@ def _rec_note(action, key, obs, changed):
     log.append({'call': len(log) + 1, 'action': action, 'target': key,
                 'observed': obs, 'changed': changed})
 
+
+def _native_composite_begin(c):
+    """Keep native events around a composite whose cleanup 1C does not record.
+
+    Close the preceding native fragment before changing selection. Capture the composite
+    from its actual accepted commands, then restart native recording. This avoids matching
+    or rewriting similar table actions in an unrelated part of the native log.
+    """
+    if not (_state.get('rec_active') and _state.get('rec_mode') == 'native'
+            and c._track is not None):
+        return None
+    if _state.get('rec_native_stopped'):
+        raise _CellEditFailure('Finish or cancel the interrupted recording before continuing.',
+                               {'code': 'recording_incomplete'})
+    try:
+        r = c.send_cmd(G.UILOG, None, kind='read818', middle=REC_FINISH)
+        _cell_step(r, 'The preceding scenario fragment could not be captured.')
+        _state.setdefault('rec_native_parts', []).append(tc1c.extract_uilog(_body(r)))
+        _state['rec_native_stopped'] = True
+        return len(c._track)
+    except Exception:
+        _state.setdefault('rec_native_errors', []).append('read_rows')
+        raise
+
+
+def _native_composite_end(c, mark):
+    try:
+        _state.setdefault('rec_native_parts', []).append(_synth_uilog(c._track[mark:]))
+        r = c.send_cmd(G.UILOG, None, kind='read818', middle=REC_START)
+        _cell_step(r, 'Native recording could not be restarted.')
+        _state.pop('rec_native_stopped', None)
+    except Exception:
+        _state.setdefault('rec_native_errors', []).append('read_rows')
+        raise
+
+
+def _join_uilogs(parts):
+    import xml.etree.ElementTree as ET
+    root = ET.Element('uilog')
+    for part in parts:
+        if part:
+            try:
+                fragment = ET.fromstring(part)
+            except ET.ParseError as exc:
+                raise ValueError('Invalid scenario fragment.') from exc
+            if fragment.tag.rsplit('}', 1)[-1] != 'uilog':
+                raise ValueError('Unexpected scenario fragment root.')
+            root.extend(fragment)
+    return ET.tostring(root, encoding='unicode', xml_declaration=True)
+
 @_action('tc_scenario')
 def tc_record_start() -> dict:
     """Start recording a scenario (uilog) that tc_run_scenario can replay later. Perform the real,
@@ -3538,9 +3757,28 @@ def tc_record_finish(path: str = None) -> dict:
     # а данных уже нет — повтор вернул бы пустой сценарий как успех
     _state.pop('rec_active', None)
     mode = _state.get('rec_mode', 'native')
-    r = c.send_cmd(G.UILOG, None, kind='read818', middle=REC_FINISH)
+    parts = _state.pop('rec_native_parts', [])
+    native_errors = _state.pop('rec_native_errors', [])
+    stopped = _state.pop('rec_native_stopped', False)
+    try:
+        r = ({'ok': False, 'raw': b''} if stopped else
+             c.send_cmd(G.UILOG, None, kind='read818', middle=REC_FINISH))
+    except Exception:
+        if not parts:
+            raise
+        r = {'ok': False, 'raw': b''}
+        native_errors.append('read_rows')
     native_xml = tc1c.extract_uilog(_body(r))
+    if parts and not r.get('ok'):
+        native_errors.append('read_rows')
     xml = _synth_uilog(tracked) if mode == 'synth' else native_xml
+    unmerged = None
+    if mode == 'native' and parts:
+        try:
+            xml = _join_uilogs([*parts, native_xml])
+        except ValueError:
+            native_errors.append('read_rows')
+            unmerged = [*parts, native_xml]
     lost = []
     if mode == 'synth':
         lost = _synth_unhandled(tracked)   # мутаторы без synth-обработчика
@@ -3548,6 +3786,7 @@ def tc_record_finish(path: str = None) -> dict:
         for g, _k, _m, _kind in tracked:
             if g in _NONREC_MUTATORS and _NONREC_MUTATORS[g] not in lost:
                 lost.append(_NONREC_MUTATORS[g])
+    lost.extend(a for a in dict.fromkeys(native_errors) if a not in lost)
     obs_log = _state.pop('rec_obs', None)
     if obs_log is None:
         obs_log = _state.pop('rec_obs_paused', None) or []   # завершение на паузе
@@ -3558,6 +3797,11 @@ def tc_record_finish(path: str = None) -> dict:
            'readback': 'on' if READBACK else 'off',
            'observed': len(seen), 'not_observed': len(obs_log) - len(seen),
            'scope': _REC_SCOPE}
+    if native_errors:
+        out.update(ok=False, code='recording_incomplete',
+                   error='Some actions could not be recorded completely; inspect lost_actions before replay.')
+    if unmerged is not None:
+        out['uilog_fragments'] = unmerged
     if path:
         # Запись сценария к этому моменту завершена НЕОБРАТИМО: трекер снят, журнал наблюдений
         # забран, кадр завершения отправлен. Любое исключение отсюда унесло бы сценарий с собой,
@@ -4568,7 +4812,10 @@ def tc_set_cell_text(key: str, column: str, text: str, handle: str) -> dict:
         _cell_window(c, window)
         editing = mode is True
         if not editing:
-            raise _CellEditFailure('the table did not enter edit mode')
+            raise _CellEditFailure('The form did not allow this cell to enter editing.' if mode is False
+                                   else 'The row edit mode could not be determined.',
+                                   {'code': 'row_edit_refused' if mode is False else 'edit_state_unavailable',
+                                    'edit_mode': mode})
         stage = 'input'
         _cell_step(tc_input_text(col['key'], text, col['handle']), 'text input failed')
         _cell_window(c, window)
@@ -4584,13 +4831,30 @@ def tc_set_cell_text(key: str, column: str, text: str, handle: str) -> dict:
         return _cell_result(key, before, after, text, 'done')
     except _CellEditFailure as exc:
         result = _cell_result(key, before, after, text, stage, str(exc))
-        for name in ('code', 'status_code', 'suggested_action', 'message', 'recovery'):
+        for name in ('code', 'status_code', 'suggested_action', 'message', 'recovery', 'edit_mode'):
             if name in exc.details:
                 result[name] = exc.details[name]
     except Exception as exc:
         result = _cell_result(key, before, after, text, stage, str(exc))
         if isinstance(exc, tc1c.OperationError):
             result.update(exc.result())
+    if result.get('code') == 'row_edit_refused':
+        result.update(requested_column=column, suggested_action='choose_row',
+                      message='The current cell can be restricted by form rules even when its column is enabled. '
+                              'Choosing the current cell may show an explanation or open its associated form; '
+                              'then read get_user_message_texts. No text was entered.')
+        try:
+            _cell_window(c, window)
+            after = _obs_cell(c, key, handle, column)
+            result.update(value_after=after, changed=before != after if after is not None else None)
+            if _guid_available(c, G.GET_USER_MESSAGE_TEXTS):
+                messages = tc_get_user_message_texts()
+                result['messages'] = messages.get('messages') if messages.get('ok') else None
+                if result['messages']:
+                    result['messages_scope'] = 'window'
+                    result['message'] += ' Existing window messages may include earlier actions.'
+        except Exception:
+            pass  # Keep the original refusal when supplementary diagnostics are unavailable.
     if stage == 'input' and result.get('suggested_action') == 'start_choosing':
         # The composite result addresses the table, while choosing addresses its editor.
         result.update(suggested_action='get_current_item',

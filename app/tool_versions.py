@@ -105,6 +105,7 @@ TOOL_MIN_VERSION = {
     'tc_is_visible':                         '8.3.3',
     'tc_open_drop_list':                     '8.3.6',
     'tc_open_field':                         '8.3.1',
+    'tc_read_rows':                          '8.3.6',
     'tc_record_cancel':                      '8.3.2',
     'tc_record_finish':                      '8.3.2',
     'tc_record_pause':                       '8.3.2',

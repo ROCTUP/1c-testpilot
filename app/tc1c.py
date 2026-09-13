@@ -440,7 +440,7 @@ class OperationError(RuntimeError):
         known = {
             7: ('target_unavailable', 'The target element is unavailable. Find it again.'),
             8: ('target_hidden', 'The target element is not visible.'),
-            9: ('target_not_interactive', 'The element is unavailable for interaction. Check the active window and any open dialogs.'),
+            9: ('target_not_interactive', 'The action is unavailable in the current form state. An enabled element can still refuse it; check the command conditions, active window and dialogs.'),
             10: ('unsupported_element_type', 'The test client does not support this action for this element type.'),
             11: ('invalid_element_state', 'The element is not in a state that permits this action.'),
             12: ('value_not_found', 'The requested value is not present in this element.'),
@@ -969,6 +969,23 @@ def _text_at(raw, i, *, compact=True):
     except UnicodeDecodeError:
         return 0, None
     return size, value
+
+
+def decode_field_text(raw, *, property_value=False):
+    """Text at the known scalar reply boundary, without filtering its contents.
+
+    Empty/unavailable scalar markers remain for the caller's element-type checks.
+    Consume the envelope first so UUID bytes and the echoed key cannot become data.
+    """
+    p = _reply_status_offset(raw)
+    prefix = b'\x81\x81\x81' + (b'\xe0\x4b\x53' if property_value else b'')
+    suffix = (b'\x20\x20' if property_value else b'\x20') + b'\xa1\xa3' + TR
+    if p is None or not raw.startswith(prefix, p) or not raw.endswith(suffix):
+        return None
+    p += len(prefix)
+    size, text = _text_at(raw, p)
+    return text if size and p + size == len(raw) - len(suffix) else None
+
 
 def decode_cell_text(raw):
     """GetCellText returns text before the echoed column; compact bytes are characters."""
