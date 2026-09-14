@@ -1,8 +1,10 @@
 [project]
 name = "1c-testpilot"
-version = "1.0.3"
+version = "1.1.0"
 description = "MCP-сервер для управления тест-клиентом 1С:Предприятие"
 readme = "README.md"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "ROCTUP" }]
 keywords = ["1c", "mcp", "openai", "gateway", "bsl", "testclient", "testing", "ui-automation", "claude"]
@@ -13,6 +15,9 @@ dependencies = [
     "pefile",
     "cryptography>=43",
     "pywin32; sys_platform == 'win32'",
+    "Pillow>=10",
+    "psutil>=6.0",
+    "python-xlib>=0.33; sys_platform == 'linux'",
 ]
 
 [project.urls]
@@ -22,9 +27,9 @@ Repository = "https://github.com/ROCTUP/1c-testpilot"
 "1c-testpilot" = "server:main"
 
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 package-dir = { "" = "app" }
-py-modules = ["server", "tc1c", "guids", "_collection", "_response", "_refs", "_connections", "_native_window", "tool_versions"]
+py-modules = ["server", "tc1c", "guids", "_collection", "_response", "_refs", "_connections", "_native_window", "_screenshots", "_screenshot_windows", "_screenshot_linux", "_screenshot_image", "tool_versions"]

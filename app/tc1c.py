@@ -578,15 +578,19 @@ def decode_expanded(raw):
     Третья раскладка булева ответа: `<результат> cb 55 20 20 ¡£`, результат вплотную перед
     `cb 55`. Ни маркер перед эпилогом (decode_bool), ни `cb-4` (decode_goto_row) сюда не
     подходят — у каждого метода своя длина средней части, поэтому распознаватель отдельный."""
-    cb = raw.rfind(b'\xcb\x55')
-    if cb < 1:
-        # При адресации строки её Соответствие возвращается вместо пустого 55.
-        cb = raw.rfind(b'\xcb\x23\x95' + _GOTOROW_MAPTYPE)
-    if cb < 1:
+    # Consume the envelope (including GUIDs and receiver text). The boolean is
+    # before the echoed criterion; its contents cannot identify this boundary.
+    p = _reply_status_offset(raw)
+    if p is None or raw[p:p+3] != b'\x81\x81\x81':
         return None
-    m = raw[cb - 1]
-    if m == 0xe2: return True
-    if m == 0xe1: return False
+    m = raw[p + 3:p + 4]
+    tail = raw[p + 4:]
+    if tail != b'\xcb\x55\x20\x20\xa1\xa3' + TR and not (
+            tail.startswith(b'\xcb\x23\x95' + _GOTOROW_MAPTYPE)
+            and tail.endswith(b'\x20\x20\x20\x20\x20\xa1\xa3' + TR)):
+        return None
+    if m == b'\xe2': return True
+    if m == b'\xe1': return False
     return None
 
 def decode_bool(raw):
@@ -793,33 +797,42 @@ def validate_address(key, handle=None):
         except ValueError:
             raise ValueError('invalid handle: use the handle returned with this element') from None
 
+def _perf_number_at(raw, i):
+    """Read one numeric metric; never search subsequent fields for digits."""
+    if i >= len(raw):
+        return 0, None
+    tag = raw[i]
+    if 0x81 <= tag <= 0x8a:
+        return 1, tag - 0x81
+    fmt = {0x8b: '<B', 0x8d: '<H', 0x8f: '<i'}.get(tag)
+    if fmt:
+        size = 1 + struct.calcsize(fmt)
+        return (size, struct.unpack_from(fmt, raw, i + 1)[0]) if i + size <= len(raw) else (0, None)
+    # Decimal numbers in native performance replies: 96 1a <byte count> <ASCII>.
+    if raw[i:i+2] == b'\x96\x1a' and i + 3 <= len(raw):
+        size = 3 + raw[i + 2]
+        if i + size <= len(raw):
+            value = raw[i + 3:i + size]
+            if re.fullmatch(rb'[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?', value):
+                return size, float(value) if b'.' in value or b'e' in value.lower() else int(value)
+            return size, None
+    return 0, None
+
+
 def parse_perf(raw):
     """{имя: значение} для GetAccumulatedPerformanceIndicators.
     Запись счётчика: 53 97 <len8> <utf16-имя> eb 4e <значение>.
-    Значение: 8b=int8 / 8d=int16 / 8f=int32, иначе ASCII-десятичное (напр. '0.008')."""
-    res = {}; i = 0; mk = bytes([0x53, 0x97])
+    Значение: компактное целое, 8b/8d/8f либо 96 1a + длина + ASCII-десятичное."""
+    res = {}; i = _reply_status_offset(raw) or 0; mk = bytes([0x53, 0x97])
     while True:
         p = raw.find(mk, i)
         if p < 0:
             break
-        ln = raw[p+2]
-        name = raw[p+3:p+3+ln*2].decode('utf-16le', 'replace')
-        v = raw[p+3+ln*2:]
-        i = p+3+ln*2
-        if v[:2] == bytes([0xeb, 0x4e]):
-            b = v[2:]; t = b[0]
-            if t == 0x8b:   val = b[1]
-            elif t == 0x8d: val = struct.unpack_from('<H', b, 1)[0]
-            elif t == 0x8f: val = struct.unpack_from('<i', b, 1)[0]
-            else:
-                run = ''; started = False
-                for ch in b:
-                    c = chr(ch)
-                    if c in '0123456789.': run += c; started = True
-                    elif started: break
-                # контракт метода: все показатели — ЧИСЛО (Длительность приходит ASCII-строкой)
-                try:    val = float(run) if '.' in run else int(run)
-                except ValueError: val = None
+        size, name = _text_at(raw, p + 1, compact=False)
+        i = p + 1 + max(size, 1)
+        if size and raw[i:i+2] == b'\xeb\x4e':
+            size, val = _perf_number_at(raw, i + 2)
+            i += 2 + size
             if all(0x20 <= ord(c) < 0x500 for c in name):
                 res[name] = val
     return res

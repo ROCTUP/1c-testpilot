@@ -11,6 +11,8 @@ import _response
 import _refs
 import _collection
 import _connections
+import _screenshots
+from mcp.types import CallToolResult, ImageContent, TextContent
 import anyio
 # Минимальная версия платформы 1С: по инструменту и по GUID метода (для воспроизведения
 # сценариев, где метод известен только по GUID).
@@ -35,13 +37,14 @@ REC_FINISH   = b'\xe5\x81'             # FinishUILogRecording (read818)
 CAL_MONTH_DATE = bytes.fromhex('f100b073f89b450200')
 
 mcp = FastMCP(
-    '1c-testclient',
+    '1c-testpilot',
     host=os.environ.get('TC1C_HTTP_HOST', '127.0.0.1'),
     port=int(os.environ.get('TC1C_HTTP_PORT', '6004')),
     streamable_http_path=os.environ.get('TC1C_HTTP_PATH', '/mcp'),
 )
 _state = _connections.State()
 _pool = _connections.Pool(_state)
+SCREENSHOTS = os.environ.get('TC1C_SCREENSHOTS', 'true').strip().lower() not in ('false', '0', 'no', 'off')
 
 _ACTIONS = {}          # группа -> {действие: функция-обработчик}
 
@@ -131,13 +134,16 @@ def _tree_criteria(c, key, pairs):
         return []
     if _key_class(key) != 'Table':
         raise _TreeCriterionError('invalid_table', 'Row criteria require a table.')
+    for column, value in pairs:
+        if not isinstance(column, str) or not column or value is None:
+            raise _TreeCriterionError('invalid_row_criterion', 'Supply both row_column and row_value.')
+    # The table address is known: its GetChildObjects is available from 8.3.1.
+    # Resolving a name to a title is required for the native row criterion.
     columns = _table_columns(c, key)
     if not columns:
         raise _TreeCriterionError('columns_unavailable', 'The table columns could not be read.')
     result = []
     for column, value in pairs:
-        if not isinstance(column, str) or not column or value is None:
-            raise _TreeCriterionError('invalid_row_criterion', 'Supply both row_column and row_value.')
         matches = [o for o in columns if column in (o.get('name'), o.get('title'))]
         if not matches:
             raise _TreeCriterionError('column_not_found', 'Use a column name or title returned by find_objects for this table.')
@@ -538,7 +544,16 @@ def _kind_of(c, key):
     и это штатный исход, а не признак чего-либо."""
     if not key or '.' not in key:
         return None
-    parent = key.rsplit('.', 1)[0]
+    if not _guid_available(c, G.GET_CHILD_OBJECTS):
+        return None
+    parent = _collection_parent(key)
+    if not parent:
+        return None
+    # Addressed form/field metadata exists from 8.3.1. Window children require
+    # 8.3.2; the public tool's 8.3.3 minimum includes finding the active window.
+    version = _vt(_conn_ver(c))
+    if _key_class(parent) in ('MainFrame', 'SecondaryFrame') and version and version < (8, 3, 2):
+        return None
     try:
         r = c.send_cmd(G.GET_CHILD_OBJECTS, parent, kind='read', middle=CHILD_MIDDLE)
     except Exception:
@@ -692,6 +707,10 @@ def _resolve_column(c, key, handle, column):
     Неоднозначность разрешается ОТКАЗОМ: один заголовок могут носить несколько колонок, и выбор
     первой попавшейся вернул бы значение чужой колонки под видом запрошенной."""
     if not column or not isinstance(column, str):
+        return None
+    # Optional traversal must not poison a supported action on older clients.
+    version = _vt(_conn_ver(c))
+    if version and version < _vt(TOOL_MIN_VERSION['tc_get_child_objects']):
         return None
     try:
         cols = [i for i in _walk_tree(c, key)
@@ -1296,6 +1315,20 @@ def tc_list_connections() -> dict:
     return {'ok': True, 'connections': _pool.list()}
 
 # ============================== окно / дерево ================================
+@_action('tc_app')
+def tc_get_screenshot(scale: int = 100, grid: bool = False, region: list[int] = None):
+    """Capture the connected 1C window with popups as an image, without changing focus.
+    Requires a local client on Windows or Linux with X11/XWayland and desktop access. scale: 25..100 percent.
+    Optional region=[x,y,width,height] uses original screenshot pixels; grid labels those coordinates.
+    capture_complete=false means some popups are missing. Screenshots are not recorded in scenarios."""
+    if not SCREENSHOTS:
+        return {'ok': False, 'code': 'screenshots_disabled', 'error': 'Screenshots are disabled on this server.'}
+    try:
+        return _screenshots.capture(_need(), scale=scale, grid=grid, region=region)
+    except _screenshots.CaptureError as exc:
+        return {'ok': False, 'code': exc.code, 'error': str(exc)}
+
+
 @_action('tc_app')
 def tc_get_active_window() -> dict:
     """Return the application's active window: {key, class, title, platform_version} and sometimes
@@ -3276,6 +3309,10 @@ def _column_error(c, key, column, *, resolved=None):
     if _key_class(key) != 'Table':
         return {'ok': False, 'column': column, 'code': 'invalid_table', 'error': 'Address the table containing the cell.'}
     if isinstance(column, str):
+        # Preserve native name-based reads before full discovery is exposed.
+        version = _vt(_conn_ver(c))
+        if version and version < _vt(TOOL_MIN_VERSION['tc_get_child_objects']):
+            return None
         cols = _table_columns(c, key)
         matches = [o for o in cols if o.get('name') == column]
         if resolved is not None:
@@ -3316,7 +3353,7 @@ def _row_criteria_error(c, key, pairs):
     for column, value in pairs:
         if not isinstance(column, str) or not column or _is_index(column):
             return {'ok': False, 'code': 'invalid_column', 'error': _COLUMN_BY_TITLE}
-    # GotoRow exists in 8.3.2; discovering its columns requires 8.3.3.
+    # Preserve native title-based search before full discovery is exposed.
     version = _vt(_conn_ver(c))
     if version and version < _vt(TOOL_MIN_VERSION['tc_get_child_objects']):
         return None
@@ -3730,25 +3767,37 @@ def _synth_step(guid, key, middle):
 def _synth_rowdesc(m):
     """Извлечь ВСЕ пары [(колонка, значение)] из middle с ОписаниеСтроки. Пара:
     <c0 | 20 e0> 4b 53 + колонка + eb 53 + значение. None, если описания строки нет."""
-    p = m.find(b'\xc0\x4b\x53')
-    if p < 0:
+    header = b'\x23\x95' + tc1c._GOTOROW_MAPTYPE
+    p = m.find(header)
+    if p < 0 or p + len(header) >= len(m):
         return None
-    out = []; i = p
-    while True:
-        q = m.find(b'\x4b\x53', i)
-        e = m.find(b'\xeb\x53', q + 2) if q >= 0 else -1
-        if q < 0 or e < 0:
-            break
-        col = _synth_dec_str(m[q+2:])
-        rest = m[e+2:]
-        iv = _synth_dec_int(rest)
-        num = iv is not None and rest[:1] in (b'\x8b', b'\x8d', b'\x8f')
-        val = str(iv) if num else _synth_dec_str(rest)
-        step = tc1c.value_size(m, e + 2)      # размер значения зависит от тега, а не от len(val)
-        if not col or not step:
-            break
+    i = p + len(header)
+    count = m[i] - 0xc1
+    i += 1
+    out = []
+    for index in range(count):
+        marker = b'\xc0\x4b\x53' if index == 0 else b'\x20\xe0\x4b\x53'
+        if not m.startswith(marker, i):
+            return None
+        i += len(marker)
+        size, col = tc1c._text_at(m, i, compact=False)
+        if not size:
+            return None
+        i += size
+        if not m.startswith(b'\xeb\x53', i):
+            return None
+        i += 2
+        if m[i:i+1] in (b'\x8b', b'\x8d', b'\x8f'):
+            size = tc1c.value_size(m, i)
+            if i + size > len(m):
+                return None
+            val = str(_synth_dec_int(m[i:i+size]))
+        else:
+            size, val = tc1c._text_at(m, i, compact=False)
+            if not size:
+                return None
         out.append((col, val))
-        i = e + 2 + step
+        i += size
     return out or None
 
 # Обратная карта GUID->имя и классификация «мутатор» (для контроля покрытия synth).
@@ -5731,6 +5780,16 @@ def _dispatch_connected_action(acts, group, kw, connection_id=None):
             raise ValueError('%s(action="%s"): %s' % (group, name, message))
         bound.apply_defaults()
         res = fn(*bound.args, **bound.kwargs)
+        if isinstance(res, _screenshots.Screenshot):
+            metadata = dict(res.metadata)
+            if connection_id is not None:
+                metadata['connection_id'] = connection_id
+            message = _response.respond(metadata)
+            if not isinstance(message, str):
+                message = json.dumps(message, ensure_ascii=False)
+            return CallToolResult(content=[TextContent(type='text', text=message),
+                ImageContent(type='image', mimeType='image/png', data=base64.b64encode(res.png).decode('ascii'))],
+                structuredContent=metadata)
         if _response.REF_MODE == 'id' and _state.get('client') is not None:
             res = _refs.present(res, name, _refs.for_client(_state['client']))
     except _refs.RefError as exc:
@@ -5797,7 +5856,8 @@ def _register_groups():
     published = {}
     for group, actions in _ACTIONS.items():
         acts = {a: fn for a, fn in actions.items()
-                if not (tv and _ver_tuple(TOOL_MIN_VERSION.get('tc_' + a, '')) > tv)}
+                if not (tv and _ver_tuple(TOOL_MIN_VERSION.get('tc_' + a, '')) > tv)
+                and (a != 'get_screenshot' or SCREENSHOTS)}
         if acts:
             published[group] = acts        # группа без доступных действий не публикуется вовсе
     pub_group = {a: g for g, acts in published.items() for a in acts}
