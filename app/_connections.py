@@ -77,6 +77,7 @@ class Connection:
                 'version': getattr(c, 'platform_version', None),
                 'connected': c is not None, 'starting': self.starting,
                 'launched': bool(self.state.get('launched_pid')),
+                'desktop': self.state.get('desktop'),
                 'recording': bool(self.state.get('rec_active'))}
 
 
@@ -180,11 +181,29 @@ class Pool:
 
     def close(self):
         with self.lock: entries = list(self.entries.values())
+        failures = []
         for connection in entries:
             with connection.lock:
                 c = connection.state.get('client')
                 if c is not None:
                     try: c.close()
                     except Exception: pass
+                isolated = connection.state.get('_isolated_process')
+                if isolated is not None:
+                    try: isolated.close()
+                    except Exception as exc:
+                        failures.append(exc)
+                        continue
                 connection.state.clear()
-        with self.lock: self.entries.clear()
+                with self.lock: self.entries.pop(connection.id, None)
+        isolated = self.state.legacy.get('_isolated_process')
+        if isolated is not None:
+            try:
+                isolated.close()
+                c = self.state.legacy.get('client')
+                if c is not None: c.close()
+                self.state.legacy.clear()
+                self.state.legacy.update(empty_state())
+            except Exception as exc: failures.append(exc)
+        if failures:
+            raise OSError('Could not release an isolated client: %s' % failures[0])

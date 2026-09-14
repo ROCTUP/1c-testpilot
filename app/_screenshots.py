@@ -88,19 +88,26 @@ def capture(client, scale=100, grid=False, region=None):
         raise CaptureError('screenshot_platform_unsupported', 'Screenshot capture is available on Windows and Linux with X11/XWayland.')
     pid, created = resolve_process(client)
     request = dict(pid=pid, created=created, scale=scale, grid=grid, region=region)
+    isolated = vars(client).get('_isolated_process')
     try:
-        helper = '_screenshot_linux.py' if sys.platform == 'linux' else '_screenshot_windows.py'
-        result = subprocess.run([sys.executable, str(Path(__file__).with_name(helper)),
-                                 json.dumps(request)], stdin=subprocess.DEVNULL, capture_output=True, timeout=CAPTURE_TIMEOUT,
-                                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0) if sys.platform == 'win32' else 0)
+        if isolated is not None:
+            out = isolated.call('screenshot', request, timeout=CAPTURE_TIMEOUT)
+        else:
+            helper = '_screenshot_linux.py' if sys.platform == 'linux' else '_screenshot_windows.py'
+            result = subprocess.run([sys.executable, str(Path(__file__).with_name(helper)),
+                                     json.dumps(request)], stdin=subprocess.DEVNULL, capture_output=True, timeout=CAPTURE_TIMEOUT,
+                                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0) if sys.platform == 'win32' else 0)
+            if result.returncode or len(result.stdout) > MAX_PNG_BYTES * 2:
+                raise CaptureError('screenshot_failed', 'The screenshot could not be captured.')
+            out = json.loads(result.stdout)
     except subprocess.TimeoutExpired as exc:
         raise CaptureError('screenshot_timeout', '1C did not provide a screenshot in time. The client was left unchanged.') from exc
     except OSError as exc:
         raise CaptureError('screenshot_failed', 'The screenshot helper could not be started.') from exc
-    if result.returncode or len(result.stdout) > MAX_PNG_BYTES * 2:
-        raise CaptureError('screenshot_failed', 'The screenshot could not be captured.')
+    except ValueError as exc:
+        if isinstance(exc, CaptureError): raise
+        raise CaptureError('screenshot_failed', 'The screenshot result could not be read.') from exc
     try:
-        out = json.loads(result.stdout)
         if not out.get('ok'):
             raise CaptureError(out['code'], out['error'])
         png = base64.b64decode(out.pop('png'), validate=True)

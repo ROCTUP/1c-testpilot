@@ -170,7 +170,7 @@
 |---|---|---|---|
 | `connect` | `ТестируемоеПриложение` · УстановитьСоединение (`Connect`) | `ТестируемоеПриложение` | `port*, host='127.0.0.1', version=None` |
 | `disconnect` | `ТестируемоеПриложение` · РазорватьСоединение (`Disconnect`) | `ТестируемоеПриложение` | `—` |
-| `launch_client` | — | — | `base*, port=None, server=False, user=None, password=None, version=None, exe=None, extra_args=None, wait=30, connect=True` |
+| `launch_client` | — | — | `base*, port=None, server=False, user=None, password=None, version=None, exe=None, extra_args=None, wait=30, connect=True, desktop="default"` |
 | `list_connections` | — | — | `—` |
 | `stop_client` | — | — | `—` |
 

@@ -1073,6 +1073,15 @@ def _native_active_window(c):
     pid = _state.get('launched_pid')
     if not pid:
         return None
+    isolated = _state.get('_isolated_process')
+    if isolated is not None:
+        try:
+            actual_pid, created = _screenshots.resolve_process(c)
+            if actual_pid != pid:
+                return None
+            return isolated.call('active_window', dict(pid=pid, created=created)).get('window')
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return None
     from _native_window import active_secondary_window
     return active_secondary_window(pid)
 
@@ -1111,6 +1120,7 @@ def tc_connect(port: int, host: str = '127.0.0.1', version: str = None) -> str:
     omitted a built-in default is used. Call this before any other tc_* tool.
     A different host/port creates another connection. The same host/port reconnects that client;
     its connection_id is retained, but find elements again before using them."""
+    host, port = _connections.endpoint(host, port)
     c = tc1c.TestClient(host, port)
     c._io_deadline = _state.get('_launch_deadline')
     if version:
@@ -1129,6 +1139,9 @@ def tc_connect(port: int, host: str = '127.0.0.1', version: str = None) -> str:
     if old is not None:
         old.close()
     _state['client'] = c
+    isolated = _state.get('_isolated_process')
+    if isolated is not None and port == _state.get('launched_port') and host in ('127.0.0.1', 'localhost', '::1'):
+        c._isolated_process = isolated
     _state['window_key'] = None
     _rec_reset()          # запись принадлежит конкретному клиенту: новая сессия её не наследует
     # версию соединения сообщаем сразу: иначе её неоткуда узнать, кроме текста отказа
@@ -1166,28 +1179,38 @@ def _find_1cv8(want_version=None):
 @_action('tc_session')
 def tc_launch_client(base: str, port: int = None, server: bool = False, user: str = None,
                      password: str = None, version: str = None, exe: str = None,
-                     extra_args: list = None, wait: int = 30, connect: bool = True) -> dict:
+                     extra_args: list = None, wait: int = 30, connect: bool = True,
+                     desktop: typing.Literal['default', 'isolated'] = 'default') -> dict:
     """Launch a 1C test client and wait until it accepts connections on `port`, then optionally
     connect to it. `base` is a file infobase path (default), or 'server\\infobase' when `server=True`.
     `user`/`password` — infobase credentials (optional; the password is passed on the command line
-    and is visible in the OS process list). `exe` — full path to 1cv8.exe on Windows,
+    and is visible in the OS process list). `exe` — full path to 1cv8.exe or 1cv8c.exe on Windows,
     or 1cv8/1cv8c on Linux (else env
     TC1C_PLATFORM_EXE or standard install path). Only the 1C platform executable is launched.
     Omit port to allocate a free local port. Each launch creates a separate connection_id.
-    Linux requires access to a graphical session via the server's DISPLAY/XAUTHORITY environment.
+    On Linux, default requires DISPLAY/XAUTHORITY for a graphical session; isolated requires Xvfb.
+    desktop: default = normal launch; isolated = a separate desktop on Windows 10+ or Linux,
+    keeping client windows away from the user's desktop. Isolated clients stop with the server.
     With connect=false ok means only that the port answers — the client can be up and showing an
     error, so check it before relying on it."""
+    if desktop not in ('default', 'isolated'):
+        return {'ok': False, 'code': 'invalid_desktop', 'error': 'desktop must be default or isolated.'}
+    if desktop == 'isolated' and os.name != 'nt' and sys.platform != 'linux':
+        return {'ok': False, 'code': 'isolated_desktop_unsupported',
+                'error': 'Isolated desktops are supported on Windows 10 or newer and Linux. Use desktop=default.'}
+    if _state.get('_isolated_process') is not None:
+        return {'ok': False, 'code': 'client_already_launched', 'error': 'Stop the isolated client before reusing this connection.'}
     exe = exe or _find_1cv8(version)
     if not exe or not os.path.isfile(exe):
         return {'ok': False, 'error': '1C platform executable not found — pass exe or set TC1C_PLATFORM_EXE'}
-    allowed = ('1cv8.exe',) if os.name == 'nt' else ('1cv8', '1cv8c')
+    allowed = ('1cv8.exe', '1cv8c.exe') if os.name == 'nt' else ('1cv8', '1cv8c')
     if os.path.basename(exe).lower() not in allowed:
         return {'ok': False, 'error': 'only %s may be launched' % ', '.join(allowed)}
     # файловую базу проверяем ДО запуска: клиент открывает порт раньше, чем смотрит на базу, и
     # по одному порту ответ выглядел бы успехом. Заодно не остаётся процесса с модальной ошибкой
     if not server and not os.path.isdir(base):
         return {'ok': False, 'error': 'base: no such infobase directory — %s' % base}
-    if os.name != 'nt' and not os.environ.get('DISPLAY'):
+    if desktop == 'default' and os.name != 'nt' and not os.environ.get('DISPLAY'):
         return {'ok': False, 'code': 'graphical_session_unavailable',
                 'error': 'Launch requires a graphical session. Start the MCP server in the desktop session '
                          'or supply its DISPLAY and XAUTHORITY environment variables.'}
@@ -1206,11 +1229,21 @@ def tc_launch_client(base: str, port: int = None, server: bool = False, user: st
     for fl in ('DETACHED_PROCESS', 'CREATE_NEW_PROCESS_GROUP'):
         flags |= getattr(subprocess, fl, 0)
     try:
-        proc = subprocess.Popen(args, creationflags=flags, close_fds=True,
-                                start_new_session=os.name != 'nt', stdin=subprocess.DEVNULL,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if desktop == 'isolated':
+            if os.name == 'nt':
+                from _desktop_windows import IsolatedProcess
+            else:
+                from _desktop_linux import IsolatedProcess
+            proc = IsolatedProcess(args)
+            _state['_isolated_process'] = proc
+        else:
+            proc = subprocess.Popen(args, creationflags=flags, close_fds=True,
+                                    start_new_session=os.name != 'nt', stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as e:
-        return {'ok': False, 'error': 'Could not launch the test client: %s' % e}
+        return {'ok': False, **({'code': 'isolated_desktop_unavailable'} if desktop == 'isolated' else {}),
+                'error': 'Could not launch the test client: %s' % e}
+    _state['desktop'] = desktop
     _state['launched_pid'] = proc.pid
     _state['launched_process'] = proc
     _state['launched_port'] = port      # чтобы tc_stop_client закрыл соединение именно с ним
@@ -1218,6 +1251,9 @@ def tc_launch_client(base: str, port: int = None, server: bool = False, user: st
     up = False
     while time.monotonic() < deadline:
         if proc.poll() is not None:
+            if desktop == 'isolated':
+                return _finish_client_launch({'ok': False, 'pid': proc.pid, 'desktop': desktop,
+                    'error': 'The isolated test client exited (code %s).' % proc.returncode})
             _state['launched_pid'] = None
             _state.pop('launched_process', None)
             _state.pop('launched_port', None)
@@ -1236,8 +1272,9 @@ def tc_launch_client(base: str, port: int = None, server: bool = False, user: st
             break
         time.sleep(max(0, min(0.5, deadline - time.monotonic())))
     if not up:
-        return {'ok': False, 'pid': proc.pid, 'error': 'the client did not start listening on port %d within %d s' % (port, wait)}
-    out = {'ok': True, 'pid': proc.pid, 'port': port, 'exe': exe, 'version': version}
+        return _finish_client_launch({'ok': False, 'pid': proc.pid, 'desktop': desktop,
+                'error': 'the client did not start listening on port %d within %d s' % (port, wait)})
+    out = {'ok': True, 'pid': proc.pid, 'port': port, 'exe': exe, 'version': version, 'desktop': desktop}
     if connect:
         # порт открывается раньше, чем платформа проверила базу, поэтому ok=true по одному порту
         # обещал бы работающий клиент и для несуществующей базы. Раз подключиться просили — оно и
@@ -1258,7 +1295,16 @@ def tc_launch_client(base: str, port: int = None, server: bool = False, user: st
                 time.sleep(max(0, min(0.5, deadline - time.monotonic())))
             finally:
                 _state.pop('_launch_deadline', None)
-    return out
+    return _finish_client_launch(out)
+
+
+def _finish_client_launch(result):
+    if not result['ok'] and _state.get('_isolated_process') is not None:
+        cleanup = tc_stop_client()
+        result['client_stopped'] = cleanup['ok']
+        if not cleanup['ok']:
+            result['cleanup_error'] = cleanup['error']
+    return result
 
 @_action('tc_session')
 def tc_stop_client() -> dict:
@@ -1268,7 +1314,16 @@ def tc_stop_client() -> dict:
     if not pid:
         return {'ok': False, 'error': 'no client was launched through tc_launch_client'}
     proc = _state.get('launched_process')
-    if os.name != 'nt':
+    isolated = _state.get('_isolated_process')
+    if isolated is not None:
+        if isolated is not proc or proc.pid != pid:
+            return {'ok': False, 'pid': pid, 'error': 'The isolated process is no longer owned by this connection.'}
+        try:
+            isolated.close()
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {'ok': False, 'pid': pid, 'error': 'Could not stop the isolated client: %s' % exc}
+        _state.pop('_isolated_process', None)
+    elif os.name != 'nt':
         if proc is None or proc.pid != pid:
             return {'ok': False, 'pid': pid, 'error': 'The launched process is no longer owned by this connection.'}
         try:
@@ -2469,8 +2524,16 @@ def _close_active_window(c, send=None, native_only=False):
     if not wk:
         native = _native_active_window(c) if active.get('native') else None
         if native:
-            from _native_window import close_secondary_window
-            closed = close_secondary_window(native)
+            isolated = _state.get('_isolated_process')
+            if isolated is not None:
+                try:
+                    pid, created = _screenshots.resolve_process(c)
+                    closed = isolated.call('close_window', dict(pid=pid, created=created, window=native)).get('closed', False)
+                except (OSError, ValueError, subprocess.TimeoutExpired):
+                    closed = False
+            else:
+                from _native_window import close_secondary_window
+                closed = close_secondary_window(native)
             if closed and getattr(c, '_track', None) is not None:
                 c._track.append((G.CLOSE, None, b'\xe2', 'action'))
             return {'ok': closed, 'closed': native['title'] if closed else None, 'native': True,
@@ -4562,13 +4625,8 @@ def _form_object(c):
 
 def _table_cells(c, table_key):
     """Колонки/ячейки таблицы: {имя_колонки: {key, handle}}."""
-    raw = _body(c.send_cmd(G.GET_CHILD_OBJECTS, table_key, kind='read', middle=CHILD_MIDDLE))
-    out = {}
-    for key, h in tc1c.object_handles(raw, table_key).items():
-        m = re.search(r'\[([^\[\]]+)\]$', key)
-        if m and 'EditField' in key:
-            out[m.group(1)] = {'key': key, 'handle': h}
-    return out
+    return {o['name']: {'key': o['key'], 'handle': o['handle']}
+            for o in _table_columns(c, table_key) if o.get('name') and o.get('handle')}
 
 @_action('tc_scenario')
 def tc_run_scenario(uilog: str = None, path: str = None) -> dict:

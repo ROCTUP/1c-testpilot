@@ -45,10 +45,11 @@ def capture_windows(request):
     user32.OpenInputDesktop.restype = wintypes.HANDLE
     user32.CloseDesktop.argtypes = [wintypes.HANDLE]
     user32.CloseDesktop.restype = wintypes.BOOL
-    desktop_handle = user32.OpenInputDesktop(0, False, 1)
-    if not desktop_handle:
-        raise CaptureError('screenshot_desktop_unavailable', 'The interactive desktop is unavailable. Unlock the client desktop session.')
-    user32.CloseDesktop(desktop_handle)
+    if not request.get('isolated'):
+        desktop_handle = user32.OpenInputDesktop(0, False, 1)
+        if not desktop_handle:
+            raise CaptureError('screenshot_desktop_unavailable', 'The interactive desktop is unavailable. Unlock the client desktop session.')
+        user32.CloseDesktop(desktop_handle)
     # All rectangles and captured pixels use the same physical coordinate system.
     user32.SetProcessDpiAwarenessContext.argtypes = [wintypes.HANDLE]
     user32.SetProcessDpiAwarenessContext.restype = wintypes.BOOL
@@ -145,7 +146,7 @@ def capture_windows(request):
             if not old or old == ctypes.c_void_p(-1).value:
                 return None
             # Prefer actual visible pixels: this also includes GPU-rendered choice lists.
-            if screen_unobstructed(w, windows, desktop):
+            if not request.get('isolated') and screen_unobstructed(w, windows, desktop):
                 if not gdi.BitBlt(dst, 0, 0, rw, rh, screen, rect[0], rect[1], 0x00CC0020 | 0x40000000):
                     return None
                 source = 'screen'
