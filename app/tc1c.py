@@ -433,6 +433,12 @@ def decode_operation_status(raw, method_guid=None):
     return None
 
 
+def empty_current_form_item(raw):
+    """Recognize an explicit absent current item, not a failed object scan."""
+    p = _reply_status_offset(raw, 'cf73f146-1108-428c-b89e-9790567846c4')
+    return p is not None and raw[p:] == b'\x81\x81\x81\xe0\x4b\x55\x20\x20\xa1\xa3' + TR
+
+
 class OperationError(RuntimeError):
     """A complete RPC reply rejected the requested operation."""
     def __init__(self, status, key):
@@ -1242,10 +1248,13 @@ class TestClient:
         """Прочитать ОДИН кадр (до трейлера TR). timeout: секунды или None (без ограничения).
         При таймауте недочитанное остаётся в self._buf. При EOF/обрыве соединение закрывается."""
         self._require_socket()
+        deadline = None if timeout is None else time.monotonic() + timeout
         try:
-            self.s.settimeout(self._io_timeout(timeout))
             while TR not in self._buf:
-                self.s.settimeout(self._io_timeout(timeout))
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise socket.timeout('Timed out waiting for a complete test-client response.')
+                self.s.settimeout(self._io_timeout(remaining))
                 d=self.s.recv(65536)
                 if not d:
                     size = len(self._buf)
@@ -1436,7 +1445,10 @@ class TestClient:
             pos = 20 if self._counter < 256 else 21
             fr = fr[:pos] + fr[pos+1:]
             self._first_binary = False
-        try: self.s.sendall(fr)
+        try:
+            # The previous receive may have left only a fraction of its deadline on the socket.
+            self.s.settimeout(self._io_timeout(self._recv_timeout() if timeout == 0 else timeout))
+            self.s.sendall(fr)
         except OSError:
             self.close()
             raise

@@ -2,7 +2,7 @@
 """MCP-сервер управления тест-клиентом 1С напрямую (без тест-менеджера).
 Инструменты поверх tc1c.TestClient. На Windows для NTLM используется SSPI.
 """
-import re, os, sys, glob, socket, time, base64, subprocess, inspect, typing, functools, threading
+import re, os, sys, glob, socket, time, base64, subprocess, inspect, typing, functools, threading, json
 from contextvars import ContextVar
 from mcp.server.fastmcp import FastMCP
 import tc1c
@@ -338,10 +338,10 @@ def _scalar_text(r, cmd):
     return _tail_char(r['raw'], cmd) if r.get('ok') else None
 
 def _field_scalar_text(c, key, r, cmd):
-    """Пустая строка обычного поля: подтверждённый вид и полный известный ответ.
+    """Пустая строка поля: подтверждённый вид и полный известный ответ.
 
     Такой же скалярный хвост бывает у неподдерживаемых элементов. Одного маркера
-    недостаточно: таблицы, их колонки и документные поля здесь пустыми не считаются.
+    недостаточно: у колонки дополнительно проверяем открытый редактор этой ячейки.
     У отсутствующей цели перед значением другой маркер; отсутствие/обрыв кадра
     тоже не являются пустой строкой.
     """
@@ -356,12 +356,34 @@ def _field_scalar_text(c, key, r, cmd):
     tail = tails.get(cmd)
     if tail and r['raw'].startswith(b'\x42') and r['raw'].endswith(tail + tc1c.TR):
         cls = _key_class(key)
-        if cls == 'EditField' and '.Table[' not in key and _kind_of(c, key) == 'InputField':
-            return ''
+        if cls == 'EditField' and _kind_of(c, key) == 'InputField':
+            if '.Table[' not in key:
+                return ''
+            p = tc1c._reply_status_offset(r['raw'], cmd)
+            if (p is not None and r['raw'][p:] == tail + tc1c.TR
+                    and _active_column_editor(c, key)):
+                return ''
         if (cls == 'Additional' and cmd == G.GET_EDIT_TEXT
                 and _kind_of(c, key) == 'SearchStringRepresentation'):
             return ''
     return None
+
+
+def _active_column_editor(c, key):
+    """An empty scalar is meaningful only for this table's current input editor."""
+    table = _table_owner(key)
+    if not table or not all(_guid_available(c, g) for g in
+                            (G.CURRENT_MODE_IS_EDIT, G.GET_CURRENT_ITEM)):
+        return False
+    try:
+        handle = _own_handle(c, table)
+        if not handle or _cell_flag(c, G.CURRENT_MODE_IS_EDIT, table, handle) is not True:
+            return False
+        current = tc_get_current_item(table, handle)
+        return (current.get('ok') and len(current.get('item', [])) == 1
+                and current['item'][0].get('key') == key)
+    except Exception:
+        return False  # Unreadable state is not evidence of an empty cell.
 
 
 def _remember_handles(objects):
@@ -921,6 +943,11 @@ def _verified(fn, action):
         res = fn(*a, **kw)
         if not isinstance(res, dict):
             return res
+        if action == 'activate' and res.get('ok'):
+            page = _page_activation_result(c, key, b.arguments.get('handle'))
+            if page:
+                res.update(page)
+                state, visible = page['target_check'], page['visible']
         res['target_check'] = state
         if state == 'present' and visible is False:
             # цель СУЩЕСТВУЕТ, но невидима: команду клиент примет, эффекта не будет. Условие
@@ -1339,7 +1366,10 @@ def _input_current(c, form):
     r = c.send_cmd(G.FORM_GET_CURRENT_ITEM, form['key'], kind='read', middle=RC,
                    handle=form['handle'])
     items = _coll(r, form['key']) if r.get('ok') else []
-    return items[0].get('key') if len(items) == 1 else None
+    if len(items) == 1:
+        return items[0].get('key')
+    # Empty address means explicitly no current item; None means unknown.
+    return '' if r.get('ok') and tc1c.empty_current_form_item(r['raw']) else None
 
 
 def _finish_input_text(c, key, text, handle):
@@ -1422,6 +1452,11 @@ def tc_input_text(key: str, text: str, handle: str, finish: bool = True) -> dict
     except tc1c.OperationError as exc:
         if exc.status != 10 or _kind_of(c, key) != 'InputField':
             raise
+        if _table_owner(key):
+            return dict(exc.result(), input_status='rejected', committed=None,
+                        suggested_action='set_cell_text',
+                        message='This is a table column. Use tc_table(action="set_cell_text") '
+                                'on its table with the column element name and the requested text.')
         return dict(exc.result(), input_status='rejected', committed=None,
                     suggested_action='start_choosing',
                     message='Text input was refused. If this field selects an object, use start_choosing to select a value.')
@@ -1429,6 +1464,10 @@ def tc_input_text(key: str, text: str, handle: str, finish: bool = True) -> dict
     if ok and finish and text and _key_class(key) == 'EditField' and '.Table[' not in key:
         if _kind_of(c, key) == 'InputField':
             result.update(_finish_input_text(c, key, text, handle))
+    if ok and _key_class(key) == 'EditField' and '.Table[' not in key:
+        # Only one field can own the input focus; keep this per connection, bounded.
+        c._pending_text_input = (key if text and result.get('edit_finished') is not True
+                                and result.get('committed') is not True else None)
     return result
 
 @_action('tc_doc')
@@ -1449,12 +1488,36 @@ def tc_input_html(key: str, html: str, handle: str, attachments: dict = None) ->
         ok = ok and r['ok']
     return {'ok': ok, 'target': key, 'len': len(html), 'attachments': sorted(att)}
 
+def _page_activation_result(c, key, handle):
+    """An inactive page may become visible; judge its state only after activation."""
+    if (not VERIFY_TARGET or _key_class(key) != 'Group'
+            or not _guid_available(c, G.GET_CHILD_OBJECTS) or not _guid_available(c, G.CURRENT_VISIBLE)):
+        return {}
+    track = getattr(c, '_track', None)
+    try:
+        c._track = None
+        if _kind_of(c, key) != 'Page':
+            return {}
+        state, visible = _verify_target(c, key, handle)
+    finally:
+        c._track = track
+    result = {'target_check': state, 'visible': visible}
+    if state == 'present' and visible is False:
+        result.update(ok=False, code='target_hidden', command_accepted=True,
+                      error='The page remains hidden after activation.',
+                      message='Change the form state to make this page available, or choose another visible page.')
+    elif state == 'absent':
+        result.update(_absent_error(key))
+    return result
+
+
 @_action('tc_field')
 def tc_activate(key: str, handle: str) -> dict:
     """Give a form element the focus — this is how you switch to a page or make a table column
     the current cell; a click does neither. It also commits text left uncommitted by tc_field(action="input_text"),
     but only when you activate a DIFFERENT focusable element: the field you typed into already has the focus.
     To let the form choose the next focus target, use tc_form(action="goto_next_element") on the form.
+    Pages report visibility after activation; a page that remains hidden returns target_hidden.
     Reports no `changed` — verify with tc_field(action="get_text"), tc_field(action="get_current_page"),
     tc_form(action="get_current_element") or tc_table(action="get_current_item")."""
     c = _need()
@@ -1904,7 +1967,8 @@ def tc_deselect_all_rows(key: str, handle: str) -> dict:
 def tc_read_rows(key: str, handle: str, max_rows: int = 500) -> dict:
     """Read all selectable rows of the current table, respecting its filters and collapsed groups.
     Returns row_count and up to max_rows rows (0 for count only); row order is not guaranteed.
-    Temporarily selects rows, then clears selection without navigating to another row.
+    Temporarily selects rows, then clears selection. Keeps a usable current row; on older
+    platforms an unavailable current row requires the first row, reported as cursor_repositioned=true.
     Previous selection is cleared. Refuses unfinished row edits. Column keys are titles."""
     c, error = _need_ver('8.3.6')
     if error:
@@ -1920,12 +1984,21 @@ def tc_read_rows(key: str, handle: str, max_rows: int = 500) -> dict:
     record_mark = None
     try:
         window = _cell_window(c)
+        state, visible = _verify_target(c, key, handle)
+        if state == 'absent':
+            return {**result, **_absent_error(key), 'code': 'target_unavailable', 'selection_changed': False}
+        if state == 'present' and visible is False:
+            return dict(result, code='target_hidden', target_hidden=True,
+                        error='The table is hidden. Open its page or change the form state before reading it.',
+                        selection_changed=False)
         mode = _cell_flag(c, G.CURRENT_MODE_IS_EDIT, key, handle)
         if mode is not False:
             return dict(result, code='row_edit_pending' if mode is True else 'edit_state_unavailable',
                         error='Finish or explicitly cancel row editing before reading the table.',
                         edit_mode=mode, selection_changed=False)
         record_mark = _native_composite_begin(c)
+        if not _guid_available(c, G.DESELECT_ALL_ROWS):
+            _table_activate(c, key, handle, window)
         attempted = True
         _cell_step(tc_select_all_rows(key, handle), 'The table rows could not be selected.')
         rows = _cell_step(tc_get_selected_rows(key, handle), 'The selected rows could not be read.')['rows']
@@ -1944,7 +2017,22 @@ def tc_read_rows(key: str, handle: str, max_rows: int = 500) -> dict:
                     _cell_step(tc_deselect_all_rows(key, handle), 'Selection could not be cleared.')
                 elif result.get('row_count') != 0:
                     # No search condition: the cursor stays on the same row, even for duplicate rows.
-                    _cell_step(tc_goto_row(key, handle=handle), 'Selection could not be reduced to the current row.')
+                    reduced = tc_goto_row(key, handle=handle)
+                    if (not reduced.get('ok') and reduced.get('status_code') == 13
+                            and (result.get('row_count') or 0) > 0):
+                        # Some read-only summaries have no usable current row. Never hide
+                        # the fallback's cursor movement, or run it for unrelated refusals.
+                        _cell_window(c, window)
+                        if _cell_flag(c, G.CURRENT_MODE_IS_EDIT, key, handle) is not False:
+                            raise RuntimeError('Row editing started; selection cleanup was stopped.')
+                        result['cursor_repositioned'] = None
+                        _cell_step(tc_goto_first_row(key, handle), 'The first row could not be made current.')
+                        result['cursor_repositioned'] = True
+                        _cell_window(c, window)
+                        if _cell_flag(c, G.CURRENT_MODE_IS_EDIT, key, handle) is not False:
+                            raise RuntimeError('Row editing started after navigation; it was left untouched.')
+                    else:
+                        _cell_step(reduced, 'Selection could not be reduced to the current row.')
                     remaining = _cell_step(tc_get_selected_rows(key, handle), 'Selection could not be checked.')['rows']
                     if remaining:
                         if len(remaining) != 1:
@@ -1985,16 +2073,120 @@ def tc_copy_row(key: str, handle: str, confirm: bool = None) -> dict:
 
 @_action('tc_table')
 def tc_delete_row(key: str, handle: str, confirm: bool = None) -> dict:
-    """Delete the current table row. On catalog/document
-    lists a 'delete?' dialog may appear — set confirm=True/False to auto-answer it
-    (default None: no dialog handling)."""
+    """Delete the current table row. On 8.3.6+, prepares an empty selection and refuses
+    unfinished row edits; existing selection is preserved during preparation.
+    Set confirm=True/False to answer a deletion dialog
+    (None leaves it open). ok confirms the command; deleted=null means its effect is
+    unverified. Lists may mark records for deletion instead of removing rows."""
     c = _need()
-    ok = True
-    for kind in ('action', 'commit'):
-        ok = c.send_cmd(G.DELETE_ROW, key, kind=kind, middle=b'', handle=handle)['ok'] and ok
-    ans = _answer_confirm_dialog(c, confirm, max_wait=2.0)[0] if confirm is not None else None
-    _state['window_key'] = None          # мог открыться модальный вопрос — активное окно другое
-    return {'ok': ok, 'target': key, 'action': 'delete_row', 'dialog_answered': ans}
+    mark = None
+    result = {'ok': False, 'target': key, 'action': 'delete_row', 'deleted': None}
+    try:
+        mark = _native_composite_begin(c, 'delete_row')
+        count = _table_prepare_delete(c, key, handle)
+        for kind in ('action', 'commit'):
+            _cell_step(c.send_cmd(G.DELETE_ROW, key, kind=kind, middle=b'', handle=handle),
+                       'The delete command was refused.')
+        ans = _answer_confirm_dialog(c, confirm, max_wait=2.0)[0] if confirm is not None else None
+        result.update(ok=True, selected_rows=count, dialog_answered=ans,
+                      deletion_status='requested', message='Delete command accepted; its effect has not been verified.')
+        if ans and confirm is False:
+            result.update(deleted=False, deletion_status='cancelled', message='Deletion was cancelled.')
+    except Exception as exc:
+        details = exc.result() if isinstance(exc, tc1c.OperationError) else getattr(exc, 'details', {})
+        result.update(details, ok=False, error=str(exc))
+    finally:
+        _state['window_key'] = None
+        if mark is not None:
+            try:
+                _native_composite_end(c, mark, 'delete_row')
+            except Exception as exc:
+                result.update(ok=False, code='recording_incomplete', error=str(exc))
+    return result
+
+
+def _table_activate(c, key, handle, window):
+    """Prepare a table without committing another element's pending input."""
+    form = _form_object(c)
+    if not form or not key.startswith(form['key'] + '.'):
+        raise _CellEditFailure('The table is not on the active form.', {'code': 'target_not_interactive'})
+    current = _input_current(c, form)
+    other_table = re.match(r'^(.*\.Table\[[^\]]+\])(?:\.|$)', current or '')
+    if other_table:
+        owner = other_table.group(1)
+        if owner != key:
+            obj = _ref_live_object(c, owner)
+            if not obj or _cell_flag(c, G.CURRENT_MODE_IS_EDIT, owner, obj['handle']) is not False:
+                raise _CellEditFailure('Finish or cancel editing in the other table first.',
+                                       {'code': 'other_input_pending'})
+    elif current and _key_class(current) == 'EditField':
+        obj = _ref_live_object(c, current)
+        if not obj:
+            raise _CellEditFailure('The current field is unavailable.', {'code': 'edit_state_unavailable'})
+        kind = _kind_of(c, current)
+        if kind == 'InputField' and getattr(c, '_pending_text_input', None) == current:
+            try:
+                r = c.send_cmd(G.GET_EDIT_TEXT, current, kind='read', middle=RS, handle=obj['handle'])
+                text = _field_scalar_text(c, current, r, G.GET_EDIT_TEXT) if r['ok'] else None
+            except tc1c.OperationError as exc:
+                if exc.status not in (10, 11, 17):
+                    raise
+                text = None  # This field has no readable input buffer in this state.
+            if text is None:
+                raise _CellEditFailure('Pending field input could not be checked; finish or cancel it first.',
+                                       {'code': 'edit_state_unavailable'})
+            if text is not None:
+                r = c.send_cmd(G.GET_PROPERTY, current, kind='read', middle=RC, handle=obj['handle'])
+                accepted = _field_scalar_text(c, current, r, G.GET_PROPERTY) if r['ok'] else None
+                if text != accepted:
+                    raise _CellEditFailure('Finish or cancel input in the current field first.',
+                                           {'code': 'other_input_pending'})
+                c._pending_text_input = None
+        elif kind == 'SpreadsheetDocumentField':
+            if _cell_flag(c, G.CURRENT_MODE_IS_EDIT_FIELD, current, obj['handle']) is not False:
+                raise _CellEditFailure('Finish or cancel document editing first.', {'code': 'other_input_pending'})
+        elif kind in ('TextDocumentField', 'FormattedDocumentField', 'HTMLDocumentField'):
+            raise _CellEditFailure('Activate the table explicitly after finishing document input.',
+                                   {'code': 'edit_state_unavailable'})
+    _cell_step(tc_activate(key, handle), 'The table could not be activated.')
+    _cell_window(c, window)
+    if _cell_flag(c, G.CURRENT_MODE_IS_EDIT, key, handle) is not False:
+        raise _CellEditFailure('Finish or cancel row editing first.', {'code': 'row_edit_pending'})
+
+
+def _table_prepare_delete(c, key, handle):
+    if _key_class(key) != 'Table':
+        raise _CellEditFailure('Deletion requires a table.', {'code': 'invalid_table'})
+    if not _guid_available(c, G.GET_SELECTED_ROWS):
+        # Preserve deletion on 8.3.1--8.3.5 without sending unavailable diagnostics.
+        return None
+    window = _cell_window(c)
+    if _cell_flag(c, G.CURRENT_MODE_IS_EDIT, key, handle) is not False:
+        raise _CellEditFailure('Finish or cancel row editing before deletion.', {'code': 'row_edit_pending'})
+    before = _cell_step(tc_get_selected_rows(key, handle), 'Selection could not be read.')['rows']
+    _table_activate(c, key, handle, window)
+    selected = _cell_step(tc_get_selected_rows(key, handle), 'Selection could not be checked.')['rows']
+    if before:
+        # Compare as multisets: platform selection order is unspecified, duplicates matter.
+        def canonical(rows):
+            return sorted(json.dumps(row, sort_keys=True, ensure_ascii=False) for row in rows)
+        if canonical(before) != canonical(selected):
+            raise _CellEditFailure('Selection changed while activating the table. Select the intended rows again.',
+                                   {'code': 'selection_changed'})
+    else:
+        if not selected:
+            if _guid_available(c, G.SELECT_ROW):
+                current = _cell_step(tc_get_current_row(key, handle), 'The current row could not be read.')['row']
+                if not current:
+                    raise _CellEditFailure('No current row is available for deletion.', {'code': 'no_current_row'})
+                _cell_step(tc_select_row(key, handle), 'The current row could not be selected.')
+            else:
+                # No criteria: retain the current row, including when several rows have identical values.
+                _cell_step(tc_goto_row(key, handle=handle), 'The current row could not be selected.')
+            selected = _cell_step(tc_get_selected_rows(key, handle), 'Selection could not be checked.')['rows']
+        if len(selected) != 1:
+            raise _CellEditFailure('No single current row is available for deletion.', {'code': 'no_current_row'})
+    return len(selected)
 
 @_action('tc_table')
 def tc_table_add_row(key: str, handle: str) -> dict:
@@ -2064,12 +2256,37 @@ def tc_go_one_level_down(key: str, handle: str, row_column: str = None, row_valu
 
 @_action('tc_table')
 def tc_change_row(key: str, handle: str) -> dict:
-    """Start editing the current table row/column. Needs an existing row not already in edit mode."""
+    """Start editing the current table row/column. Activate the intended column first.
+    Needs an existing row not already in edit mode. edit_mode confirms whether editing started;
+    null means it could not be checked. For text input use set_cell_text for automatic preparation."""
     c = _need()
+    check = _guid_available(c, G.CURRENT_MODE_IS_EDIT)
+    window = _window(c).get('key') if check else None
     ok = True
     for kind in ('action', 'commit'):
         ok = c.send_cmd(G.CHANGE_ROW, key, kind=kind, middle=b'', handle=handle)['ok'] and ok
-    return {'ok': ok, 'target': key, 'action': 'change_row'}
+    result = {'ok': ok, 'target': key, 'action': 'change_row', 'edit_mode': None}
+    if not ok:
+        return result
+    if not check:
+        result['message'] = 'Editing requested; this platform cannot check the row edit mode.'
+        return result
+    try:
+        if not window:
+            raise _CellEditFailure('The active window could not be determined.')
+        _cell_window(c, window)
+        result['edit_mode'] = _cell_flag(c, G.CURRENT_MODE_IS_EDIT, key, handle)
+    except Exception:
+        pass  # An accepted edit may open another window; do not act on the covered table.
+    if result['edit_mode'] is not True:
+        result.update(ok=False, command_accepted=True,
+                      code='row_edit_refused' if result['edit_mode'] is False else 'edit_state_unavailable',
+                      error='Row editing did not start.' if result['edit_mode'] is False
+                            else 'The row edit mode could not be verified. Inspect the active window.',
+                      suggested_action='get_current_item' if result['edit_mode'] is False else 'get_active_window')
+        if result['edit_mode'] is False:
+            result['message'] = 'Activate the intended column before change_row, or use set_cell_text for text input.'
+    return result
 
 @_action('tc_table')
 def tc_switch_row_delete_mark(key: str, handle: str, confirm: bool = True) -> dict:
@@ -2358,7 +2575,11 @@ def tc_get_current_element(key: str, handle: str) -> dict:
                 'error': 'This action requires a managed form. Address the form containing the element.'}
     c = _need()
     r = c.send_cmd(G.FORM_GET_CURRENT_ITEM, key, kind='read', middle=RC, handle=handle)
-    return {'ok': r['ok'], 'item': _coll(r, key)}
+    items = _coll(r, key)
+    result = {'ok': r['ok'], 'item': items}
+    if not items:
+        result['current_status'] = 'none' if r.get('ok') and tc1c.empty_current_form_item(r['raw']) else 'unavailable'
+    return result
 
 @_action('tc_form')
 def tc_find_default_button(key: str, handle: str) -> dict:
@@ -2797,7 +3018,8 @@ def tc_delete_view_status_item(key: str, index: int | str, handle: str) -> dict:
 @_action('tc_field')
 def tc_start_choosing(key: str, handle: str) -> dict:
     """Open a reference field's choice form. Handles focus and table-cell editing.
-    Returns opened and the active window; use that window to continue choosing."""
+    For CalendarField, selects the current date like a double-click; use goto_date first.
+    Returns opened and the active window. A calendar selection need not open another window."""
     c = _need()
     if not _guid_available(c, G.CURRENT_VISIBLE):
         # The native choice action predates the focus/edit-state inspection methods.
@@ -2811,6 +3033,7 @@ def tc_start_choosing(key: str, handle: str) -> dict:
     try:
         before = _cell_window(c)
         _cell_ready(c, key, handle)
+        calendar = _kind_of(c, key) == 'CalendarField'
         table = _table_owner(key)
         table_handle = _own_handle(c, table) if table else None
         if table and not table_handle:
@@ -2839,6 +3062,8 @@ def tc_start_choosing(key: str, handle: str) -> dict:
         _state['window_key'] = None
         window = _window(c)
         opened = bool(window.get('key') and window['key'] != before)
+        if calendar:
+            return {'ok': True, 'target': key, 'opened': opened, 'window': window}
         result = {'ok': opened, 'target': key, 'opened': opened, 'window': window}
         if not opened:
             result.update(code='choice_not_opened', error='No separate choice window opened. Inspect the field or its choice list.')
@@ -3081,6 +3306,56 @@ def _table_columns(c, key):
     return [o for o in _walk_tree(c, key) if o.get('class') == 'EditField'
             and _table_owner(o.get('key', '')) == key]
 
+
+def _row_criteria_error(c, key, pairs):
+    """Validate titles without changing criteria or moving the row cursor."""
+    if not pairs:
+        return None
+    if _key_class(key) != 'Table':
+        return {'ok': False, 'code': 'invalid_table', 'error': 'Row criteria require a table.'}
+    for column, value in pairs:
+        if not isinstance(column, str) or not column or _is_index(column):
+            return {'ok': False, 'code': 'invalid_column', 'error': _COLUMN_BY_TITLE}
+    # GotoRow exists in 8.3.2; discovering its columns requires 8.3.3.
+    version = _vt(_conn_ver(c))
+    if version and version < _vt(TOOL_MIN_VERSION['tc_get_child_objects']):
+        return None
+    track = getattr(c, '_track', None)
+    try:
+        c._track = None
+        columns = _table_columns(c, key)
+    except Exception:
+        return {'ok': False, 'code': 'columns_unavailable',
+                'error': 'The table columns could not be checked. Find the table again before searching.'}
+    finally:
+        c._track = track
+    if not columns:
+        return {'ok': False, 'code': 'columns_unavailable', 'error': 'No column titles are available for this table.'}
+    for column, value in pairs:
+        matches = [o for o in columns if o.get('title') == column]
+        if len(matches) != 1:
+            named = [o for o in columns if o.get('name') == column]
+            # 1C can omit an inherited title, e.g. the row-number title N.
+            # Missing metadata is not proof that a displayed title is invalid.
+            if not matches and not any(o.get('title') for o in named) and any(
+                    not o.get('title') for o in columns):
+                continue
+            result = {'ok': False, 'column': column,
+                      'code': 'ambiguous_column' if matches else 'column_not_found',
+                      'error': 'Row search requires a unique column title returned by find_objects for this table.'}
+            suggestions = list(dict.fromkeys(o['title'] for o in columns
+                               if o.get('name') == column and o.get('title')))
+            if suggestions:
+                result['suggested_columns'] = suggestions
+            return result
+    return None
+
+
+def _row_search_refusal(pairs):
+    return {'ok': False, 'code': 'row_criteria_rejected', 'criteria': dict(pairs),
+            'error': 'The table rejected the search criteria. Use displayed column titles and values.',
+            'message': 'Column titles can also be read from the keys returned by read_rows.'}
+
 @_action('tc_field')
 def tc_current_opened(key: str, handle: str) -> dict:
     """Whether a form group is currently open."""
@@ -3121,9 +3396,17 @@ def tc_goto_row(key: str, column: str | int = None, value=None, handle: str = No
         return {'ok': False, 'target': key, 'code': 'conflicting_row_criteria',
                 'error': 'Use either fields or column/value. Put all search conditions in fields.'}
     pairs = list(fields.items()) if fields else ([(column, value)] if column is not None else [])
+    error = _row_criteria_error(c, key, pairs)
+    if error:
+        return dict(error, target=key)
     mid = tc1c.mk_gotorow(fields=pairs, toggle_selection=toggle_selection, direction=direction)
-    r = c.send_cmd(G.GOTO_ROW, key, kind='read', middle=mid,
-                   pad=(tc1c.GOTOROW_PAD if pairs else None), handle=handle)
+    try:
+        r = c.send_cmd(G.GOTO_ROW, key, kind='read', middle=mid,
+                       pad=(tc1c.GOTOROW_PAD if pairs else None), handle=handle)
+    except tc1c.OperationError as exc:
+        if exc.status == 13 and pairs:
+            return dict(_row_search_refusal(pairs), target=key)
+        raise
     # без условий поиска метод переключает выделение текущей строки и результата поиска не имеет
     return {'ok': r['ok'], 'target': key, 'criteria': dict(pairs),
             'found': _scalar(r, tc1c.decode_goto_row) if pairs else None}
@@ -3668,7 +3951,7 @@ def _rec_note(action, key, obs, changed):
                 'observed': obs, 'changed': changed})
 
 
-def _native_composite_begin(c):
+def _native_composite_begin(c, action='read_rows'):
     """Keep native events around a composite whose cleanup 1C does not record.
 
     Close the preceding native fragment before changing selection. Capture the composite
@@ -3688,18 +3971,18 @@ def _native_composite_begin(c):
         _state['rec_native_stopped'] = True
         return len(c._track)
     except Exception:
-        _state.setdefault('rec_native_errors', []).append('read_rows')
+        _state.setdefault('rec_native_errors', []).append(action)
         raise
 
 
-def _native_composite_end(c, mark):
+def _native_composite_end(c, mark, action='read_rows'):
     try:
         _state.setdefault('rec_native_parts', []).append(_synth_uilog(c._track[mark:]))
         r = c.send_cmd(G.UILOG, None, kind='read818', middle=REC_START)
         _cell_step(r, 'Native recording could not be restarted.')
         _state.pop('rec_native_stopped', None)
     except Exception:
-        _state.setdefault('rec_native_errors', []).append('read_rows')
+        _state.setdefault('rec_native_errors', []).append(action)
         raise
 
 
@@ -4102,57 +4385,63 @@ def tc_wait_for_object_displayed(name: str = None, cls: str = None, type: str = 
 
 @_action('tc_form')
 def tc_wait_for_closing(window_title: str = None, timeout: int = 60) -> dict:
-    """Wait until a window closes, up to timeout seconds. Without window_title it watches the
-    window that is active AT THE MOMENT OF THE CALL, so it only makes sense BEFORE the action that
-    closes something; called after tc_window(action="close_window") it is already watching the
-    next window and will time out while reporting the window is still open. After a close, pass
-    window_title — the title is taken from the window's managed form, and if it cannot be
-    determined the call says so instead of claiming the window closed."""
+    """Wait until a window closes, up to timeout seconds. Without window_title, watch the window
+    active AT THE MOMENT OF THE CALL. After a close, pass window_title to check the closed window.
+    Switching windows or opening a preview does not count as closing. If the target cannot be
+    identified or its absence confirmed, return ok=False."""
     import time as _t
     c = _need()
     start = _window(c)
-    deadline = _t.time() + max(timeout, 0)
-
+    deadline = _t.monotonic() + max(timeout, 0)
+    matched_key = None
     if not window_title:
-        # ветка по КЛЮЧУ окна: одинаковые заголовки у разных окон («Документ» и «Документ»)
-        # иначе выглядели бы как «окно не менялось». Достоверна, не меняется.
-        start_key = start.get('key')
-        while True:
-            w = _window(c)
-            if not w.get('key') or w.get('key') != start_key:
-                return {'ok': True, 'closed_title': start.get('title')}
-            if _t.time() >= deadline:
-                return {'ok': False, 'error': 'timeout after %d s; the window is still open' % timeout}
-            _t.sleep(0.5)
-
-    # ветка по ЗАГОЛОВКУ: сравниваем с заголовком управляемой формы окна. Неопределённый
-    # заголовок закрытием НЕ считается — иначе первая же итерация объявила бы окно закрытым.
-    undetermined = 0
-    matched_key = None            # ключ окна, у которого заголовок совпал с заданным
+        matched_key = start.get('key')
+        if not matched_key:
+            return {'ok': False, 'code': 'active_window_unavailable',
+                    'error': 'The active window cannot be identified; closing is not confirmed.',
+                    'recovery': start.get('recovery') or 'Pass window_title to identify the window.'}
+    closed_title = window_title or start.get('title')
     while True:
-        w = _window(c)
-        if not w.get('key'):
-            return {'ok': True, 'closed_title': window_title}
-        if matched_key and w['key'] != matched_key:
-            # заголовок мог совпасть и у ДРУГОГО окна: разрешив окно один раз, дальше следим
-            # за его идентичностью, иначе два окна с одинаковым текстом неразличимы
-            return {'ok': True, 'closed_title': window_title}
-        cur = _form_title(c, w['key'])[0]
-        if cur is None:
-            undetermined += 1
-        elif cur != window_title:
-            return {'ok': True, 'closed_title': window_title}
+        # Проверяем существование окна, а не фокус: предпросмотр и другая форма могут
+        # перекрывать цель. Отказ перечисления нельзя принимать за пустую коллекцию.
+        r = c.send_cmd(G.GET_CHILD_OBJECTS, None, kind='read', middle=CHILD_MIDDLE)
+        if not r.get('ok'):
+            return {'ok': False, 'code': 'window_list_unavailable',
+                    'error': 'The open windows could not be read; closing is not confirmed.'}
+        windows = tc1c.decode_collection(r['raw'], None)
+        unknown_title = False
+        if matched_key:
+            if not any(w.get('key') == matched_key for w in windows):
+                return {'ok': True, 'closed_title': closed_title}
         else:
-            matched_key = matched_key or w['key']
-        if _t.time() >= deadline:
-            if undetermined:
-                return {'ok': False, 'target': w.get('key'),
-                        'error': 'the active window caption could not be determined reliably '
-                                 '(%d time(s) in %d s); closing by caption is not confirmed. '
-                                 'Use the wait without window_title — it compares the window '
-                                 'key.' % (undetermined, timeout)}
+            matches = []
+            for w in windows:
+                title = w.get('title')
+                if title is None:
+                    title = _form_title(c, w.get('key'))[0]
+                if title is None:
+                    unknown_title = True
+                elif title == window_title:
+                    matches.append(w['key'])
+            if start.get('key') in matches:
+                matched_key = start['key']
+            elif len(matches) == 1:
+                matched_key = matches[0]
+            elif len(matches) > 1:
+                return {'ok': False, 'code': 'ambiguous_window',
+                        'error': 'Several windows have this title. Activate the target and wait without window_title.'}
+            elif not unknown_title:
+                if not start.get('key'):
+                    return {'ok': False, 'code': 'active_window_unavailable',
+                            'error': 'The target was not found, but the active window cannot be identified; closing is not confirmed.'}
+                return {'ok': True, 'closed_title': closed_title}
+        remaining = deadline - _t.monotonic()
+        if remaining <= 0:
+            if unknown_title and not matched_key:
+                return {'ok': False, 'code': 'window_title_unavailable',
+                        'error': 'An open window caption could not be determined reliably; closing is not confirmed.'}
             return {'ok': False, 'error': 'timeout after %d s; the window is still open' % timeout}
-        _t.sleep(0.5)
+        _t.sleep(min(0.5, remaining))
 
 def _form_elements(c):
     """Навигация окно->форма->ВСЕ элементы (рекурсивно, включая вложенные в группы).
@@ -4270,12 +4559,13 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
     # Статус предполётной проверки последнего отправленного кадра шага. Без него шаг с
     # подтверждённым адресом, шаг без доступной проверки и шаг с выключенной проверкой выглядят
     # одинаково — а политика «при unknown выполняем» имеет смысл только вместе с видимым статусом.
-    _chk = {'v': None, 'hidden': None}
+    _chk = {'v': None, 'hidden': None, 'extra': {}}
     # наблюдение шага: (описание, до, после). Тот же контракт, что у обработчиков, — иначе
     # одинаковое действие через MCP и через воспроизведение отвечало бы по-разному
     _obs = {'v': None, 'busy': False, 'applies': False, 'args': {}}
 
     def _step(d):
+        d.update(_chk['extra'])
         if _chk['v'] is not None:
             d['target_check'] = _chk['v']       # у шага из нескольких кадров — статус последнего
         if _chk['v'] == 'present' and _chk['hidden'] is False:
@@ -4292,6 +4582,7 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
             if not READBACK:
                 d['readback'] = 'off'
         _chk['v'] = None; _chk['hidden'] = None
+        _chk['extra'] = {}
         _obs['v'] = None; _obs['applies'] = False; _obs['args'] = {}
         steps.append(d)
 
@@ -4382,7 +4673,14 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
     def _replay(key, handle, act):
         """Действие над ЭЛЕМЕНТОМ. None = тег не поддержан."""
         a = act.tag.split('}')[-1]
-        if a == 'activate':      return _ac(G.ACTIVATE, key, handle)
+        if a == 'activate':
+            ok = _ac(G.ACTIVATE, key, handle)
+            if ok:
+                page = _page_activation_result(c, key, handle)
+                if page:
+                    _chk.update(v=page['target_check'], hidden=page['visible'], extra=page)
+                    ok = page.get('ok', True)
+            return ok
         if a == 'inputText':
             guid, middle = _input_text_command(act.get('text', ''), c, key)
             return _ac(guid, key, handle, middle)
@@ -4441,7 +4739,18 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
         if a == 'create':        return _ac(G.CREATE, key, handle)
         if a == 'expand':        return _ac(G.EXPAND_GROUP, key, handle)
         if a == 'collapse':      return _ac(G.COLLAPSE_GROUP, key, handle)
-        if a == 'closeDropList': return _ac(G.CLOSE_DROP_LIST, key, handle)
+        if a == 'closeDropList':
+            # Native logs can close a column's list after EndEditRow already closed it.
+            # Only a positive read of the same live target permits the redundant close.
+            if (_table_owner(key) and _key_class(key) == 'EditField'
+                    and _guid_available(c, G.DROP_LIST_IS_OPEN)
+                    and _kind_of(c, key) == 'InputField'):
+                _guard(G.CLOSE_DROP_LIST, key, 'action', handle)
+                if _chk['v'] == 'present':
+                    r = _send(G.DROP_LIST_IS_OPEN, key, kind='read', middle=RS, handle=handle)
+                    if _scalar(r, _bool_from_resp) is False:
+                        return True
+            return _ac(G.CLOSE_DROP_LIST, key, handle)
         if a == 'FormField':     # вложенное редактирование области табличного документа: begin + ввод в ту же область
             ok = _ac(G.BEGIN_EDIT_CURRENT_AREA, key, handle)
             for sub in list(act):
@@ -4521,6 +4830,17 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
                             elif a == 'gotoRow':     # поиск строки ПО ЗНАЧЕНИЯМ колонок либо
                                 #                          (без Field) переключение выделения ТЕКУЩЕЙ строки
                                 fields = _fields_of(act)
+                                error = _row_criteria_error(c, tel['key'], fields)
+                                if error:
+                                    raise _CellEditFailure(error['error'], error)
+                                if not fields and _guid_available(c, G.CURRENT_MODE_IS_EDIT):
+                                    if _cell_flag(c, G.CURRENT_MODE_IS_EDIT, tel['key'], tel['handle']) is not False:
+                                        raise _CellEditFailure('Finish or cancel row editing first.', {'code': 'row_edit_pending'})
+                                    _table_activate(c, tel['key'], tel['handle'], _cell_window(c))
+                                    if _guid_available(c, G.GET_CURRENT_ROW) and not _cell_step(
+                                            tc_get_current_row(tel['key'], tel['handle']),
+                                            'The current row could not be read.')['row']:
+                                        raise _CellEditFailure('No current row is available.', {'code': 'no_current_row'})
                                 _obs['args'] = {'column': fields[0][0]} if fields else {}
                                 tgl = (act.get('switchSelection') or act.get('toggleSelection') or 'false') == 'true'
                                 mid = tc1c.mk_gotorow(fields=fields, toggle_selection=tgl,
@@ -4552,12 +4872,14 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
                                     ok = _send(G.END_EDIT_ROW, tel['key'], kind=kind, middle=mid, handle=tel['handle'])['ok'] and ok
                                 _step({'target': tname, 'action': 'endEditRow', 'ok': ok})
                             elif a == 'deleteRow':
+                                selected_count = _table_prepare_delete(c, tel['key'], tel['handle'])
                                 ok = _ac(G.DELETE_ROW, tel['key'], tel['handle'])
                                 want = _confirm_of(act)          # None -> при записи не отвечали
                                 if want is not None:
                                     try: _answer_confirm_dialog(c, want, max_wait=2.0)
                                     except Exception: pass
-                                _step({'target': tname, 'action': 'deleteRow', 'ok': ok})
+                                _step({'target': tname, 'action': 'deleteRow', 'ok': ok,
+                                       'selected_rows': selected_count, 'deleted': None})
                                 _t.sleep(0.4)
                             elif a == 'copyRow':
                                 ok = _ac(G.COPY_ROW, tel['key'], tel['handle'])
@@ -4606,10 +4928,18 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
                             else:                          # прочие элементные действия над самой таблицей (view-status, write и т.п.)
                                 res = _replay(tel['key'], tel['handle'], act)
                                 _step({'target': tname, 'action': a, 'ok': bool(res), 'skipped': res is None})
+                        except _CellEditFailure as e:
+                            _step({'target': tname, 'action': a, **e.details, 'ok': False, 'error': str(e)})
+                        except tc1c.OperationError as e:
+                            _step({'target': tname, 'action': a, **e.result()})
                         except _TreeCriterionError as e:
                             _step({'target': tname, 'action': a, 'ok': False, 'code': e.code, 'error': str(e)})
                         except _VerErr as e:   # метод новее подключённой платформы
-                            _step({'target': tname, 'action': a, 'ok': False, 'error': str(e), **e.details})
+                            if (a == 'gotoRow' and isinstance(e.__cause__, tc1c.OperationError)
+                                    and e.__cause__.status == 13 and _fields_of(act)):
+                                _step({'target': tname, 'action': a, **_row_search_refusal(_fields_of(act))})
+                            else:
+                                _step({'target': tname, 'action': a, 'ok': False, 'error': str(e), **e.details})
                 elif tag in FORM_ACTIONS:
                     try:
                         res = _replay_form(formobj, node)
@@ -4730,37 +5060,115 @@ def _cell_result(key, before, after, text, stage, error=None):
         result.update(ok=True, verified=None, verification='numeric_equivalent',
                       message='Editing finished with an equivalent numeric representation; exact text is not verified.')
         return result
+    if (stage == 'done' and error is None and result['changed'] is True
+            and _possibly_rounded(text, after)):
+        result.update(verified=None, edit_finished=True, code='value_verification_inconclusive',
+                      verification='rounded_display',
+                      error='Editing finished, but the displayed precision cannot confirm the requested value.',
+                      message='The displayed number is consistent with rounding. Read a more precise representation '
+                              'in the form before repeating input; the exact value may already be accepted.')
+        return result
     if error or not verified:
         result['error'] = error or 'the cell text after editing does not match the requested text'
     return result
 
 
-def _numeric_equivalent(wanted, actual):
+def _numeric_value(value):
     from decimal import Decimal, InvalidOperation
-    def number(value):
-        if not isinstance(value, str):
-            return None
-        # No leading zero codes, exponents, currency, dates or arbitrary whitespace.
-        pattern = r'[+-]?(?:0|[1-9]\d*|[1-9]\d{0,2}(?:[ \u00a0\u202f]\d{3})+)(?:[.,]\d+)?'
-        if not re.fullmatch(pattern, value):
-            return None
-        try:
-            return Decimal(re.sub(r'[ \u00a0\u202f]', '', value).replace(',', '.'))
-        except InvalidOperation:
-            return None
-    left, right = number(wanted), number(actual)
+    if not isinstance(value, str):
+        return None
+    # No leading zero codes, exponents, currency, dates or arbitrary whitespace.
+    pattern = r'[+-]?(?:0|[1-9]\d*|[1-9]\d{0,2}(?:[ \u00a0\u202f]\d{3})+)(?:[.,]\d+)?'
+    if not re.fullmatch(pattern, value):
+        return None
+    try:
+        return Decimal(re.sub(r'[ \u00a0\u202f]', '', value).replace(',', '.'))
+    except InvalidOperation:
+        return None
+
+
+def _numeric_equivalent(wanted, actual):
+    left, right = _numeric_value(wanted), _numeric_value(actual)
     return left is not None and right is not None and left == right
+
+
+def _possibly_rounded(wanted, actual):
+    # This is a reason to leave verification inconclusive, never proof of acceptance.
+    from decimal import Decimal, localcontext, ROUND_HALF_UP, ROUND_HALF_EVEN
+    left, right = _numeric_value(wanted), _numeric_value(actual)
+    if left is None or right is None or left == right:
+        return False
+    exponent = right.as_tuple().exponent
+    if exponent <= left.as_tuple().exponent:
+        return False
+    with localcontext() as ctx:
+        ctx.prec = max(len(left.as_tuple().digits), len(right.as_tuple().digits)) + 2
+        unit = Decimal(1).scaleb(exponent)
+        return any(left.quantize(unit, rounding=mode) == right for mode in (ROUND_HALF_UP, ROUND_HALF_EVEN))
+
+
+def _verify_empty_cell(c, key, handle, col, window):
+    """Read the committed value behind conditional text, then cancel only our readback edit.
+
+    Verification is excluded from both recording modes: replay needs the accepted input,
+    not another edit/cancel cycle. Native fragments before and after it remain intact.
+    """
+    def current():
+        _cell_window(c, window)
+        r = tc_get_current_item(key, handle)
+        if not (r.get('ok') and len(r.get('item', [])) == 1
+                and r['item'][0].get('key') == col['key']):
+            raise _CellEditFailure('The current editor changed during empty-cell verification.')
+
+    current()
+    if _cell_flag(c, G.CURRENT_MODE_IS_EDIT, key, handle) is not False:
+        raise _CellEditFailure('The row must be out of edit mode before verifying its empty value.')
+    mark = _native_composite_begin(c, 'verify_empty_cell')
+    track, observations = c._track, _state.get('rec_obs')
+    attempted = False
+    try:
+        c._track, _state['rec_obs'] = None, None
+        attempted = True
+        _cell_step(tc_change_row(key, handle), 'The cell could not be reopened for verification.')
+        current()
+        if _cell_flag(c, G.CURRENT_MODE_IS_EDIT, key, handle) is not True:
+            raise _CellEditFailure('The cell editor is unavailable for verification.')
+        r = tc_get_data_presentation(col['key'], col['handle'])
+        return r.get('ok') and r.get('presentation') == ''
+    finally:
+        try:
+            if attempted:
+                try:
+                    current()
+                    mode = _cell_flag(c, G.CURRENT_MODE_IS_EDIT, key, handle)
+                    if mode is True:
+                        _cell_step(tc_end_edit_row(key, handle, cancel=True),
+                                   'The verification edit could not be cancelled.')
+                        current()
+                        mode = _cell_flag(c, G.CURRENT_MODE_IS_EDIT, key, handle)
+                    if mode is not False:
+                        raise _CellEditFailure('The row edit mode is unavailable after verification.')
+                except Exception as exc:
+                    raise _CellEditFailure(
+                        'Empty-cell verification could not restore the editor state; inspect the current window.',
+                        {'code': 'verification_cleanup_failed', 'edit_mode': None}) from exc
+        finally:
+            c._track, _state['rec_obs'] = track, observations
+            if mark is not None:
+                _native_composite_end(c, mark, 'verify_empty_cell')
 
 
 @_action('tc_table')
 def tc_set_cell_text(key: str, column: str, text: str, handle: str) -> dict:
     """Set text in the current row's column (element name). Handles focus and row editing,
     then reads the result. Empty text clears the cell. Returns verified, changed and
-    value_before/value_after. Numeric formatting can return verified=null with
+    value_before/value_after (displayed text). verification=empty_value confirms an empty
+    value behind display formatting. Numeric formatting can return verified=null with
     verification=numeric_equivalent. Continues an existing row edit, including a newly added row,
     and finishes it without discarding other cells' edits. If validation or reference selection
     keeps the row in edit mode, returns row_edit_pending with the current editor; continue
-    there or cancel explicitly with end_edit_row(cancel=true)."""
+    there or cancel explicitly with end_edit_row(cancel=true). Rounded output can instead return
+    value_verification_inconclusive: editing finished, but the exact value is not verified."""
     c = _need()
     stage, before, after, editing, window = 'check_target', None, None, False, None
     existing_edit = False
@@ -4828,6 +5236,13 @@ def tc_set_cell_text(key: str, column: str, text: str, handle: str) -> dict:
         stage = 'verify'
         _cell_ready(c, col['key'], col['handle'])
         after = _obs_cell(c, key, handle, column)
+        if text == '' and after not in ('', None):
+            stage = 'verify_empty'
+            if _verify_empty_cell(c, key, handle, col, window):
+                result = _cell_result(key, before, after, text, 'done')
+                result.pop('error', None)
+                result.update(ok=True, verified=True, verification='empty_value')
+                return result
         return _cell_result(key, before, after, text, 'done')
     except _CellEditFailure as exc:
         result = _cell_result(key, before, after, text, stage, str(exc))
@@ -4855,7 +5270,7 @@ def tc_set_cell_text(key: str, column: str, text: str, handle: str) -> dict:
                     result['message'] += ' Existing window messages may include earlier actions.'
         except Exception:
             pass  # Keep the original refusal when supplementary diagnostics are unavailable.
-    if stage == 'input' and result.get('suggested_action') == 'start_choosing':
+    if stage == 'input' and result.get('suggested_action') in ('start_choosing', 'set_cell_text'):
         # The composite result addresses the table, while choosing addresses its editor.
         result.update(suggested_action='get_current_item',
                       message='Text input was refused. Read the table\'s current editor; '
@@ -4926,7 +5341,8 @@ def tc_set_area_text(key: str, address: str, text: str, handle: str) -> dict:
     """Set a spreadsheet cell's text by address, e.g. R2C1. Selects the cell, starts and
     finishes editing, then reads the result. Empty text clears it. Returns verified,
     changed and value_before/value_after. Numeric formatting can return verified=null
-    with verification=numeric_equivalent. Requires an editable document."""
+    with verification=numeric_equivalent. Rounded output returns value_verification_inconclusive:
+    editing finished, but the exact value is not verified. Requires an editable document."""
     c = _need()
     stage, before, after, editing, window = 'check_target', None, None, False, None
     try:

@@ -1,6 +1,6 @@
 [project]
 name = "1c-testpilot"
-version = "1.0.2"
+version = "1.0.3"
 description = "MCP-сервер для управления тест-клиентом 1С:Предприятие"
 readme = "README.md"
 requires-python = ">=3.10"
