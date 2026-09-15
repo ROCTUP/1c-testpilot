@@ -1,6 +1,6 @@
 [project]
 name = "1c-testpilot"
-version = "1.2.0"
+version = "1.3.0"
 description = "MCP-сервер для управления тест-клиентом 1С:Предприятие"
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -32,4 +32,4 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 package-dir = { "" = "app" }
-py-modules = ["server", "tc1c", "guids", "_collection", "_response", "_refs", "_connections", "_native_window", "_desktop_windows", "_desktop_linux", "_screenshots", "_screenshot_windows", "_screenshot_linux", "_screenshot_image", "tool_versions"]
+py-modules = ["server", "tc1c", "guids", "_collection", "_response", "_refs", "_connections", "_field_batches", "_snapshots", "_native_window", "_desktop_windows", "_desktop_linux", "_screenshots", "_screenshot_windows", "_screenshot_linux", "_screenshot_image", "tool_versions"]

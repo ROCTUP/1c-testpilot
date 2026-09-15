@@ -116,6 +116,7 @@ OBJECT_SLOTS = {
     'get_linked_window': 'window', 'get_current_area_field': 'field',
     'start_choosing': 'window', 'execute_command': 'window',
     'set_cell_text': 'current_item',
+    'set_row_values': 'page',
 }
 
 
@@ -131,6 +132,14 @@ def present(payload, action, registry):
         objects = [v for v in value if isinstance(v, dict) and _collection.is_object_key(v.get('key'))]
     elif isinstance(value, dict) and _collection.is_object_key(value.get('key')):
         objects = [value]
+    if action == 'set_row_values':
+        objects.extend(v['page'] for v in payload.get('results', [])
+                       if isinstance(v, dict) and isinstance(v.get('page'), dict)
+                       and _collection.is_object_key(v['page'].get('key')))
+    snapshot_slots = ('changes', 'observed', 'added', 'errors') if action in ('create_snapshot', 'compare_snapshot') else ()
+    for field in snapshot_slots:
+        objects.extend(v for v in payload.get(field, []) if isinstance(v, dict)
+                       and _collection.is_object_key(v.get('key')))
     if action == 'get_active_window' and _collection.is_object_key(payload.get('key')):
         objects.append(payload)
     for obj in objects:
@@ -170,6 +179,12 @@ def present(payload, action, registry):
         out[slot] = [node(v) for v in value] if isinstance(value, list) else node(value)
         if slot == 'window' and isinstance(value, dict) and 'key' in value and value['key'] is None:
             out[slot] = {'ref': None, **{k: v for k, v in value.items() if k not in ('key', 'handle')}}
+    for field in snapshot_slots:
+        if field in payload:
+            out[field] = [node(v) for v in payload[field]]
+    if action == 'set_row_values' and 'results' in payload:
+        out['results'] = [{**v, 'page': node(v['page'])} if isinstance(v, dict) and 'page' in v else v
+                          for v in payload['results']]
     for field, key in echoes.items():
         out[field] = refs[key]
     if argument_targets:

@@ -12,6 +12,8 @@ import _refs
 import _collection
 import _connections
 import _screenshots
+import _field_batches as _batches
+import _snapshots
 from mcp.types import CallToolResult, ImageContent, TextContent
 import anyio
 # Минимальная версия платформы 1С: по инструменту и по GUID метода (для воспроизведения
@@ -25,6 +27,7 @@ except Exception:
 RS   = tc1c.RES_SCALAR                 # e1      — скаляр/булево
 RC   = tc1c.RES_COLLECTION             # e04b55  — коллекция
 CHILD_MIDDLE = b'\xe1' + b'\x81' * 7   # GetChildObjects без фильтра
+FIND_MIDDLE = b'\xe1\x82' + b'\x81' * 6  # FindObjects: рекурсивный поиск без фильтра
 HTML_READ    = b'\xe1\xcb\x55'         # GetDocumentHTML
 CHOICE_READ  = b'\xe2\xcb\x55'         # GetChoiceListPresentation (kind=read818)
 PERF_MIDDLE  = b'\xe1\x82\xcb\x55'     # GetAccumulatedPerformanceIndicators (read818)
@@ -44,6 +47,7 @@ mcp = FastMCP(
 )
 _state = _connections.State()
 _pool = _connections.Pool(_state)
+_snapshot_store = _snapshots.Store()
 SCREENSHOTS = os.environ.get('TC1C_SCREENSHOTS', 'true').strip().lower() not in ('false', '0', 'no', 'off')
 
 _ACTIONS = {}          # группа -> {действие: функция-обработчик}
@@ -225,8 +229,7 @@ _WINDOW_CHANGING = {G.CLICK, G.CLICK_FIELD, G.CLICK_DECORATION, G.CLICK_CI, G.ST
 
 def _key_class(key):
     """Класс объекта из последнего сегмента ключа: '...EditField[Поле]' -> 'EditField'."""
-    seg = (key or '').split('.')[-1]
-    return seg.split('[', 1)[0] if '[' in seg else seg
+    return _collection.object_class(key)
 
 def _conn_ver(c):
     """Версия платформы этого соединения (аргумент tc_connect, иначе версия по умолчанию)."""
@@ -304,7 +307,7 @@ def _rec_reset():
     """Сбросить всё состояние записи сценария: признаков несколько, и рассыпанный сброс уже
     приводил к тому, что «запись идёт» переживала потерю накопленного."""
     for k in ('rec_paused_track', 'rec_obs', 'rec_obs_paused', 'rec_active',
-              'rec_native_parts', 'rec_native_stopped', 'rec_native_errors'):
+              'rec_native_parts', 'rec_native_stopped', 'rec_native_errors', 'rec_native_covered'):
         _state.pop(k, None)
 
 
@@ -1540,6 +1543,20 @@ def tc_input_text(key: str, text: str, handle: str, finish: bool = True) -> dict
     except tc1c.OperationError as exc:
         if exc.status != 10 or _kind_of(c, key) != 'InputField':
             raise
+        track = getattr(c, '_track', None)
+        try:
+            c._track = None
+            readonly = (_cell_flag(c, G.CURRENT_READONLY, key, handle)
+                        if _guid_available(c, G.CURRENT_READONLY) else None)
+        except tc1c.OperationError:
+            readonly = None
+        finally:
+            c._track = track
+        if readonly is True:
+            return dict(exc.result(), code='readonly', input_status='rejected',
+                        committed=None, readonly=True,
+                        error='The field is read-only.',
+                        message='The field is read-only; text input is unavailable.')
         if _table_owner(key):
             return dict(exc.result(), input_status='rejected', committed=None,
                         suggested_action='set_cell_text',
@@ -1708,13 +1725,7 @@ def tc_get_html(key: str, handle: str) -> dict:
     if error:
         return error
     r = c.send_cmd(G.GET_HTML, key, kind='read', middle=HTML_READ, handle=handle)
-    # Документ опознаётся по форме — самая длинная строка с разметкой. Эвристики clean_strings
-    # рассчитаны на выуживание коротких значений из шумного кадра и на содержимом документа
-    # дают ложные потери (скобки a[href], иероглифы, значки), поэтому здесь не применяются;
-    # от бинарного мусора достаточно отсева C1-управляющих.
-    htmls = [x for x in (tc1c.extract_strings(r['raw'], 4) if r.get('ok') else [])
-             if '<' in x and '>' in x and not any(0x80 <= ord(ch) <= 0x9F for ch in x)]
-    html = max(htmls, key=len) if htmls else None
+    html = tc1c.decode_html(r['raw']) if r.get('ok') else None
     return _unavailable_read({'ok': r['ok'], 'html': html}, 'html')
 
 @_action('tc_field')
@@ -1729,9 +1740,9 @@ def tc_get_context_menu(key: str, handle: str) -> dict:
 def _own_handle(c, key):
     """Собственный handle объекта: берём из перечня детей его РОДИТЕЛЯ (один адресованный кадр).
     None, когда родителя в ключе нет или цели среди детей не оказалось."""
-    if not key or '.' not in key:
+    parent = _collection_parent(key) if key else None
+    if not parent:
         return None
-    parent = key.rsplit('.', 1)[0]
     try:
         r = c.send_cmd(G.GET_CHILD_OBJECTS, parent, kind='read', middle=CHILD_MIDDLE)
     except Exception:
@@ -1746,7 +1757,7 @@ def tc_get_parent(key: str, handle: str) -> dict:
     """Get an element's parent in parent: [...]. The server resolves the parent's own address
     and returns it with the available object metadata."""
     c = _need()
-    recv = key.rsplit('.', 1)[0] if '.' in key else key
+    recv = _collection_parent(key) or key
     r = c.send_cmd(G.GET_PARENT, recv, kind='read', middle=tc1c.mk_area(key), handle=handle)
     parent = _coll(r, key, remember=False)
     for o in parent:
@@ -1766,14 +1777,6 @@ def tc_get_selected_rows(key: str, handle: str) -> dict:
     r = c.send_cmd(G.GET_SELECTED_ROWS, key, kind='read', middle=RC, handle=handle)
     # ответ = массив Соответствий: маркер c04b начинает СТРОКУ, внутри пары <колонка> eb53 <значение>
     rows = _rows(r)
-    if not rows and r.get('ok'):   # ответ без пар eb53 — запасное попарное склеивание строк.
-        # Охрана нужна и здесь: у кадра отказа строк тоже нет, а склейка выдала бы из его
-        # диагностики правдоподобную «строку таблицы»
-        for part in r['raw'].split(b'\xc0\x4b')[1:]:
-            vals = [s for s in tc1c.extract_strings(part, 1) if '[' not in s]
-            row = {vals[i]: vals[i + 1] for i in range(0, len(vals) - 1, 2)}
-            if row:
-                rows.append(row)
     return {'ok': r['ok'], 'target': key, 'rows': rows}
 
 @_action('tc_field')
@@ -1893,6 +1896,7 @@ def tc_choose_from_drop_list(key: str, value: str | int, handle: str) -> dict:
     for kind in ('action', 'commit'):
         r = c.send_cmd(G.CHOOSE_FROM_DROP_LIST, key, kind=kind, middle=tc1c.mk_choice(value), handle=handle)
         ok = ok and r['ok']
+    _resolved_text_input(c, key, ok)
     return {'ok': ok, 'target': key, 'value': value}
 
 @_action('tc_field')
@@ -3015,17 +3019,21 @@ def _area_value(raw, area, cmd):
         return vals[-1]
     return _tail_char(raw, cmd)
 
-_AREA_INT_TAG = 0xEB     # тег однобайтового числа: <eb> <n> 20 a1 a3 TR
-
 def _area_size(raw, values):
-    """Размер области данных. Две формы в хвосте кадра:
-    малый скаляр (...818181 <e1+n> 20 a1 a3 TR), т.е. raw[-8]-0xE1 (e1=0, e4=3);
-    число байтом (...8181 <eb> <n> 20 a1 a3 TR), т.е. raw[-8] как есть.
-    Форму различает тег в raw[-9]; иначе — запасной явный int из values."""
-    if len(raw) >= 9 and raw[-9] == _AREA_INT_TAG:
-        return raw[-8]
-    if len(raw) >= 8 and 0xE1 <= raw[-8] <= 0xFE:
-        return raw[-8] - 0xE1
+    """Размер: компактное значение e1..ea либо eb/ed/ef + 1/2/4 байта числа."""
+    suffix = b'\x20\xa1\xa3' + tc1c.TR
+    pos = tc1c._reply_status_offset(raw)
+    if pos is not None:
+        if not raw.startswith(b'\x81\x81\x81', pos) or not raw.endswith(suffix):
+            return None
+        pos += 3
+        end = len(raw) - len(suffix)
+        for tag, width in ((0xeb, 1), (0xed, 2), (0xef, 4)):
+            if pos + 1 + width == end and raw[pos] == tag:
+                return int.from_bytes(raw[pos + 1:end], 'little', signed=width == 4)
+        if pos + 1 == end and 0xe1 <= raw[pos] <= 0xea:
+            return raw[pos] - 0xe1
+        return None
     ints = [v for k, v in values if k == 'int']
     return ints[-1] if ints else None
 
@@ -3188,6 +3196,7 @@ def tc_execute_choice_from_choice_list(key: str, value: str | int, handle: str) 
     for kind in ('action', 'commit'):
         ok = c.send_cmd(G.EXECUTE_CHOICE_FROM_CHOICE_LIST, key, kind=kind, middle=tc1c.mk_choice(value), handle=handle)['ok'] and ok
     _state['window_key'] = None          # список выбора закрылся — активное окно другое
+    _resolved_text_input(c, key, ok)
     return {'ok': ok, 'target': key, 'value': value}
 
 @_action('tc_field')
@@ -3208,6 +3217,7 @@ def tc_clear(key: str, handle: str) -> dict:
     ok = True
     for kind in ('action', 'commit'):
         ok = c.send_cmd(guid, key, kind=kind, middle=middle, handle=handle)['ok'] and ok
+    _resolved_text_input(c, key, ok)
     return {'ok': ok, 'target': key}
 
 @_action('tc_field')
@@ -3229,7 +3239,23 @@ def tc_cancel_edit(key: str, handle: str) -> dict:
     ok = True
     for kind in ('action', 'commit'):
         ok = c.send_cmd(G.CANCEL_EDIT, key, kind=kind, middle=b'', handle=handle)['ok'] and ok
+    _resolved_text_input(c, key, ok)
     return {'ok': ok, 'target': key}
+
+
+def _resolved_text_input(c, key, ok):
+    # A successful native choice, clear or cancellation replaces the text attempt.
+    # Do not release another field, or dismiss an intervening validation dialog.
+    if not ok or getattr(c, '_pending_text_input', None) != key or not _guid_available(c, G.GET_ACTIVE_WINDOW):
+        return
+    track = getattr(c, '_track', None)
+    try:
+        c._track = None
+        form = _batches.owner(sys.modules[__name__], key)
+        if form and _window(c).get('key') == _collection_parent(form):
+            c._pending_text_input = None
+    finally:
+        c._track = track
 
 @_action('tc_field')
 def tc_drop_list_is_open(key: str, handle: str) -> dict:
@@ -4154,6 +4180,7 @@ def tc_record_finish(path: str = None) -> dict:
     mode = _state.get('rec_mode', 'native')
     parts = _state.pop('rec_native_parts', [])
     native_errors = _state.pop('rec_native_errors', [])
+    covered = _state.pop('rec_native_covered', [])
     stopped = _state.pop('rec_native_stopped', False)
     try:
         r = ({'ok': False, 'raw': b''} if stopped else
@@ -4178,7 +4205,9 @@ def tc_record_finish(path: str = None) -> dict:
     if mode == 'synth':
         lost = _synth_unhandled(tracked)   # мутаторы без synth-обработчика
     else:
-        for g, _k, _m, _kind in tracked:
+        for index, (g, _k, _m, _kind) in enumerate(tracked):
+            if any(start <= index < end for start, end in covered):
+                continue  # This command was preserved in an explicit composite fragment.
             if g in _NONREC_MUTATORS and _NONREC_MUTATORS[g] not in lost:
                 lost.append(_NONREC_MUTATORS[g])
     lost.extend(a for a in dict.fromkeys(native_errors) if a not in lost)
@@ -4257,9 +4286,7 @@ def tc_record_cancel() -> dict:
     return {'ok': r['ok']}
 
 # ====================== сценарий: навигация формы ===========================
-# ============ клиент-сторонний поиск (Find*/Wait*) — обход GetChildObjects ============
-# Эти методы НЕ имеют отдельного кадра протокола: штатный менеджер реализует их
-# рекурсивным обходом дерева + фильтром. Здесь — то же, композитно.
+# ============ чтение детей, обход для внутренних операций и нативный поиск ============
 def _read_children(c, key, *, observed=False):
     """Preserve traversal failures except the native ordinary-form leaf case."""
     try:
@@ -4345,14 +4372,30 @@ def _name_matcher(pattern):
     rx = '^' + re.escape(pattern).replace(r'\*', '.*').replace(r'\?', '.') + '$'
     return re.compile(rx, re.IGNORECASE)
 
+def _search_objects(c, root_key=None):
+    """Одна попытка нативного FindObjects; фильтры MCP применяются к этому ответу."""
+    start = root_key or _window(c)['key']
+    if not start:
+        return []
+    r = c.send_cmd(G.GET_CHILD_OBJECTS, start, kind='read', middle=FIND_MIDDLE)
+    if not r.get('ok'):
+        raise RuntimeError('Could not read the search result; retry the search.')
+    seen = {start}; out = []
+    for item in _coll(r, start):
+        key = item.get('key')
+        if key and key not in seen:
+            seen.add(key)
+            out.append(item)
+    return out
+
+
 def _find(c, name=None, cls=None, type=None, root_key=None, title=None, seen_classes=None,
           seen_types=None):
-    """Объекты дерева по критериям. seen_classes/seen_types (если переданы set) наполняются
-    классами и видами ЭТОГО ЖЕ обхода: диагностика и совпадение обязаны опираться на один снимок,
-    иначе объект, который был в дереве, может исчезнуть между двумя обходами."""
+    """Объекты нативного поиска по критериям. seen_classes/seen_types (если переданы set)
+    наполняются из того же ответа: диагностика не выполняет дополнительный поиск."""
     nm = _name_matcher(name); tm = _name_matcher(title)
     res = []
-    for it in _walk_tree(c, root_key):
+    for it in _search_objects(c, root_key):
         if seen_classes is not None and it.get('class'):
             seen_classes.add(it['class'])
         if seen_types is not None and it.get('type'):
@@ -4554,6 +4597,41 @@ def tc_wait_for_closing(window_title: str = None, timeout: int = 60) -> dict:
                         'error': 'An open window caption could not be determined reliably; closing is not confirmed.'}
             return {'ok': False, 'error': 'timeout after %d s; the window is still open' % timeout}
         _t.sleep(min(0.5, remaining))
+
+@_action('tc_form')
+def tc_create_snapshot(key: str = None) -> dict:
+    """Save a baseline of a ManagedForm (default: the active form). Returns snapshot_id and a
+    summary. May take several seconds; use when you need to compare form state later.
+    Reads element visibility, availability, read-only flags and ordinary field values;
+    excludes table-row contents and document contents. Hidden branches skip further state reads;
+    disabled elements skip read-only. Reads are sequential, not an atomic view of the form."""
+    return _snapshots.run(sys.modules[__name__], 'create_snapshot', key=key)
+
+
+@_action('tc_form')
+def tc_compare_snapshot(snapshot_id: str, key: str = None) -> dict:
+    """Compare a saved baseline with the current state of its original form; no new snapshot is
+    stored. Optional key must identify that same form instance. Returns changes, added and removed
+    elements; observed lists properties read now whose earlier values were not read. Skipped
+    readings are not changes. complete/baseline_complete and errors identify gaps in reading.
+    For flags in added, '-' means not read and 'unknown' means reading failed.
+    Closed forms and reconnected clients require a new baseline."""
+    return _snapshots.run(sys.modules[__name__], 'compare_snapshot', key=key, snapshot_id=snapshot_id)
+
+
+@_action('tc_form')
+def tc_list_snapshots(key: str = None) -> dict:
+    """List saved snapshots for this connection, optionally restricted to one ManagedForm key.
+    Returns IDs, form titles, timestamps, element counts, sizes and global storage limits.
+    Listing does not refresh last_used_at or verify forms are still open; a supplied key is validated."""
+    return _snapshots.run(sys.modules[__name__], 'list_snapshots', key=key)
+
+
+@_action('tc_form')
+def tc_delete_snapshot(snapshot_id: str) -> dict:
+    """Delete a saved snapshot belonging to this connection."""
+    return _snapshots.run(sys.modules[__name__], 'delete_snapshot', snapshot_id=snapshot_id)
+
 
 def _form_elements(c):
     """Навигация окно->форма->ВСЕ элементы (рекурсивно, включая вложенные в группы).
@@ -5149,6 +5227,38 @@ def _cell_ready(c, key, handle):
             raise _CellEditFailure(message)
 
 
+def _table_edit_diagnostic(c, key, detail):
+    """Explain a refused edit only when a page group's current page proves why."""
+    if not _guid_available(c, G.GET_CURRENT_PAGE):
+        return detail
+    try:
+        ancestors = []
+        parent = _collection_parent(key)
+        while parent and _key_class(parent) != 'ManagedForm':
+            ancestors.append(parent)
+            parent = _collection_parent(parent)
+        for parent in reversed(ancestors):
+            if _key_class(parent) != 'Group':
+                continue
+            page = _ref_live_object(c, parent)
+            if not page or page.get('type') != 'Page':
+                continue
+            group_key = _collection_parent(parent)
+            group = _ref_live_object(c, group_key)
+            if not group or group.get('type') != 'Pages' or not group.get('handle'):
+                continue
+            r = c.send_cmd(G.GET_CURRENT_PAGE, group_key, kind='read', middle=RC, handle=group['handle'])
+            current = _coll(r, group_key)
+            if len(current) == 1 and current[0].get('key') and current[0]['key'] != parent:
+                return dict(detail, code='inactive_page', page=page,
+                            suggested_action='activate',
+                            error='The table is on an inactive page. Activate the returned page, then retry.')
+    except Exception as exc:
+        # Diagnostics must retain the original refused operation and its status.
+        return dict(detail, diagnostic_error=str(exc))
+    return detail
+
+
 def _cell_window(c, expected=None):
     key = _window(c).get('key')
     if not key or (expected is not None and key != expected):
@@ -5625,6 +5735,41 @@ def tc_read_document(key: str, handle: str, start_address: str = None, max_cells
         return result
 
 
+@_action('tc_field')
+def tc_read_fields(targets: list[dict], properties: _batches.PropertyList = None) -> dict:
+    """Read 1–100 fields of the active form without moving focus. properties defaults to ['text'];
+    presentation reads data, edit_text reads the editing buffer. visible/enabled/readonly are
+    optional. Table-column text reads the current row. Results follow input order (index is 0-based);
+    unavailable properties remain null with a reason. Reads are sequential, not an atomic snapshot."""
+    c, error = _need_ver('8.3.12')
+    if error: return error
+    return _batches.read_fields(sys.modules[__name__], targets, properties)
+
+
+@_action('tc_field')
+def tc_set_fields(entries: list[dict]) -> dict:
+    """Fill 1–100 ordinary input fields of one active form in order; each entry includes text.
+    Empty text clears. Stops on refusal, unfinished selection, a changed window or unconfirmed value;
+    previous changes remain. Results use 0-based input indexes. Rechecks all values at the end;
+    final_verified=null can mean equivalent numeric formatting. Does not save the document."""
+    c, error = _need_ver('8.3.12')
+    if error: return error
+    return _batches.write(sys.modules[__name__], entries=entries)
+
+
+@_action('tc_table')
+def tc_set_row_values(key: str, handle: str, cells: _batches.CellEntries) -> dict:
+    """Fill 1–100 input columns in the current row, using cells=[{column: element name, text: ...}].
+    Finishes row editing once after entering all cells, then reads the values back. Continues an
+    existing row edit. Stops on refusal or an unexpected editor; preserves earlier edits for explicit
+    completion or cancellation. completed counts entered cells; edit_finished confirms row completion.
+    Results follow input order (0-based index). final_verified=null can
+    mean equivalent numeric formatting. Does not add rows, change selection or save the document."""
+    c, error = _need_ver('8.3.12')
+    if error: return error
+    return _batches.write(sys.modules[__name__], key=key, handle=handle, cells=cells)
+
+
 # ===================== публикация групп инструментов ========================
 def _ver_tuple(s):
     try: return tuple(int(x) for x in str(s).split('.'))
@@ -5690,6 +5835,8 @@ def _common_hint(group, acts, published):
 
 def _public_parameters(fn):
     for p in inspect.signature(fn).parameters.values():
+        if fn.__name__ in ('tc_read_fields', 'tc_set_fields') and p.name in ('targets', 'entries'):
+            p = p.replace(annotation=_batches.public_type(p.name, _response.REF_MODE))
         if _response.REF_MODE == 'id':
             if p.name == 'handle':
                 continue
@@ -5701,6 +5848,14 @@ def _public_parameters(fn):
 # These operations need explicit address instructions; their common descriptions
 # stay independent of the selected public address representation.
 _ADDRESS_NOTES = {
+    'read_fields': {
+        'id': 'targets is an array of {ref} objects returned by discovery.',
+        **dict.fromkeys(('prefix', 'off'), 'targets is an array of {key, handle} pairs returned by discovery.'),
+    },
+    'set_fields': {
+        'id': 'entries is an array of {ref, text} objects; use discovered references unchanged.',
+        **dict.fromkeys(('prefix', 'off'), 'entries is an array of {key, handle, text} objects; use discovered address pairs.'),
+    },
     'get_child_objects': {
         'id': 'Address the parent with ref; children contain ref values. '
               'For a whole subtree, pass root_ref to tc_find(action="find_objects").',
@@ -5829,6 +5984,8 @@ def _dispatch_connected_action(acts, group, kw, connection_id=None):
                 kw = _resolve_ref_arguments(fn, kw)
         else:
             _response.check_ref_args(kw)
+        if name in _batches.FIELD_ACTIONS:
+            kw = _batches.resolve_arguments(sys.modules[__name__], name, kw)
         try:
             bound = inspect.signature(fn).bind(**kw)
         except TypeError as e:
@@ -5852,6 +6009,8 @@ def _dispatch_connected_action(acts, group, kw, connection_id=None):
             res = _refs.present(res, name, _refs.for_client(_state['client']))
     except _refs.RefError as exc:
         res = {'ok': False, 'code': exc.code, 'error': str(exc)}
+    except _batches.Failure as exc:
+        res = {'ok': False, **_batches.error(exc)}
     except tc1c.OperationError as exc:
         res = exc.result()
         if _response.REF_MODE == 'id':
@@ -5889,6 +6048,7 @@ def _dispatch_action(acts, group, kw):
             kw['port'] = connection.port
         else:
             refs = [kw[k] for k in ('ref', 'root_ref') if kw.get(k) is not None]
+            refs.extend(_batches.refs(name, kw))
             connection = _pool.select(connection_id, refs, stop=name == 'stop_client')
         with _pool.use(connection):
             try:
@@ -5943,6 +6103,8 @@ def _register_groups():
         if _response.REF_MODE == 'id' and ref_params:
             desc += ('Passing %s selects the client automatically; otherwise, with several clients, '
                      'connection_id is required. ' % '/'.join(ref_params))
+            if set(acts) & _batches.FIELD_ACTIONS.keys():
+                desc += 'References in targets/entries also select the client; all must belong to one connection. '
         else:
             desc += 'With several clients, connection_id is required. '
         desc += 'Use tc_session(action="list_connections").'

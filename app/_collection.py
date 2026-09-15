@@ -10,6 +10,7 @@ import re, struct, uuid
 # Форма: Класс[GUID-окна] + сегменты .Класс[имя] либо .Класс (напр. .CommandPanel).
 _KEY_RE = re.compile(r'^[A-Za-z][A-Za-z0-9]*\[[0-9a-fA-F-]{36}\]'
                      r'(\.[A-Za-z][A-Za-z0-9]*(\[[^\[\]]*\])?)*$')
+_LAST_SEGMENT_RE = re.compile(r'(?:^|\.)([A-Za-z][A-Za-z0-9]*)(?:\[([^\[\]]*)\])?\Z')
 _TITLE_MARK = bytes.fromhex('82f7')   # заголовок: 82 f7 <len8> <utf16>
 
 
@@ -119,6 +120,7 @@ _TYPE_SUBTYPE = {
 }
 _VIEW_ANCHOR = bytes.fromhex('20eb2395')       # завершитель: <код> 20 eb 23 95 (после имени)
 _VIEW_ALT_ANCHOR = bytes.fromhex('20a1')       # вторая раскладка того же места
+_VIEW_SEARCH_ANCHOR = bytes.fromhex('20a2')    # последняя запись нативного поиска
 _HANDLE_LEN = 16                               # запись: <handle 16 байт><строка-ключа>
 
 # Классы, которые встречаются в ответах. Перечень отдельный от карты видов: у окна и стартовой
@@ -167,12 +169,13 @@ def _code_at(raw, q2, rec_end):
     """Код вида и подтип из собственной записи объекта -> (код, подтип) либо (None, None).
 
     Код — байт диапазона e0..ef перед ЗАВЕРШИТЕЛЕМ, идущим после имени; между кодом и
-    завершителем может стоять байт ПОДТИПА — он и различает виды с общим кодом. Завершителей
-    два, и раскладка выбирается платформой: у одних элементов идёт длинный "20 eb 23 95", у
-    других короткий "20 a1". Берётся ближайший к имени — иначе код был бы прочитан из участка
+    завершителем может стоять байт ПОДТИПА — он и различает виды с общим кодом.
+    Раскладка выбирается платформой: "20 eb 23 95", "20 a1" или "20 a2" в поиске.
+    Берётся ближайший к имени — иначе код был бы прочитан из участка
     следующего объекта."""
     ends = [p for p in (raw.find(_VIEW_ANCHOR, q2, rec_end),
-                        raw.find(_VIEW_ALT_ANCHOR, q2, rec_end)) if p > 0]
+                        raw.find(_VIEW_ALT_ANCHOR, q2, rec_end),
+                        raw.find(_VIEW_SEARCH_ANCHOR, q2, rec_end)) if p > 0]
     end = min(ends) if ends else -1
     if end <= 0:
         return None, None
@@ -223,18 +226,18 @@ def object_name(key):
 
     Единственное определение деривации имени в проекте: им пользуется и декодер, и слой
     представления ответов, который по нему решает, дублирует ли колонка `name` данные ключа."""
-    seg = str(key).split('.')[-1]
-    if '[' in seg and seg.endswith(']'):
-        return seg.split('[', 1)[1][:-1]
-    return None
+    return _key_name_class(key)[0]
+
+
+def object_class(key):
+    """Class of the last address segment, preserving dots inside bracketed names."""
+    return _key_name_class(key)[1]
 
 
 def _key_name_class(key):
     """Из последнего сегмента ключа Класс[Имя] -> (имя, класс)."""
-    seg = key.split('.')[-1]
-    if '[' in seg and seg.endswith(']'):
-        return object_name(key), seg.split('[', 1)[0]
-    return None, seg
+    match = _LAST_SEGMENT_RE.search(key or '')
+    return (match[2], match[1]) if match else (None, '')
 
 def _read_string(raw, i, end):
     """One complete string at its declared position, bounded by its object record."""

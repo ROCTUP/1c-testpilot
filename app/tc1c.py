@@ -12,6 +12,7 @@ else:
 from _collection import decode_collection, object_handles
 
 TR = bytes.fromhex('6653b2a6')
+_WIRE_ESCAPE = bytes.fromhex('6552b1a5')
 TOK_GUID = b'671507fd-50a9-4b63-b70e-58b3d364f48f'
 SESS_BLOCK = b'3ace6d91-51bb-4344-9388-c8105ad4ad11'
 NETWORK_GREETING = bytes.fromhex('53f5c61a7b')
@@ -1006,6 +1007,16 @@ def decode_field_text(raw, *, property_value=False):
     return text if size and p + size == len(raw) - len(suffix) else None
 
 
+def decode_html(raw):
+    """The HTML value follows the reply status; the attachment map follows the text."""
+    p = _reply_status_offset(raw)
+    if p is None or not raw.startswith(b'\x81\x81\x81', p):
+        return None
+    p += 3
+    size, value = _text_at(raw, p)
+    return value if size and raw.startswith(b'\xcb', p + size) else None
+
+
 def decode_cell_text(raw):
     """GetCellText returns text before the echoed column; compact bytes are characters."""
     marker = b'\x81\x81\x81\xe0\x4b\x53'
@@ -1208,6 +1219,83 @@ def _enc_like(tag, new):
         return bytes([hi | 0x08]) + n.to_bytes(2, 'little') + nb        # длинная UTF-16
 
 _FIXBLK = bytes.fromhex('81848381cb5381a3cb2395')
+
+
+def _escape_frame(raw):
+    """Escape reserved wire sequences, leaving the final trailer unchanged."""
+    return (raw[:-len(TR)].replace(_WIRE_ESCAPE, _WIRE_ESCAPE * 2)
+            .replace(TR, _WIRE_ESCAPE + TR) + TR)
+
+
+def _unescape_buffer(raw, start, decoded, escapes):
+    """Append complete wire values; retain a partial escape for the next receive.
+
+    Escape positions map decoded frame ends back to offsets in the wire buffer.
+    """
+    while start < len(raw):
+        p = raw.find(_WIRE_ESCAPE, start)
+        if p < 0:
+            end = len(raw)
+            for tail in range(min(3, end - start), 0, -1):
+                if _WIRE_ESCAPE.startswith(raw[end - tail:]):
+                    end -= tail
+                    break
+            decoded.extend(raw[start:end])
+            return end
+        decoded.extend(raw[start:p])
+        if len(raw) < p + 8:
+            return p
+        following = raw[p + 4:p + 8]
+        if following in (TR, _WIRE_ESCAPE):
+            escapes.append(len(decoded))
+            decoded.extend(following)
+            start = p + 8
+        else:
+            decoded.extend(_WIRE_ESCAPE)
+            start = p + 4
+    return start
+
+
+def _binary_frame_end(raw, start=1):
+    """Find a trailer at a value boundary, returning (end, resume position).
+
+    Lengths delimit text/binary strings, GUIDs and fixed-width values. Their payload
+    bytes cannot be delimiters or tags. A resume position may point beyond the
+    buffered bytes when a value's payload is still arriving.
+    """
+    i = start
+    while i < len(raw):
+        if raw.startswith(TR, i):
+            return i + len(TR), i
+        if len(raw) - i < len(TR) and TR.startswith(raw[i:]):
+            return None, i
+        tag = raw[i]
+        low, high = tag & 15, tag & 0xf0
+        size = 1
+        if high in (0x90, 0xb0, 0xd0, 0xf0):
+            if low == 5:                 # binary GUID
+                size = 17
+            elif low == 1:               # date
+                size = 9
+            elif low in (7, 8, 9, 10, 11, 12):
+                width = {7: 1, 8: 2, 9: 4, 10: 1, 11: 2, 12: 4}[low]
+                if i + 1 + width > len(raw):
+                    return None, i
+                count = int.from_bytes(raw[i + 1:i + 1 + width], 'little')
+                size = 1 + width + count * (2 if low < 10 else 1)
+            elif low == 6:               # decimal in its length-delimited ASCII representation
+                if i + 1 >= len(raw):
+                    return None, i
+                if raw[i + 1] == 0x1a:
+                    if i + 2 >= len(raw):
+                        return None, i
+                    size = 3 + raw[i + 2]
+        elif high in (0x80, 0xa0, 0xc0, 0xe0) and low in (11, 13, 15):
+            # The upper bits vary with position; eb <n> is also a byte value.
+            # Its payload (including 95, a GUID tag elsewhere) is never a tag.
+            size = {11: 2, 13: 3, 15: 5}[low]
+        i += size
+    return None, i
 def _percall_pos(frame):
     p = frame.find(_FIXBLK)
     if p < 0: return None
@@ -1257,13 +1345,27 @@ class TestClient:
             return self.RECV_TIMEOUT
         return None if int(mat) <= 0 else int(mat)
 
-    def _read_frame(self, timeout):
+    def _read_frame(self, timeout, *, binary=None):
         """Прочитать ОДИН кадр (до трейлера TR). timeout: секунды или None (без ограничения).
         При таймауте недочитанное остаётся в self._buf. При EOF/обрыве соединение закрывается."""
         self._require_socket()
         deadline = None if timeout is None else time.monotonic() + timeout
+        scan = 1
+        processed, decoded, escapes = 0, bytearray(), []
         try:
-            while TR not in self._buf:
+            while True:
+                is_binary = self._buf[:1] in (b'A', b'B', b'C') if binary is None else binary
+                if is_binary:
+                    processed = _unescape_buffer(self._buf, processed, decoded, escapes)
+                    end, scan = _binary_frame_end(decoded, scan)
+                else:
+                    j = self._buf.find(TR)
+                    end = j + len(TR) if j >= 0 else None
+                if end is not None:
+                    consumed = end + 4 * sum(p < end for p in escapes) if is_binary else end
+                    out = bytes(decoded[:end]) if is_binary else self._buf[:end]
+                    self._buf = self._buf[consumed:]
+                    return out
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
                     raise socket.timeout('Timed out waiting for a complete test-client response.')
@@ -1280,19 +1382,16 @@ class TestClient:
         except OSError:
             self.close()            # EOF/reset is final; never send another request on this socket
             raise
-        j=self._buf.find(TR)
-        out=self._buf[:j+len(TR)]; self._buf=self._buf[j+len(TR):]
-        return out
 
     def _require_socket(self):
         if self.s is None:
             raise ConnectionError('The test-client connection is closed. Reconnect with tc_session(action="connect").')
 
-    def _recv(self, timeout=0):
+    def _recv(self, timeout=0, *, binary=None):
         """timeout: 0 — политика по умолчанию (_recv_timeout), None — без ограничения,
         число — секунды (для методов с собственным ожиданием, напр. WaitFor…)."""
         try:
-            return self._read_frame(self._recv_timeout() if timeout == 0 else timeout)
+            return self._read_frame(self._recv_timeout() if timeout == 0 else timeout, binary=binary)
         except socket.timeout:
             # Ответ на эту команду ещё придёт и ляжет в поток. Сверки «ответ↔запрос» в
             # протоколе нет, поэтому следующая команда прочитала бы ЧУЖОЙ кадр — помечаем
@@ -1354,7 +1453,7 @@ class TestClient:
             preamble = self._read_exact(size)
             if not re.fullmatch(rb'\xef\xbb\xbf\{#base64:[A-Za-z0-9+/=\r\n]+\}', preamble):
                 raise ConnectionError('Invalid test-client network preamble.')
-            return _decode_network_intro(key, preamble, self._recv(self.CONNECT_TIMEOUT))
+            return _decode_network_intro(key, preamble, self._recv(self.CONNECT_TIMEOUT, binary=False))
         except Exception:
             self.close()
             raise
@@ -1461,7 +1560,7 @@ class TestClient:
         try:
             # The previous receive may have left only a fraction of its deadline on the socket.
             self.s.settimeout(self._io_timeout(self._recv_timeout() if timeout == 0 else timeout))
-            self.s.sendall(fr)
+            self.s.sendall(_escape_frame(fr))
         except OSError:
             self.close()
             raise

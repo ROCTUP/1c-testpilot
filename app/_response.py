@@ -41,9 +41,11 @@ _REF_RE = re.compile(r'^@[ph]:\d+')
 # настоящий адрес, но tc_get_selected_rows возвращает данные, а не адресуемые объекты, и его
 # значения подменять ссылками нельзя.
 ADDR_TOOLS = frozenset({
+    'tc_create_snapshot', 'tc_compare_snapshot',
     'tc_get_child_objects', 'tc_find_objects', 'tc_find_object', 'tc_get_context_menu',
     'tc_get_parent', 'tc_get_command_bar', 'tc_get_command_interface',
     'tc_get_current_page', 'tc_find_default_button', 'tc_get_current_item', 'tc_get_current_element',
+    'tc_set_row_values',
     'tc_get_linked_window', 'tc_get_current_area_field',
     'tc_start_choosing', 'tc_execute_command',
 })

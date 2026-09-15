@@ -67,6 +67,7 @@ class Connection:
         self.host, self.port = endpoint(host, port)
         self.base, self.user = base, user
         self.state = empty_state()
+        self.state['connection_id'] = self.id
         self.lock = threading.RLock()
         self.starting = True
 
