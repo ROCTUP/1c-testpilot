@@ -1302,7 +1302,10 @@ def tc_launch_client(base: str, port: int = None, server: bool = False, user: st
 
 
 def _finish_client_launch(result):
-    if not result['ok'] and _state.get('_isolated_process') is not None:
+    # клиент, поднятый здесь и не взлетевший, гасим при ЛЮБОМ рабочем столе: иначе процесс
+    # остаётся жив и держит порт, а запись о нём остаётся в реестре, и повторный запуск на
+    # тот же endpoint отвечает connection_in_use
+    if not result['ok'] and _state.get('launched_pid'):
         cleanup = tc_stop_client()
         result['client_stopped'] = cleanup['ok']
         if not cleanup['ok']:
