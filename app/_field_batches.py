@@ -2,7 +2,7 @@
 from contextlib import contextmanager
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictStr, StrictBool
 
 LIMIT = 100
 FIELD_ACTIONS = {'read_fields': 'targets', 'set_fields': 'entries'}
@@ -30,20 +30,42 @@ class AddressEntry(AddressTarget):
     text: StrictStr
 
 
+class RefCheckEntry(RefTarget):
+    checked: StrictBool
+
+
+class AddressCheckEntry(AddressTarget):
+    checked: StrictBool
+
+
 class CellEntry(BaseModel):
     model_config = ConfigDict(extra='forbid')
     column: StrictStr
     text: StrictStr
 
 
+class CheckCellEntry(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    column: StrictStr
+    checked: StrictBool
+
+
 Property = Literal['text', 'presentation', 'edit_text', 'visible', 'enabled', 'readonly']
-CellEntries = Annotated[list[CellEntry], Field(min_length=1, max_length=LIMIT)]
+CellEntries = Annotated[list[CellEntry | CheckCellEntry], Field(min_length=1, max_length=LIMIT)]
+
+
+class RowEntry(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    cells: CellEntries
+
+
+RowEntries = Annotated[list[RowEntry], Field(min_length=1, max_length=LIMIT)]
 PropertyList = Annotated[list[Property], Field(min_length=1, max_length=len(PROPERTIES))]
 
 
 def public_type(name, mode):
-    model = ({'targets': RefTarget, 'entries': RefEntry} if mode == 'id' else
-             {'targets': AddressTarget, 'entries': AddressEntry})[name]
+    model = ({'targets': RefTarget, 'entries': RefEntry | RefCheckEntry} if mode == 'id' else
+             {'targets': AddressTarget, 'entries': AddressEntry | AddressCheckEntry})[name]
     return Annotated[list[model], Field(min_length=1, max_length=LIMIT)]
 
 
@@ -64,8 +86,15 @@ def bounded(items, fields):
         raise Failure('invalid_batch', f'Supply between 1 and {LIMIT} entries.')
     out = [plain(v) for v in items]
     for i, item in enumerate(out):
-        if not isinstance(item, dict) or set(item) != set(fields) or any(type(item[k]) is not str for k in fields):
-            raise Failure('invalid_batch', 'Each entry must contain exactly: ' + ', '.join(fields) + '.', i)
+        expected = set(fields)
+        if isinstance(item, dict) and 'text' in expected and 'checked' in item:
+            expected = (expected - {'text'}) | {'checked'}
+        if (not isinstance(item, dict) or set(item) != expected
+                or any(type(item[k]) is not (bool if k == 'checked' else str) for k in expected)):
+            message = ('Each entry must contain ' + ', '.join(k for k in fields if k != 'text') +
+                       ' and exactly one value: text (string) or checked (boolean).') if 'text' in fields else (
+                       'Each entry must contain exactly: ' + ', '.join(fields) + '.')
+            raise Failure('invalid_batch', message, i)
     return out
 
 
@@ -83,7 +112,7 @@ def resolve_arguments(S, action, kw):
     for entry in entries:
         if id_mode:
             key, handle = registry.resolve(entry['ref'])
-            entry = {'key': key, 'handle': handle, **({'text': entry['text']} if 'text' in entry else {})}
+            entry = {'key': key, 'handle': handle, **{k: entry[k] for k in ('text', 'checked') if k in entry}}
         else:
             S._response.check_ref_args(entry)
         resolved.append(entry)
@@ -136,8 +165,9 @@ def targets(S, c, entries, writing=False):
         obj = live(S, c, item)
         if obj.get('class') != 'EditField':
             raise Failure('unsupported_element_type', 'This action requires form fields.', i)
-        if writing and (obj.get('type') != 'InputField' or S._table_owner(item['key'])):
-            raise Failure('unsupported_element_type', 'Use ordinary input fields; table cells use set_row_values.', i)
+        expected_kind = 'CheckBoxField' if 'checked' in item else 'InputField'
+        if writing and (obj.get('type') != expected_kind or S._table_owner(item['key'])):
+            raise Failure('unsupported_element_type', 'Use text for input fields or checked for checkboxes; table cells use set_row_values.', i)
         form = owner(S, item['key'])
         if not form:
             raise Failure('form_unavailable', 'The owning managed form could not be identified.', i)
@@ -287,11 +317,57 @@ def finish_known_field(S, c, obj, other, window):
 
 
 def checked(S, item, obj, actual, presentation=None):
+    if 'checked' in obj:
+        state = checkbox_state(actual)
+        item.update(value_after=actual, checked_after=state, verified=state == obj['checked'], verification='exact')
+        if state != obj['checked']:
+            raise Failure('value_not_confirmed', 'The checkbox does not have the requested state.', item['index'])
+        return
     verified, verification = check_value(S, obj['text'], actual, presentation)
     item.update(value_after=actual, verified=verified, verification=verification)
     if presentation is not None: item['presentation'] = presentation
     if verified is False:
         raise Failure('value_not_confirmed', 'The accepted value does not confirm the requested text.', item['index'])
+
+
+CHECKED_STEP = 'testpilot:set_checked'  # Recording event only; never a protocol method.
+
+
+def checkbox_state(text):
+    states = {'да': True, 'нет': False, 'yes': True, 'no': False}
+    value = text.strip().casefold() if isinstance(text, str) else None
+    if value not in states:
+        raise Failure('checkbox_state_unavailable', 'The checkbox state could not be read as Yes/No. No state is assumed.',
+                      details={'value': text})
+    return states[value]
+
+
+def apply_checkbox(S, c, obj):
+    """Set a known state and record that state, including an already satisfied request."""
+    with observations(c):
+        if S._kind_of(c, obj['key']) != 'CheckBoxField':
+            raise Failure('unsupported_element_type', 'checked requires a checkbox field.')
+        S._cell_ready(c, obj['key'], obj['handle'])
+        table = S._table_owner(obj['key'])
+        if table:
+            parent = S._ref_live_object(c, table)
+            current = S.tc_get_current_item(table, parent['handle']) if parent else {}
+            if [o.get('key') for o in current.get('item', [])] != [obj['key']]:
+                raise Failure('column_not_current', 'Activate the checkbox column before setting its state.')
+        window = S._cell_window(c)
+        before = checkbox_state(read_property(S, c, obj, 'text'))
+    track = getattr(c, '_track', None)
+    mark = len(track) if track is not None else None
+    if before != obj['checked']:
+        require_result(S.tc_set_check(obj['key'], obj['handle']))
+    with observations(c):
+        S._cell_window(c, window)
+        actual = read_property(S, c, obj, 'text')
+        if checkbox_state(actual) != obj['checked']:
+            raise Failure('value_not_confirmed', 'The checkbox did not keep the requested state.')
+    if mark is not None:
+        track[mark:] = [(CHECKED_STEP, obj['key'], b'1' if obj['checked'] else b'0', 'action')]
+    return {'ok': True, 'changed': before != obj['checked']}
 
 
 def empty_cell(S, c, key, handle, obj, window):
@@ -313,7 +389,7 @@ def empty_cell(S, c, key, handle, obj, window):
 
 def require_result(result):
     if not result.get('ok'):
-        details = {k: result[k] for k in ('status_code', 'suggested_action', 'message', 'readonly') if k in result}
+        details = {k: result[k] for k in ('status_code', 'suggested_action', 'message', 'readonly', 'failure_context') if k in result}
         raise Failure(result.get('code', 'input_refused'), result.get('error') or 'Input was refused.', details=details)
 
 
@@ -341,6 +417,103 @@ def finish_record(S, c, mark, action, out):
         out.update(ok=False, recording_complete=False, **error(exc))
 
 
+def row_objects(S, c, key, cells, columns=None, verify_live=True):
+    values = bounded(cells, ['column', 'text'])
+    cols = S._table_columns(c, key) if columns is None else columns
+    objects, seen = [], set()
+    for i, value in enumerate(values):
+        if value['column'] in seen:
+            raise Failure('duplicate_column', 'Each column may appear only once.', i)
+        seen.add(value['column'])
+        found = [o for o in cols if o.get('name') == value['column']]
+        expected_kind = 'CheckBoxField' if 'checked' in value else 'InputField'
+        if len(found) != 1 or found[0].get('type') != expected_kind:
+            raise Failure('invalid_column', 'Use a unique column name: text for input columns, checked for checkbox columns.', i)
+        obj = {**found[0], **{k: value[k] for k in ('text', 'checked') if k in value}}
+        if verify_live:
+            live(S, c, obj)
+        objects.append(obj)
+    return objects
+
+
+def add_rows(S, key, handle, rows):
+    c = S._need()
+    out = dict(ok=False, target=key, results=[], completed=0, added=0)
+    current = None
+    try:
+        if not isinstance(rows, list) or not 1 <= len(rows) <= LIMIT:
+            raise Failure('invalid_batch', 'Provide 1–100 rows, each with cells.')
+        rows = [plain(r) for r in rows]
+        if any(not isinstance(r, dict) or set(r) != {'cells'} for r in rows):
+            raise Failure('invalid_batch', 'Each row must contain only cells.')
+        values = []
+        for i, row in enumerate(rows):
+            try:
+                values.append(bounded(row['cells'], ['column', 'text']))
+            except Failure as exc:
+                exc.details['row_index'] = i
+                raise
+        if sum(map(len, values)) > 1000:
+            raise Failure('invalid_batch', 'At most 1000 cells may be filled in one call.')
+        with observations(c):
+            if S._key_class(key) != 'Table':
+                raise Failure('invalid_table', 'Address a table.')
+            live(S, c, dict(key=key, handle=handle))
+            # Validate every row before the first mutation, including later bad columns.
+            columns = S._table_columns(c, key)
+            requested = {}
+            for i, cells in enumerate(values):
+                try:
+                    requested.update((o['key'], o) for o in row_objects(S, c, key, cells, columns, False))
+                except Failure as exc:
+                    exc.details['row_index'] = i
+                    raise
+            for obj in requested.values():
+                live(S, c, obj)
+            ensure_pending(S, c, None)
+            window = S._cell_window(c)
+            form = owner(S, key)
+            if not form or S._collection_parent(form) != window:
+                raise Failure('form_not_active', 'Activate the owning form before adding rows.')
+        out['results'] = [dict(index=i, status='not_executed', added=False) for i in range(len(rows))]
+        for cells, current in zip(values, out['results']):
+            with observations(c):
+                S._cell_window(c, window)
+                live(S, c, dict(key=key, handle=handle))
+                S._cell_ready(c, key, handle)
+                # Never implicitly finish a row the caller was already editing.
+                mode = S._cell_flag(c, S.G.CURRENT_MODE_IS_EDIT, key, handle)
+                if mode is not False:
+                    raise Failure('row_edit_pending' if mode is True else 'edit_state_unavailable',
+                                  'Finish or cancel the current row edit before adding rows.')
+                row_objects(S, c, key, cells)
+            current.update(status='adding', added=None)
+            require_result(S.tc_table_add_row(key, handle))
+            with observations(c):
+                S._cell_window(c, window)
+                if S._cell_flag(c, S.G.CURRENT_MODE_IS_EDIT, key, handle) is not True:
+                    raise Failure('row_add_unconfirmed',
+                                  'Adding did not leave a new row in editing. Inspect the table before retrying.')
+            current.update(status='filling', added=True)
+            out['added'] += 1
+            # Each fill owns its native recording fragment; AddRow is recorded normally.
+            result = S.tc_set_row_values(key, handle, cells)
+            current['fill'] = result
+            require_result(result)
+            current['status'] = 'completed'
+            out['completed'] += 1
+        out['ok'] = True
+    except Exception as exc:
+        detail = error(exc)
+        if 'index' in detail:
+            detail['cell_index'] = detail.pop('index')
+        out.update(detail)
+        if current is not None:
+            current.update(status='stopped', **detail)
+            out['stopped_at'] = current['index']
+    return out
+
+
 def write(S, entries=None, key=None, handle=None, cells=None):
     c = S._need()
     row = key is not None
@@ -352,22 +525,10 @@ def write(S, entries=None, key=None, handle=None, cells=None):
     try:
         with observations(c):
             if row:
-                values = bounded(cells, ['column', 'text'])
                 if S._key_class(key) != 'Table':
                     raise Failure('invalid_table', 'Address a table.')
                 live(S, c, {'key': key, 'handle': handle})
-                cols = S._table_columns(c, key)
-                objects, seen = [], set()
-                for i, value in enumerate(values):
-                    if value['column'] in seen:
-                        raise Failure('duplicate_column', 'Each column may appear only once.', i)
-                    seen.add(value['column'])
-                    found = [o for o in cols if o.get('name') == value['column']]
-                    if len(found) != 1 or found[0].get('type') != 'InputField':
-                        raise Failure('invalid_column', 'Use the unique element name of an input column.', i)
-                    obj = {**found[0], 'text': value['text']}
-                    live(S, c, obj)
-                    objects.append(obj)
+                objects = row_objects(S, c, key, cells)
                 form = owner(S, key)
                 ensure_pending(S, c, None)
             else:
@@ -397,6 +558,8 @@ def write(S, entries=None, key=None, handle=None, cells=None):
                 else:
                     before, _ = field_value(S, c, obj)
                 current['value_before'] = before
+                if 'checked' in obj:
+                    current['checked_before'] = checkbox_state(before)
             if row:
                 require_result(S.tc_activate(obj['key'], obj['handle']))
                 S._cell_window(c, window)
@@ -413,9 +576,10 @@ def write(S, entries=None, key=None, handle=None, cells=None):
                 if mode is not True:
                     raise Failure('row_edit_interrupted', 'Row editing did not start or was interrupted. Inspect the table.')
             current['status'] = 'attempted'
-            result = S.tc_input_text(obj['key'], obj['text'], obj['handle'])
+            result = (apply_checkbox(S, c, obj) if 'checked' in obj else
+                      S.tc_input_text(obj['key'], obj['text'], obj['handle']))
             require_result(result)
-            if not row and obj['text'] and result.get('edit_finished') is False and len(objects) > 1:
+            if not row and obj.get('text') and result.get('edit_finished') is False and len(objects) > 1:
                 index = current['index']
                 other = objects[index + 1] if index + 1 < len(objects) else objects[index - 1]
                 if finish_known_field(S, c, obj, other, window):
@@ -428,10 +592,10 @@ def write(S, entries=None, key=None, handle=None, cells=None):
                     out['edit_finished'] = None if mode is None else not mode
                     if [o.get('key') for o in selected.get('item', [])] != [obj['key']] or mode is not True:
                         raise Failure('row_edit_interrupted', 'The editor changed while entering text. Inspect the table.')
-                    actual = read_property(S, c, obj, 'edit_text')
+                    actual = read_property(S, c, obj, 'text' if 'checked' in obj else 'edit_text')
                     checked(S, current, obj, actual)
                 else:
-                    if obj['text'] and result.get('edit_finished') is not True:
+                    if obj.get('text') and result.get('edit_finished') is not True:
                         raise Failure('input_pending', 'Input is unfinished or unverified. Inspect the field and any selection dialog.')
                     actual, presentation = field_value(S, c, obj)
                     checked(S, current, obj, actual, presentation)
@@ -454,7 +618,7 @@ def write(S, entries=None, key=None, handle=None, cells=None):
                 live(S, c, obj)
                 actual, presentation = ((S._obs_cell(c, key, handle, obj['name']), None) if row else field_value(S, c, obj))
                 try:
-                    if row and obj['text'] == '' and actual not in ('', None) and empty_cell(S, c, key, handle, obj, window):
+                    if row and obj.get('text') == '' and actual not in ('', None) and empty_cell(S, c, key, handle, obj, window):
                         item.update(value_after=actual, verified=True, verification='empty_value')
                     else:
                         checked(S, item, obj, actual, presentation)

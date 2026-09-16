@@ -49,6 +49,7 @@ TOOL_MIN_VERSION = {
     'tc_find_default_button':                '8.3.3',
     'tc_find_object':                        '8.3.3',
     'tc_find_objects':                       '8.3.3',
+    'tc_find_text':                          '8.3.13',
     'tc_answer_dialog':                      '8.3.3',   # обход дерева: GetActiveWindow + GetChildObjects
     'tc_get_active_window':                  '8.3.3',
     'tc_get_area_text':                      '8.3.6',
@@ -58,6 +59,7 @@ TOOL_MIN_VERSION = {
     'tc_get_command_bar':                    '8.3.3',
     'tc_get_command_interface':              '8.3.3',
     'tc_get_context_menu':                   '8.3.3',
+    'tc_get_context':                        '8.3.3',
     'tc_get_current_area_address':           '8.3.1',
     'tc_get_current_area_field':             '8.3.2',
     'tc_get_current_area_text':              '8.3.1',
@@ -123,6 +125,7 @@ TOOL_MIN_VERSION = {
     'tc_set_file_dialog_result':             '8.3.8',
     'tc_set_order':                          '8.3.6',
     'tc_set_row_values':                     '8.3.12',
+    'tc_add_rows':                           '8.3.12',
     'tc_start_choosing':                     '8.3.1',
     'tc_start_choosing_from_choice_list':    '8.3.1',
     'tc_switch_row_delete_mark':             '8.3.6',

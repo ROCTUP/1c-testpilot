@@ -14,6 +14,8 @@ import _connections
 import _screenshots
 import _field_batches as _batches
 import _snapshots
+import _form_context
+import _action_diagnostics
 from mcp.types import CallToolResult, ImageContent, TextContent
 import anyio
 # Минимальная версия платформы 1С: по инструменту и по GUID метода (для воспроизведения
@@ -83,14 +85,20 @@ def _action(group):
 
 
 def _with_operation_errors(fn):
+    sig = inspect.signature(fn)
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
         try:
-            return fn(*args, **kwargs)
+            result = fn(*args, **kwargs)
         except tc1c.OperationError as exc:
-            return exc.result()
+            result = exc.result()
         except _PlatformVersionError as exc:
             return exc.result
+        if fn.__name__[3:] in _action_diagnostics.FAILURE_ACTIONS and isinstance(result, dict) and result.get('ok') is False:
+            bound = sig.bind(*args, **kwargs).arguments
+            result = _action_diagnostics.failure(sys.modules[__name__], _state.get('client'),
+                bound.get('key'), bound.get('handle'), result)
+        return result
     return wrapped
 
 
@@ -1302,9 +1310,7 @@ def tc_launch_client(base: str, port: int = None, server: bool = False, user: st
 
 
 def _finish_client_launch(result):
-    # клиент, поднятый здесь и не взлетевший, гасим при ЛЮБОМ рабочем столе: иначе процесс
-    # остаётся жив и держит порт, а запись о нём остаётся в реестре, и повторный запуск на
-    # тот же endpoint отвечает connection_in_use
+    # При неудачном запуске останавливаем созданный нами клиент в любом режиме рабочего стола.
     if not result['ok'] and _state.get('launched_pid'):
         cleanup = tc_stop_client()
         result['client_stopped'] = cleanup['ok']
@@ -1647,9 +1653,18 @@ def _click_guid(key):
 
 
 @_action('tc_field')
-def tc_click(key: str, handle: str) -> dict:
+def tc_click(key: str, handle: str, diagnostics: bool = False, diagnostics_wait: float = 2.0) -> dict:
     """Click a button, field, decoration or command-interface button. The element must support
-    clicking. To focus an input, table cell or page, use activate."""
+    clicking. To focus an input, table cell or page, use activate.
+    When present, window describes the active window after the click.
+    diagnostics=True requests the active window and its messages, which may include earlier actions.
+    diagnostics_wait (0..60 s) is the polling period while
+    messages are unavailable/empty; 0 reads once. Individual requests use set_max_action_time.
+    diagnostics.status distinguishes read/unavailable/failed; messages=null is not an empty list.
+    Neither ok nor missing messages confirms a business operation succeeded."""
+    error = _action_diagnostics.validate(diagnostics, diagnostics_wait)
+    if error:
+        return dict(ok=False, code='invalid_argument', error=error)
     c = _need()
     guid = _click_guid(key)
     if guid is None:
@@ -1661,7 +1676,10 @@ def tc_click(key: str, handle: str) -> dict:
         r = c.send_cmd(guid, key, kind=kind, middle=b'', handle=handle)
         ok = ok and r['ok']
     _state['window_key'] = None          # клик мог открыть новое окно — кэш недействителен
-    return {'ok': ok, 'target': key}
+    result = {'ok': ok, 'target': key}
+    if ok and (READBACK or diagnostics):
+        result.update(_action_diagnostics.collect(sys.modules[__name__], c, diagnostics, diagnostics_wait))
+    return result
 
 @_action('tc_field')
 def tc_set_check(key: str, handle: str) -> dict:
@@ -1857,12 +1875,8 @@ def _read_value(c, key, handle):
 def tc_get_current_error() -> dict:
     """Get info about the session's last CLIENT error (none → null). error is the main description;
     details preserves additional text, including nested causes, module locations and stacks.
-    This is not where an
-    application refusal shows up: messages raised by the configuration ("field not filled in",
-    "posting is not possible") arrive in tc_get_user_message_texts. Read that one with care — it
-    returns the ACCUMULATED messages of the session, so an old complaint is still there after a
-    later action succeeded; clear it with tc_close_user_messages_panel before the action you want
-    to judge."""
+    Application messages (e.g. unfilled fields or posting refusal) are read with
+    tc_get_user_message_texts; they may include earlier actions."""
     c = _need()
     r = c.send_cmd(G.GET_CURRENT_ERROR, None, kind='read', middle=ERR_MIDDLE, pad=4)
     vals = _vals(r)
@@ -2602,9 +2616,10 @@ def tc_get_command_interface() -> dict:
 
 @_action('tc_window')
 def tc_get_user_message_texts() -> dict:
-    """Get the user-message texts shown in the window → list of strings. These ACCUMULATE over the
-    session: a complaint from an earlier attempt is still listed after a later attempt succeeded.
-    To judge one action, call tc_close_user_messages_panel first, then the action, then this."""
+    """Get the user-message texts currently shown in the window → list of strings. They may
+    include earlier actions; the application can also replace the list with identical messages.
+    To judge one action, call tc_close_user_messages_panel first, then the action, then this.
+    Messages may appear after the action returns."""
     c = _need()
     try:
         r = c.send_cmd(G.GET_USER_MESSAGE_TEXTS, _winkey(c), kind='read', middle=RC)
@@ -2615,8 +2630,15 @@ def tc_get_user_message_texts() -> dict:
                     error='The user-message panel is unavailable in this window.',
                     message='The message panel is closed or unavailable in this window. '
                             'This does not establish that the last action had no validation errors.')
-    vals = _vals(r)
-    return {'ok': r['ok'], 'messages': vals}
+    return _user_messages_result(r)
+
+
+def _user_messages_result(r):
+    messages = tc1c.decode_user_messages(r['raw']) if r.get('ok') else None
+    if messages is None:
+        return dict(ok=False, messages=None, code='user_messages_unavailable',
+                    message='The message list could not be read; this does not establish that it is empty.')
+    return dict(ok=True, messages=messages)
 
 @_action('tc_window')
 def tc_answer_dialog(confirm: bool = True, timeout: int = 5) -> dict:
@@ -2898,6 +2920,8 @@ def tc_end_edit_current_area(key: str, handle: str, cancel: bool = False) -> dic
         ok = c.send_cmd(G.END_EDIT_CURRENT_AREA, key, kind=kind, middle=mid, handle=handle)['ok'] and ok
     if ok:
         getattr(c, '_pending_area_edits', set()).discard(key)
+        if getattr(c, '_pending_text_input', None) == key:
+            c._pending_text_input = None
     return {'ok': ok, 'target': key, 'cancelled': bool(cancel)}
 
 @_action('tc_doc')
@@ -3769,6 +3793,8 @@ def _synth_dec_int(b):
 def _synth_step(guid, key, middle):
     """(guid, key, middle) -> (tag, attrs, fields) для uilog, либо None (не действие сценария)."""
     m = middle or b''
+    if guid == _batches.CHECKED_STEP:
+        return ('setChecked', {'checked': 'true' if m == b'1' else 'false'}, None)
     def after(pfx): return m[len(pfx):] if m.startswith(pfx) else m
     simple = {G.SET_CHECK: 'setCheck', G.CLICK: 'click', G.CLICK_FIELD: 'click',
               G.CLICK_DECORATION: 'click', G.CLICK_CI: 'click', G.CLEAR: 'clear',
@@ -4602,13 +4628,31 @@ def tc_wait_for_closing(window_title: str = None, timeout: int = 60) -> dict:
         _t.sleep(min(0.5, remaining))
 
 @_action('tc_form')
-def tc_create_snapshot(key: str = None) -> dict:
+def tc_get_context(key: str = None, save_as_snapshot: bool = False,
+                   include_tables: bool = False, max_rows: int = 500) -> dict:
+    """Inspect the active ManagedForm: all elements (including hidden ones), states, field values
+    and current input context. Includes find_objects results for this form; no separate search
+    is needed. For element lookup only, use find_objects. May take several seconds.
+    save_as_snapshot returns snapshot_id for compare_snapshot without reading the form again.
+    include_tables adds table_rows (up to max_rows per table) without expanding trees; rows stay
+    selected. On 8.3 preparation may activate rows. Document contents are excluded.
+    Flags: '-' was not read, 'unknown' failed; null is unavailable, not an empty string.
+    complete/errors report read gaps; snapshot_error reports a failed save. Reads are sequential."""
+    return _form_context.run(sys.modules[__name__], key, save_as_snapshot, include_tables, max_rows)
+
+
+@_action('tc_form')
+def tc_create_snapshot(key: str = None, include_tables: bool = False, max_rows: int = 500) -> dict:
     """Save a baseline of a ManagedForm (default: the active form). Returns snapshot_id and a
     summary. May take several seconds; use when you need to compare form state later.
     Reads element visibility, availability, read-only flags and ordinary field values;
-    excludes table-row contents and document contents. Hidden branches skip further state reads;
+    include_tables saves table rows in display order, up to max_rows per table, without expanding
+    trees. Rows stay selected; on 8.3 preparation may activate rows or establish a current row.
+    Including rows requires the active form and finished input (platform 8.3.6+).
+    All preparation precedes the final state read. Document contents are excluded. Hidden branches skip further state reads;
     disabled elements skip read-only. Reads are sequential, not an atomic view of the form."""
-    return _snapshots.run(sys.modules[__name__], 'create_snapshot', key=key)
+    return _snapshots.run(sys.modules[__name__], 'create_snapshot', key=key,
+                          include_tables=include_tables, max_rows=max_rows)
 
 
 @_action('tc_form')
@@ -4617,6 +4661,9 @@ def tc_compare_snapshot(snapshot_id: str, key: str = None) -> dict:
     stored. Optional key must identify that same form instance. Returns changes, added and removed
     elements; observed lists properties read now whose earlier values were not read. Skipped
     readings are not changes. complete/baseline_complete and errors identify gaps in reading.
+    Uses the baseline's table settings. table_changes compares rows by position (1-based), with
+    column titles and before/after values; *_present distinguishes missing cells from empty text.
+    Table preparation precedes reading; rows stay selected. Truncated tables are not compared.
     For flags in added, '-' means not read and 'unknown' means reading failed.
     Closed forms and reconnected clients require a new baseline."""
     return _snapshots.run(sys.modules[__name__], 'compare_snapshot', key=key, snapshot_id=snapshot_id)
@@ -4881,6 +4928,15 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
             guid, middle = _input_text_command('', c, key)
             return _ac(guid, key, handle, middle)
         if a == 'setCheck':      return _ac(G.SET_CHECK, key, handle)
+        if a == 'setChecked':
+            value = act.get('checked')
+            if value not in ('true', 'false'):
+                raise ValueError('setChecked requires checked="true" or "false"')
+            obj = _ref_live_object(c, key)
+            if not obj:
+                raise ValueError('The checkbox is no longer available.')
+            return _batches.apply_checkbox(sys.modules[__name__], c,
+                                          dict(obj, key=key, handle=handle, checked=value == 'true'))['ok']
         if a == 'click':
             guid = _click_guid(key)
             return _ac(guid, key, handle) if guid is not None else False
@@ -5647,18 +5703,32 @@ def _document_span(area):
 
 
 @_action('tc_doc')
-def tc_read_document(key: str, handle: str, start_address: str = None, max_cells: int = 1000) -> dict:
+def tc_read_document(key: str, handle: str, start_address: str = None, max_cells: int = 1000,
+                     area: str = None) -> dict:
     """Read nonempty spreadsheet cells as rows with cell addresses and merged-cell spans.
-    Uses the document's data bounds. If complete=false, pass next_address as start_address
-    to continue. max_cells limits positions scanned per call (1–10000)."""
+    Optional area is a rectangle such as R2C3:R8C5 (platform 8.3.25+), clipped to the document's data bounds.
+    Intersecting merged cells retain their full address/span, even if they start outside area.
+    If complete=false, pass next_address as start_address with the same area to continue.
+    max_cells limits positions scanned per call (1–10000). Does not move the current area."""
     c = _need()
     result = {'ok': False, 'target': key, 'rows': [], 'complete': False, 'next_address': None,
               'scanned_cells': 0, 'nonempty_cells': 0}
-    pos, width, height = None, None, None
+    pos, width, height, total = None, None, None, None
+    top, left, scan_width = 1, 1, None
     try:
         if isinstance(max_cells, bool) or not isinstance(max_cells, int) or not 1 <= max_cells <= 10000:
             raise ValueError('max_cells must be an integer from 1 to 10000')
-        start = _document_cell(start_address) if start_address is not None else (1, 1)
+        bounds = None
+        if area is not None:
+            cell = _document_cell(area)
+            bounds = (*cell, *cell) if cell else _document_span(area)
+            if bounds is None:
+                raise ValueError('area must be a cell or rectangle such as R2C3:R8C5')
+            if not _guid_available(c, G.INCLUDED_IN_MERGED_AREA):
+                raise ValueError('area reading requires 1C platform 8.3.25 or newer to identify intersecting merged cells')
+            top, left = bounds[:2]
+            result['area'] = area
+        start = _document_cell(start_address) if start_address is not None else (top, left)
         if start is None:
             raise ValueError('start_address must be a cell address such as R2C1')
         for guid in (G.GET_DOC_AREA_VERTICAL_SIZE, G.GET_DOC_AREA_HORIZONTAL_SIZE, G.GET_AREA_TEXT):
@@ -5670,25 +5740,27 @@ def tc_read_document(key: str, handle: str, start_address: str = None, max_cells
         if _cell_flag(c, G.CURRENT_VISIBLE, key, handle) is not True:
             raise ValueError('the document field is not visibly available')
         height, width = _document_bounds(c, key, handle)
+        bottom, right = (min(bounds[2], height), min(bounds[3], width)) if bounds else (height, width)
+        scan_width = max(0, right - left + 1)
         result['dimensions'] = {'rows': height, 'columns': width}
         result['merged_cells_identified'] = _guid_available(c, G.INCLUDED_IN_MERGED_AREA)
-        if not height or not width:
-            if start_address is not None and start != (1, 1):
+        if bottom < top or right < left:
+            if start_address is not None and start != (top, left):
                 raise ValueError('start_address is outside the document data bounds')
             result.update(ok=True, complete=True)
             return result
-        if start[0] > height or start[1] > width:
-            raise ValueError('start_address is outside the document data bounds')
-        pos = (start[0] - 1) * width + start[1] - 1
-        first, total = pos, height * width
+        if not (top <= start[0] <= bottom and left <= start[1] <= right):
+            raise ValueError('start_address is outside the requested area or document data bounds')
+        pos = (start[0] - top) * scan_width + start[1] - left
+        first, total = pos, (bottom - top + 1) * scan_width
         end = min(total, pos + max_cells)
         spans, rows = [], {}
         deadline = time.monotonic() + 10
         while pos < end:
             if pos > first and time.monotonic() >= deadline:
                 break
-            row, col = divmod(pos, width)
-            row, col = row + 1, col + 1
+            row, col = divmod(pos, scan_width)
+            row, col = row + top, col + left
             address = 'R%dC%d' % (row, col)
             if any(r1 <= row <= r2 and c1 <= col <= c2 for r1, c1, r2, c2 in spans):
                 pos += 1
@@ -5698,20 +5770,36 @@ def tc_read_document(key: str, handle: str, start_address: str = None, max_cells
             if not r.get('ok'):
                 raise ValueError('could not read cell ' + address)
             value = _area_value(r['raw'], address, G.GET_AREA_TEXT)
+            span = None
+            # A rectangle can start inside an otherwise empty-looking covered cell.
+            if area is not None and result['merged_cells_identified']:
+                merged, ok = _merged_area(c, key, handle, address)
+                if not ok:
+                    raise ValueError('could not read the merged area of cell ' + address)
+                span = _document_span(merged)
+                if span and not (span[0] <= row <= span[2] and span[1] <= col <= span[3]):
+                    raise ValueError('inconsistent merged area for cell ' + address)
+                if span:
+                    anchor_address = 'R%dC%d' % span[:2]
+                    if anchor_address != address:
+                        r = c.send_cmd(G.GET_AREA_TEXT, key, kind='read', middle=tc1c.mk_area(anchor_address), handle=handle)
+                        if not r.get('ok'):
+                            raise ValueError('could not read merged cell ' + anchor_address)
+                        value = _area_value(r['raw'], anchor_address, G.GET_AREA_TEXT)
             if value is not None and value != '':
                 cell = {'address': address, 'text': value}
-                if result['merged_cells_identified']:
+                if result['merged_cells_identified'] and area is None:
                     merged, ok = _merged_area(c, key, handle, address)
                     if not ok:
                         raise ValueError('could not read the merged area of cell ' + address)
                     span = _document_span(merged)
-                    if span and span[0] <= row <= span[2] and span[1] <= col <= span[3]:
-                        spans.append(span)
-                        row, col = span[:2]
-                        cell.update(address='R%dC%d' % (row, col),
-                                    row_span=span[2] - row + 1, column_span=span[3] - col + 1)
+                if span and span[0] <= row <= span[2] and span[1] <= col <= span[3]:
+                    spans.append(span)
+                    row, col = span[:2]
+                    cell.update(address='R%dC%d' % (row, col),
+                                row_span=span[2] - row + 1, column_span=span[3] - col + 1)
                 # A continuation inside a merged cell does not repeat its earlier anchor.
-                anchor = (row - 1) * width + col - 1
+                anchor = (max(row, top) - top) * scan_width + max(col, left) - left
                 if anchor >= first:
                     if row not in rows:
                         rows[row] = {'row': row, 'cells': []}
@@ -5727,15 +5815,44 @@ def tc_read_document(key: str, handle: str, start_address: str = None, max_cells
             raise ValueError('the document data bounds changed; read the document again')
         result.update(ok=True, complete=pos == total)
         if pos < total:
-            result['next_address'] = 'R%dC%d' % (pos // width + 1, pos % width + 1)
+            result['next_address'] = 'R%dC%d' % (pos // scan_width + top, pos % scan_width + left)
         return result
     except Exception as exc:
         result['error'] = str(exc)
-        if pos is not None and width and height and pos >= width * height:
+        if pos is not None and total is not None and pos >= total:
             result['restart_required'] = True
-        if pos is not None and width and not result.get('restart_required'):
-            result['next_address'] = 'R%dC%d' % (pos // width + 1, pos % width + 1)
+        if pos is not None and scan_width and not result.get('restart_required'):
+            result['next_address'] = 'R%dC%d' % (pos // scan_width + top, pos % scan_width + left)
         return result
+
+
+@_action('tc_doc')
+def tc_find_text(key: str, handle: str, text: str, match: typing.Literal['contains', 'exact'] = 'contains',
+                 case_sensitive: bool = False, area: str = None, start_address: str = None,
+                 max_cells: int = 1000) -> dict:
+    """Find literal text in a spreadsheet document; return matching cell addresses and text.
+    match=contains finds substrings, exact matches a whole cell. Case is ignored by default.
+    Optional area limits the search to a cell or rectangle (8.3.25+). Does not move the current area.
+    max_cells limits scanned positions (1–10000), not matches. complete=false means more positions
+    remain: pass next_address as start_address with the same text, match, case_sensitive and area.
+    An empty matches list establishes absence only in the successfully scanned part."""
+    if not isinstance(text, str) or not text or match not in ('contains', 'exact') or type(case_sensitive) is not bool:
+        return {'ok': False, 'code': 'invalid_search', 'error': 'Supply nonempty text, match=contains or exact, and a boolean case_sensitive.',
+                'matches': [], 'complete': False}
+    result = tc_read_document(key, handle, start_address=start_address, max_cells=max_cells, area=area)
+    rows = result.pop('rows', [])
+    result['matches'] = []
+    wanted = text if case_sensitive else text.casefold()
+    for row in rows:
+        for cell in row['cells']:
+            actual = cell['text'] if case_sensitive else cell['text'].casefold()
+            matches = wanted in actual if match == 'contains' else wanted == actual
+            if matches:
+                r, col = _document_cell(cell['address'])
+                result['matches'].append(dict(address=cell['address'], row=r, column=col,
+                    text=cell['text'], row_span=cell.get('row_span', 1), column_span=cell.get('column_span', 1)))
+    result.update(text=text, match=match, case_sensitive=case_sensitive, match_count=len(result['matches']))
+    return result
 
 
 @_action('tc_field')
@@ -5751,7 +5868,9 @@ def tc_read_fields(targets: list[dict], properties: _batches.PropertyList = None
 
 @_action('tc_field')
 def tc_set_fields(entries: list[dict]) -> dict:
-    """Fill 1–100 ordinary input fields of one active form in order; each entry includes text.
+    """Fill 1–100 input fields or checkboxes of one active form in order. Each entry has exactly
+    one value: text for an input field, checked=true/false for a checkbox. Already matching checkboxes
+    are not toggled. Unknown checkbox states stop the batch; Yes/No presentations in Russian and English are supported.
     Empty text clears. Stops on refusal, unfinished selection, a changed window or unconfirmed value;
     previous changes remain. Results use 0-based input indexes. Rechecks all values at the end;
     final_verified=null can mean equivalent numeric formatting. Does not save the document."""
@@ -5761,8 +5880,21 @@ def tc_set_fields(entries: list[dict]) -> dict:
 
 
 @_action('tc_table')
+def tc_add_rows(key: str, handle: str, rows: _batches.RowEntries) -> dict:
+    """Add and fill 1–100 rows: rows=[{cells:[{column: element name, text: ...}]}], at most 1000 cells.
+    Each cell uses text for an input column or checked=true/false for a checkbox column, never both.
+    Requires finished row editing. Stops at the first refusal; earlier edits
+    remain. results use 0-based input indexes; added=null means creation could not be confirmed.
+    Each completed row is checked when filled, not after later rows. Does not save the document."""
+    c, error = _need_ver('8.3.12')
+    if error: return error
+    return _batches.add_rows(sys.modules[__name__], key, handle, rows)
+
+
+@_action('tc_table')
 def tc_set_row_values(key: str, handle: str, cells: _batches.CellEntries) -> dict:
-    """Fill 1–100 input columns in the current row, using cells=[{column: element name, text: ...}].
+    """Fill 1–100 input or checkbox columns in the current row: each cell has column (element name)
+    and exactly one of text (input column) or checked=true/false (checkbox). Matching checkboxes are not toggled.
     Finishes row editing once after entering all cells, then reads the values back. Continues an
     existing row edit. Stops on refusal or an unexpected editor; preserves earlier edits for explicit
     completion or cancellation. completed counts entered cells; edit_finished confirms row completion.
@@ -5818,7 +5950,9 @@ _EFFECT_NOTE = ('\n`ok: true` means the client accepted the command, not that an
                 'absence says nothing. A wrong address is refused with an error only where the '
                 'address can be checked: a read without a target marker cannot tell one from an '
                 'empty answer, and tc_table(action="get_cell_text") on a table that does '
-                'not exist returns text=null exactly as for an empty cell.')
+                'not exist returns text=null exactly as for an empty cell. '
+                'Interaction refusals may include failure_context: observed element state, '
+                'current table editor or open choices. complete=false means some diagnostics were unavailable.')
 
 
 
@@ -5856,8 +5990,8 @@ _ADDRESS_NOTES = {
         **dict.fromkeys(('prefix', 'off'), 'targets is an array of {key, handle} pairs returned by discovery.'),
     },
     'set_fields': {
-        'id': 'entries is an array of {ref, text} objects; use discovered references unchanged.',
-        **dict.fromkeys(('prefix', 'off'), 'entries is an array of {key, handle, text} objects; use discovered address pairs.'),
+        'id': 'entries contains {ref, text} or {ref, checked} objects; use discovered references unchanged.',
+        **dict.fromkeys(('prefix', 'off'), 'entries contains {key, handle, text} or {key, handle, checked}; use discovered address pairs.'),
     },
     'get_child_objects': {
         'id': 'Address the parent with ref; children contain ref values. '

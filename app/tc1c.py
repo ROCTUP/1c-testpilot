@@ -1017,6 +1017,48 @@ def decode_html(raw):
     return value if size and raw.startswith(b'\xcb', p + size) else None
 
 
+def decode_user_messages(raw):
+    """Read the fixed array returned by GetUserMessageTexts, preserving every string."""
+    from guids import GET_USER_MESSAGE_TEXTS
+    p = _reply_status_offset(raw, GET_USER_MESSAGE_TEXTS)
+    prefix = b'\x81\x81\x81\xe0\x4b\x23\x95' + uuid.UUID('4500381b-db30-4a10-9db4-990038032acf').bytes_le
+    if p is None or not raw.startswith(prefix, p):
+        return None
+    p += len(prefix)
+    if p >= len(raw):
+        return None
+    tag = raw[p]
+    if 0xc1 <= tag <= 0xca:
+        count, p = tag - 0xc1, p + 1
+    elif tag in (0xcb, 0xcd, 0xcf):
+        width = {0xcb: 1, 0xcd: 2, 0xcf: 4}[tag]
+        if p + 1 + width > len(raw):
+            return None
+        count = int.from_bytes(raw[p + 1:p + 1 + width], 'little')
+        p += 1 + width
+    else:
+        return None
+    if count > len(raw):
+        return None
+    messages = []
+    for index in range(count):
+        if not raw.startswith(b'\xcb\x53' if index == 0 else b'\xeb\x53', p):
+            return None
+        p += 2
+        if raw[p:p + 1] == b'\x81':
+            size, text = 1, ''
+        else:
+            size, text = _text_at(raw, p)
+        if not size:
+            return None
+        messages.append(text)
+        p += size
+    end = b'\xa1\xa3' + TR
+    if not raw.endswith(end) or raw[p:-len(end)] not in (b' ', b'  ', b'   ', b'    '):
+        return None
+    return messages
+
+
 def decode_cell_text(raw):
     """GetCellText returns text before the echoed column; compact bytes are characters."""
     marker = b'\x81\x81\x81\xe0\x4b\x53'

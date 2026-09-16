@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import uuid
+import _snapshot_tables as table_rows
 
 
 PROPERTIES = ('visible', 'enabled', 'readonly', 'presentation')
@@ -64,7 +65,7 @@ class Store:
 
     def info(self, entry):
         return {k: entry[k] for k in ('snapshot_id', 'connection_id', 'form_title',
-                'created_at', 'last_used_at', 'element_count', 'size_bytes')}
+                'created_at', 'last_used_at', 'element_count', 'size_bytes', 'include_tables', 'max_rows')}
 
     def stats(self):
         with self.lock:
@@ -80,6 +81,7 @@ class Store:
                      connection_id=connection_id, key=form['key'], handle=form.get('handle'),
                      form_title=form.get('title'), created_at=stamp, last_used_at=stamp,
                      element_count=len(capture['elements']), payload=payload, size_bytes=0)
+        entry.update(capture.get('options', table_rows.options(False, 500)))
         # Separate equal timestamps for conservative ownership accounting; include map overhead.
         entry['last_used_at'] = stamp.encode().decode()
         entry['size_bytes'] = deep_size(entry) + 256
@@ -153,17 +155,36 @@ def form_object(S, c, key=None):
     return obj
 
 
-def capture(S, c, form):
+def capture(S, c, form, inspect=None, include_tables=False, max_rows=500):
     start = time.perf_counter()
     track = getattr(c, '_track', None)
     c._track = None
     try:
-        return _capture(S, c, form, start)
+        prepared = None
+        if include_tables:
+            objects = S._search_objects(c, form['key'])
+            native = (S._state.get('rec_active') and S._state.get('rec_mode') == 'native' and track is not None)
+            def recording(middle, message):
+                try:
+                    r = c.send_cmd(S.G.UILOG, None, kind='read818', middle=middle)
+                    if not r.get('ok'):
+                        raise Failure('recording_incomplete', message)
+                except Exception:
+                    S._state.setdefault('rec_native_errors', []).append('snapshot_tables')
+                    raise
+            if native:
+                recording(b'\xe2\x81', 'Recording could not be paused for table preparation.')
+            try:
+                prepared = table_rows.prepare(S, c, form, objects)
+            finally:
+                if native:
+                    recording(b'\xe3\x81', 'Recording could not be resumed after table preparation.')
+        return _capture(S, c, form, start, inspect, prepared, max_rows)
     finally:
         c._track = track
 
 
-def _capture(S, c, form, start):
+def _capture(S, c, form, start, inspect=None, prepared=None, max_rows=500):
     errors = []
 
     def read(obj, prop):
@@ -188,6 +209,13 @@ def _capture(S, c, form, start):
 
     before = guard()
     objects = S._search_objects(c, form['key'])
+    if prepared is not None:
+        tables, preparation_errors = prepared
+        current_tables = {o['key']: o.get('handle') for o in objects if o.get('class') == 'Table'}
+        if current_tables != {k: t.get('handle') for k, t in tables.items()}:
+            raise Failure('snapshot_unstable', 'The form tables changed during preparation. Retry.')
+        errors.extend(preparation_errors)
+        errors.extend(table_rows.read(S, tables, max_rows))
     data, inherited = {}, {}
     # Parents precede children, independent of the order of the native result.
     def depth(obj):
@@ -199,7 +227,10 @@ def _capture(S, c, form, start):
         key, cls = obj['key'], obj.get('class')
         parent = S._collection_parent(key)
         hidden, disabled = inherited.get(parent, (False, False))
+        # Keep the baseline's standard columns even when discovery omits a value,
+        # and preserve additional attributes such as form_name for the overview.
         item = {k: obj.get(k) for k in ('key', 'handle', 'name', 'title', 'class', 'type')}
+        item.update(obj)
         status = {}
         for prop in PROPERTIES[:3]:
             item[prop], status[prop] = '-', 'skipped'
@@ -219,6 +250,7 @@ def _capture(S, c, form, start):
         data[key] = item
         inherited[key] = hidden, disabled
 
+    context = inspect(data, before) if inspect is not None else None
     after = guard()
     current = form_object(S, c, form['key'])
     again = S._search_objects(c, form['key'])
@@ -226,8 +258,13 @@ def _capture(S, c, form, start):
         return {o['key']: tuple(o.get(p) for p in ('handle', 'class', 'type', 'name', 'title')) for o in values}
     if before != after or current.get('handle') != form.get('handle') or structure(objects) != structure(again):
         raise Failure('snapshot_unstable', 'The form changed while it was being read. Retry after the form finishes updating.')
-    return dict(elements=data, errors=errors, complete=not errors,
-                captured_at=now(), seconds=round(time.perf_counter() - start, 4))
+    result = dict(elements=data, errors=errors, complete=not errors,
+                  captured_at=now(), seconds=round(time.perf_counter() - start, 4))
+    if prepared is not None:
+        result.update(tables=tables, options=table_rows.options(True, max_rows))
+    if inspect is not None:
+        result.update(context=context, modified=before[0])
+    return result
 
 
 def difference(before, after):
@@ -249,13 +286,21 @@ def difference(before, after):
         return {k: v for k, v in item.items() if k != '_status'}
     # Removed elements must not mint usable refs for objects that no longer exist.
     removed = [{p: old[k][p] for p in ('name', 'title', 'class', 'type')} for k in old if k not in new]
-    return dict(changes=changes, observed=observed,
+    result = dict(changes=changes, observed=observed,
                 added=[public(new[k]) for k in new if k not in old], removed=removed,
                 errors=after['errors'], baseline_complete=before['complete'], complete=after['complete'])
+    if before.get('options', {}).get('include_tables'):
+        result.update(table_changes=table_rows.difference(before.get('tables', {}), after.get('tables', {})),
+                      tables=table_rows.summary(after.get('tables', {})))
+    return result
 
 
-def run(S, action, key=None, snapshot_id=None):
+def run(S, action, key=None, snapshot_id=None, include_tables=False, max_rows=500):
     try:
+        try:
+            options = table_rows.options(include_tables, max_rows)
+        except ValueError as exc:
+            return dict(ok=False, code='invalid_argument', error=str(exc))
         owner, generation, connection_id = identity(S)
         store = S._snapshot_store
         if action == 'delete_snapshot':
@@ -277,8 +322,13 @@ def run(S, action, key=None, snapshot_id=None):
             form = form_object(S, c, entry['key'])
             if form.get('handle') != entry['handle']:
                 raise Failure('snapshot_form_unavailable', 'This is a different form instance. Create a new snapshot.')
-            current = capture(S, c, form)
             baseline = json.loads(entry['payload'])
+            options = baseline.get('options', table_rows.options(False, 500))
+            if options['include_tables']:
+                _, error = S._need_ver('8.3.6')
+                if error:
+                    return error
+            current = capture(S, c, form, **options)
             result = difference(baseline, current)
             # Another connection can evict the baseline during the read. The local immutable
             # copy is still valid; do not resurrect it or fail an already completed comparison.
@@ -289,13 +339,19 @@ def run(S, action, key=None, snapshot_id=None):
             return dict(ok=True, compared_to=snapshot_id, form_title=form.get('title'),
                         seconds=current['seconds'], **result)
         form = form_object(S, c, key)
-        current = capture(S, c, form)
+        if include_tables:
+            _, error = S._need_ver('8.3.6')
+            if error:
+                return error
+        current = capture(S, c, form, **options)
         if (S._response.REF_MODE == 'id'
-                and len({e['key'] for e in current['errors']}) > S._refs.for_client(c).limit):
-            raise Failure('ref_limit_exceeded', 'The snapshot has too many error targets for TC1C_REF_LIMIT; no snapshot was stored.')
+                and len({e['key'] for e in current['errors']} | set(current.get('tables', {}))) > S._refs.for_client(c).limit):
+            raise Failure('ref_limit_exceeded', 'The snapshot result exceeds TC1C_REF_LIMIT; no snapshot was stored.')
         info = store.add(owner, generation, connection_id, form, current)
-        return dict(ok=True, **info, complete=current['complete'], errors=current['errors'],
-                    seconds=current['seconds'])
+        result = dict(ok=True, **info, complete=current['complete'], errors=current['errors'], seconds=current['seconds'])
+        if include_tables:
+            result['tables'] = table_rows.summary(current['tables'])
+        return result
     except Failure as exc:
         return dict(ok=False, code=exc.code, error=str(exc))
     except (OSError, RuntimeError) as exc:

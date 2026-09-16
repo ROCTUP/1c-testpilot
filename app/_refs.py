@@ -108,6 +108,7 @@ def for_client(client):
 # Only these response slots contain UI objects. Never rewrite table values, document
 # cells, text, HTML, attachments, criteria or recorded scenarios, even if they look like keys.
 OBJECT_SLOTS = {
+    'click': 'window',
     'get_child_objects': 'children', 'find_objects': 'objects', 'find_object': 'object',
     'wait_for_object_displayed': 'object',
     'get_context_menu': 'menu', 'get_parent': 'parent', 'get_command_bar': 'commandbar',
@@ -120,10 +121,84 @@ OBJECT_SLOTS = {
 }
 
 
+_CONTEXT_LISTS = ('elements', 'tables', 'documents', 'pages', 'errors', 'table_rows')
+_CONTEXT_RELATIONS = ('parent_key', 'current_column_key', 'current_page_key', 'field_key')
+
+
+def context_pairs(payload, registry):
+    """Only declared context addresses; field values and choice text are never addresses."""
+    import _collection
+    nodes = [payload.get('form'), payload.get('input')]
+    nodes.extend(v for field in _CONTEXT_LISTS for v in payload.get(field, []))
+    pairs = {v['key']: v.get('handle') or registry.get(v['key']) for v in nodes
+             if isinstance(v, dict) and _collection.is_object_key(v.get('key'))}
+    for obj in [payload, *nodes, *payload.get('choices', [])]:
+        if not isinstance(obj, dict):
+            continue
+        for field in ('current_key', *_CONTEXT_RELATIONS):
+            key = obj.get(field)
+            if _collection.is_object_key(key) and key not in pairs:
+                pairs[key] = registry.get(key)
+    return pairs
+
+
+def _present_context(payload, registry):
+    refs = registry.publish(context_pairs(payload, registry))
+    def node(obj):
+        if not isinstance(obj, dict):
+            return obj
+        out = {}
+        for field, value in obj.items():
+            if field == 'handle':
+                continue
+            if field == 'key' or field in ('current_key', *_CONTEXT_RELATIONS):
+                name = 'ref' if field == 'key' else field[:-3] + 'ref'
+                out[name] = refs.get(value) if value is not None else None
+            else:
+                out[field] = value
+        return out
+    out = dict(payload)
+    if 'current_key' in out:
+        out['current_ref'] = refs.get(out.pop('current_key'))
+    for field in ('form', 'input'):
+        if field in out:
+            out[field] = node(out[field])
+    for field in (*_CONTEXT_LISTS, 'choices'):
+        if field in out:
+            out[field] = [node(v) for v in out[field]]
+    return out
+
+
+def _failure_objects(context):
+    nodes = [context.get('target'), context.get('focused_element'), context.get('table')]
+    nodes.extend(context.get('ancestors', []))
+    table = context.get('table')
+    if isinstance(table, dict):
+        nodes.append(table.get('current_column'))
+    unique = {}
+    for obj in nodes:
+        if isinstance(obj, dict) and obj.get('key'):
+            unique[id(obj)] = obj
+    return list(unique.values())
+
+
+def _envelopes(payload, action):
+    """Declared result containers only; never inspect arbitrary cell text or UI values."""
+    yield payload
+    if action in ('set_fields', 'set_row_values', 'add_rows'):
+        for row in payload.get('results', []):
+            if isinstance(row, dict):
+                yield row
+                if action == 'add_rows' and isinstance(row.get('fill'), dict):
+                    yield from _envelopes(row['fill'], 'set_row_values')
+
+
 def present(payload, action, registry):
     import _collection
     if not isinstance(payload, dict):
         return payload
+    if action == 'get_context':
+        return _present_context(payload, registry)
     pairs = {}
     objects = []
     slot = OBJECT_SLOTS.get(action)
@@ -136,13 +211,17 @@ def present(payload, action, registry):
         objects.extend(v['page'] for v in payload.get('results', [])
                        if isinstance(v, dict) and isinstance(v.get('page'), dict)
                        and _collection.is_object_key(v['page'].get('key')))
-    snapshot_slots = ('changes', 'observed', 'added', 'errors') if action in ('create_snapshot', 'compare_snapshot') else ()
+    snapshot_slots = ('changes', 'observed', 'added', 'errors', 'tables', 'table_changes') if action in ('create_snapshot', 'compare_snapshot') else ()
     for field in snapshot_slots:
         objects.extend(v for v in payload.get(field, []) if isinstance(v, dict)
                        and _collection.is_object_key(v.get('key')))
     if action == 'get_active_window' and _collection.is_object_key(payload.get('key')):
         objects.append(payload)
     for obj in objects:
+        pairs[obj['key']] = obj.get('handle') or registry.get(obj['key'])
+    envelopes = list(_envelopes(payload, action))
+    extra_pages = [v['page'] for v in envelopes if isinstance(v.get('page'), dict) and v['page'].get('key')]
+    for obj in extra_pages:
         pairs[obj['key']] = obj.get('handle') or registry.get(obj['key'])
     # Address echoes at the top level have defined semantics, unlike arbitrary UI data.
     echoes = {}
@@ -151,8 +230,6 @@ def present(payload, action, registry):
         echo_fields.append('table')
     if action == 'close_window' and not payload.get('native'):
         echo_fields.append('closed')
-    if isinstance(payload.get('observed'), dict) and payload['observed'].get('kind') == 'active_window':
-        echo_fields.extend(('value_before', 'value_after'))
     for field in echo_fields:
         key = payload.get(field)
         if _collection.is_object_key(key):
@@ -167,6 +244,33 @@ def present(payload, action, registry):
             if _collection.is_object_key(key):
                 pairs.setdefault(key, args.get('handle') or registry.get(key))
                 argument_targets[field] = key
+    if action in ('click', 'start_choosing', 'execute_command') and len(pairs) > registry.limit and isinstance(value, dict):
+        # The action has already happened. Losing an optional window ref must not
+        # turn its response into a failed action that the caller might repeat.
+        window_key = value.get('key')
+        if window_key not in echoes.values():
+            pairs.pop(window_key, None)
+            value = {**value, 'key': None, 'reference_status': 'unavailable',
+                     'code': 'ref_limit_exceeded',
+                     'message': 'The window reference exceeds TC1C_REF_LIMIT. Find the window separately.'}
+    # Window observations are optional readback of an already attempted action.
+    # Keep the target usable; prefer the current window when only one more ref fits.
+    missing_window_refs = []
+    if isinstance(payload.get('observed'), dict) and payload['observed'].get('kind') == 'active_window':
+        for field in ('value_after', 'value_before'):
+            key = payload.get(field)
+            if not _collection.is_object_key(key):
+                continue
+            if key in pairs or len(pairs) < registry.limit:
+                pairs.setdefault(key, registry.get(key))
+                echoes[field] = key
+            else:
+                missing_window_refs.append(field)
+    # Optional diagnostics must not turn an already attempted mutation into ref_limit_exceeded.
+    for envelope in envelopes:
+        for obj in _failure_objects(envelope.get('failure_context', {})):
+            if obj['key'] in pairs or len(pairs) < registry.limit:
+                pairs[obj['key']] = obj.get('handle') or registry.get(obj['key'])
     refs = registry.publish(pairs)
     def node(obj):
         if not isinstance(obj, dict) or obj.get('key') not in refs:
@@ -185,8 +289,26 @@ def present(payload, action, registry):
     if action == 'set_row_values' and 'results' in payload:
         out['results'] = [{**v, 'page': node(v['page'])} if isinstance(v, dict) and 'page' in v else v
                           for v in payload['results']]
+    if extra_pages or any('failure_context' in v for v in envelopes):
+        import copy
+        out = copy.deepcopy(out)
+    for envelope in _envelopes(out, action):
+        if isinstance(envelope.get('page'), dict):
+            envelope['page'] = node(envelope['page'])
+        for obj in _failure_objects(envelope.get('failure_context', {})):
+            key = obj.pop('key')
+            obj.pop('handle', None)
+            obj['ref'] = refs.get(key)
+            if obj['ref'] is None:
+                obj['reference_status'] = 'unavailable'
     for field, key in echoes.items():
         out[field] = refs[key]
+    if missing_window_refs:
+        for field in missing_window_refs:
+            out[field] = None
+        out['observed'] = {**payload['observed'], 'reference_status': 'unavailable',
+                           'code': 'ref_limit_exceeded', 'missing_refs': missing_window_refs,
+                           'message': 'Window references exceed TC1C_REF_LIMIT. Find the window separately.'}
     if argument_targets:
         converted = dict(args)
         for field, key in argument_targets.items():
