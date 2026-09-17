@@ -59,7 +59,7 @@ def failure(S, c, key, handle, result):
         c._track = None
         c._failure_diagnostic_busy = True
         target = obj(key)
-        if not target or (handle and target.get('handle') != handle):
+        if not target or (handle and (target.get('handle') or '').lower() != handle.lower()):
             out.update(complete=False, code='target_unavailable')
             return dict(result, failure_context=out)
         out['target'] = flags(target)

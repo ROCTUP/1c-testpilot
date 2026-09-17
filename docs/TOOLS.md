@@ -61,7 +61,8 @@
 | `choose_row` | `ТестируемаяТаблицаФормы` · `Choose` | `ТестируемаяТаблицаФормы` | `ref*` |
 | `collapse` | `ТестируемаяТаблицаФормы` · Свернуть (`Collapse`) | `ТестируемаяГруппаФормы`, `ТестируемаяТаблицаФормы` | `ref*, row_column=None, row_value=None` |
 | `copy_row` | `ТестируемаяТаблицаФормы` · СкопироватьСтроку (`CopyRow`) | `ТестируемаяТаблицаФормы` | `ref*, confirm=None` |
-| `delete_row` | `ТестируемаяТаблицаФормы` · УдалитьСтроку (`DeleteRow`) | `ТестируемаяТаблицаФормы` | `ref*, confirm=None` |
+| `delete_row` | Устаревший вариант `delete_rows(scope="current")` | `ТестируемаяТаблицаФормы` | `ref*, confirm=None` |
+| `delete_rows` | `ТестируемаяТаблицаФормы` · УдалитьСтроку (`DeleteRow`), ПереключитьПометкуУдаленияСтроки (`SwitchRowDeleteMark`); для выделенных — штатная команда контекстного меню | `ТестируемаяТаблицаФормы` | `ref*, confirm=None, scope='current', unmark=False` |
 | `deselect_all_rows` | `ТестируемаяТаблицаФормы` · `DeselectAllRows` | `ТестируемаяТаблицаФормы` | `ref*` |
 | `deselect_row` | `ТестируемаяТаблицаФормы` · `DeselectRow` | `ТестируемаяТаблицаФормы` | `ref*` |
 | `end_edit_row` | `ТестируемаяТаблицаФормы` · ЗакончитьРедактированиеСтроки (`EndEditRow`) | `ТестируемаяТаблицаФормы` | `ref*, cancel=False` |
@@ -183,7 +184,7 @@
 | `connect` | `ТестируемоеПриложение` · УстановитьСоединение (`Connect`) | `ТестируемоеПриложение` | `port=None, host='127.0.0.1', version=None, profile=None` |
 | `disconnect` | `ТестируемоеПриложение` · РазорватьСоединение (`Disconnect`) | `ТестируемоеПриложение` | `—` |
 | `get_logging_status` | Состояние журнала MCP-вызовов | — | `—` |
-| `launch_client` | — | — | `base=None, port=None, server=False, user=None, password=None, version=None, exe=None, extra_args=None, wait=30, connect=True, desktop='default', profile=None` |
+| `launch_client` | — | — | `base=None, port=None, server=False, user=None, password=None, version=None, exe=None, extra_args=None, wait=60, connect=True, desktop='default', profile=None` |
 | `list_connections` | — | — | `—` |
 | `list_profiles` | — | — | `—` |
 | `start_logging` | Начать журнал MCP-вызовов | — | `screenshot_mode=None` |

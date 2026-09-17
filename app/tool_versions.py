@@ -36,6 +36,7 @@ TOOL_MIN_VERSION = {
     'tc_current_opened':                     '8.3.16',
     'tc_decrease_value':                     '8.3.1',
     'tc_delete_row':                         '8.3.3',
+    'tc_delete_rows':                        '8.3.3',
     'tc_delete_view_status_item':            '8.3.16',
     'tc_deselect_all_rows':                  '8.5.1',
     'tc_deselect_row':                       '8.5.1',

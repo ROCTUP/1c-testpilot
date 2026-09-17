@@ -2,7 +2,7 @@
 """Декодер коллекций/объектов тест-протокола 1С.
 Каждый объект в потоке кодируется как <handle GUID 16б><ключ-строка>.
 Ключ адресует объект логически, handle — живой дескриптор для команд НА объекте."""
-import re, struct, uuid
+import re, uuid
 
 # Ключ проверяется ЦЕЛИКОМ (до конца строки), а не по префиксу: иначе ложный тег строки,
 # случайно попавший перед настоящим, даёт «ключ» вида fSecondaryFrame[...]<мусор>, сканер
@@ -22,31 +22,37 @@ def is_object_key(s):
     return isinstance(s, str) and bool(_KEY_RE.match(s))
 
 
+def _string_layout(raw, i):
+    """String header, total size and encoding; lengths use 1, 2 or 8 bytes."""
+    if i >= len(raw) or raw[i] & 0xf0 not in (0x90, 0xb0, 0xd0, 0xf0):
+        return None
+    low = raw[i] & 15
+    width = {7: 1, 8: 2, 9: 8, 10: 1, 11: 2, 12: 8}.get(low)
+    if width is None or i + 1 + width > len(raw):
+        return None
+    count = int.from_bytes(raw[i + 1:i + 1 + width], 'little')
+    return 1 + width, 1 + width + count * (2 if low < 10 else 1), ('utf-16le' if low < 10 else 'latin1')
+
+
 def _scan_strings(raw):
     """Позиции строк-ключей: список (pos_tag, key, handle_le_или_None).
     Понимает и ДЛИННЫЕ формы строк (len16: _b ASCII / _8 UTF-16) — длинные ключи реально
     приходят от 1С у глубоко вложенных элементов (контекстные меню таблиц)."""
     out = []; i = 0; n = len(raw); caption_at = None
     while i < n - 1:
-        t = raw[i]; ln = raw[i+1]; s = None; adv = 1
-        ln16 = struct.unpack_from('<H', raw, i+1)[0] if i+3 <= n else 0
-        if t in (0x9a, 0xba, 0xda, 0xfa) and i+2+ln <= n:
-            try: s = raw[i+2:i+2+ln].decode('latin1'); adv = 2+ln
-            except Exception: s = None
-        elif t in (0x97, 0xb7, 0xd7, 0xf7) and i+2+ln*2 <= n:
-            try: s = raw[i+2:i+2+ln*2].decode('utf-16le'); adv = 2+ln*2
-            except Exception: s = None
-        elif t in (0x9b, 0xbb, 0xdb, 0xfb) and i+3+ln16 <= n:
-            try: s = raw[i+3:i+3+ln16].decode('latin1'); adv = 3+ln16
-            except Exception: s = None
-        elif t in (0x98, 0xb8, 0xd8, 0xf8) and i+3+ln16*2 <= n:
-            try: s = raw[i+3:i+3+ln16*2].decode('utf-16le'); adv = 3+ln16*2
-            except Exception: s = None
+        s, adv = None, 1
+        layout = _string_layout(raw, i)
+        if layout and i + layout[1] <= n:
+            header, adv, encoding = layout
+            try: s = raw[i+header:i+adv].decode(encoding)
+            except UnicodeDecodeError: pass
+        # At the known caption slot, the whole string is data. Its UTF-16 bytes
+        # can contain another apparent string tag followed by an object address.
+        if s is not None and i == caption_at:
+            i += adv
+            caption_at = None
+            continue
         if s is not None and _KEY_RE.match(s):
-            # A caption may itself look exactly like an object address.
-            if i == caption_at:
-                i += adv
-                continue
             handle = raw[i-16:i] if i >= 16 else None       # 16 байт перед тегом
             out.append((i, s, handle)); i += adv
             caption_at = i + (1 if i < n and raw[i] in (0x81, 0x82) else 0)
@@ -145,10 +151,7 @@ def _record_bounds(raw, spans, idx):
     pos, key = spans[idx][0], spans[idx][1]
     # Конец ключа зависит от ТЕГА: байт на символ у ASCII (_a/_b) против двух у UTF-16 (_7/_8),
     # плюс длина занимает 1 или 2 байта. Иначе заголовок ищется мимо и теряется.
-    low = raw[pos] & 0x0f
-    header = 2 if low in (0x0a, 0x07) else 3
-    length = int.from_bytes(raw[pos+1:pos+header], 'little')
-    ke = pos + header + length * (1 if low in (0x0a, 0x0b) else 2)
+    ke = pos + _string_layout(raw, pos)[1]
     # Запись устроена как <handle 16 байт><строка-ключа>, а _scan_strings отдаёт позицию тега
     # ключа, а не начало записи. Без вычета длины handle разбор заглядывает в двоичный GUID
     # соседа: там может встретиться завершитель, и объект получит чужой вид — тихо и правдоподобно
@@ -242,10 +245,10 @@ def _key_name_class(key):
 def _read_string(raw, i, end):
     """One complete string at its declared position, bounded by its object record."""
     end = min(end, len(raw))
-    if i >= end or raw[i] not in (0xf7, 0xf8, 0xfa, 0xfb):
+    if i >= end or raw[i] not in (0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc):
         return None, i, False
-    ascii_ = raw[i] in (0xfa, 0xfb)
-    header = 3 if raw[i] in (0xf8, 0xfb) else 2
+    ascii_ = raw[i] in (0xfa, 0xfb, 0xfc)
+    header = {7: 2, 8: 3, 9: 9, 10: 2, 11: 3, 12: 9}[raw[i] & 15]
     if i + header > end: return None, i, False
     n = int.from_bytes(raw[i+1:i+header], 'little')
     nxt = i + header + n * (1 if ascii_ else 2)
@@ -299,12 +302,12 @@ def _navigation_string(raw, i, end, empty_tags):
     if raw[i] in empty_tags:
         return '', i + 1
     tag = raw[i]
-    if tag not in (0x97, 0x98, 0x9a, 0x9b, 0xf7, 0xf8, 0xfa, 0xfb):
+    if tag not in (0x97, 0x98, 0x99, 0x9a, 0x9b, 0x9c, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc):
         return None, i
-    header = 3 if tag & 15 in (8, 11) else 2
+    header = {7: 2, 8: 3, 9: 9, 10: 2, 11: 3, 12: 9}[tag & 15]
     if i + header > end:
         return None, i
-    wide = tag & 15 in (7, 8)
+    wide = tag & 15 in (7, 8, 9)
     size = int.from_bytes(raw[i+1:i+header], 'little')
     stop = i + header + size * (2 if wide else 1)
     if stop > end:

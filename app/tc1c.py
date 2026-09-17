@@ -9,7 +9,7 @@ if os.name == 'nt':
     import sspi, sspicon, win32security
 else:
     sspi = sspicon = win32security = None
-from _collection import decode_collection, object_handles
+from _collection import decode_collection, object_handles, _string_layout
 
 TR = bytes.fromhex('6653b2a6')
 _WIRE_ESCAPE = bytes.fromhex('6552b1a5')
@@ -50,12 +50,8 @@ def value_size(b, i=0):
     if t == 0x8d: return 3
     if t == 0x8f: return 5
     if t == 0xf1: return 9
-    low = t & 0x0f
-    if t >= 0x90 and low == 0x0a: return 2 + b[i+1]
-    if t >= 0x90 and low == 0x07: return 2 + 2 * b[i+1]
-    if t >= 0x90 and low == 0x0b: return 3 + int.from_bytes(b[i+1:i+3], 'little')
-    if t >= 0x90 and low == 0x08: return 3 + 2 * int.from_bytes(b[i+1:i+3], 'little')
-    return 0
+    layout = _string_layout(b, i)
+    return layout[1] if layout else 0
 
 def _plausible_str(s):
     """Правдоподобная строка 1С: почти нет символов CJK-диапазона (>=0x2000). Много таких =
@@ -68,7 +64,11 @@ def decode_stream(b, start=0):
     i=start; out=[]
     while i < len(b):
         t=b[i]
-        if t>=0x90 and (t&0x0f)==0x0a and i+1<len(b):      # ASCII1: 9a/ba/da/fa (len8)
+        if t & 15 in (9, 12) and (layout := _string_layout(b, i)) and i + layout[1] <= len(b):
+            prefix, size, encoding = layout
+            out.append(('ustr' if encoding == 'utf-16le' else 'str', b[i+prefix:i+size].decode(encoding, 'replace')))
+            i += size
+        elif t>=0x90 and (t&0x0f)==0x0a and i+1<len(b):      # ASCII1: 9a/ba/da/fa (len8)
             n=b[i+1]; out.append(('str', b[i+2:i+2+n].decode('latin1','replace'))); i+=2+n
         elif t>=0x90 and (t&0x0f)==0x0b and i+2<len(b):     # ASCII2: 9b/bb/db/fb (len16 LE)
             n=struct.unpack_from('<H',b,i+1)[0]; out.append(('str', b[i+3:i+3+n].decode('latin1','replace'))); i+=3+n
@@ -222,10 +222,10 @@ def mk_goto_value(value):
 def mk_choice_index(index):
     """Аргумент ВыполнитьВыборИзСписка/ИзМеню (модальный диалог на ТестируемойФорме):
     e0 4b 4e + один байт (0x81 + индекс). Индекс 0 -> 0x81, 1 -> 0x82, ...
-    Начиная с 127 малый байт переполняется — тогда число явным int (8b/8d/8f), как в
+    Начиная с 10 число кодируется явным int (8b/8d/8f), как в
     ПерейтиКЗначению (тот же маркер e0 4b 4e)."""
     i = int(index)
-    return b'\xe0\x4b\x4e' + (bytes([0x81 + i]) if 0 <= i <= 126 else enc_int(i))
+    return b'\xe0\x4b\x4e' + (bytes([0x81 + i]) if 0 <= i <= 9 else enc_int(i))
 
 # Типы значений в аргументе «Вложения» ВвестиHTMLДокумента (GUID типов платформы).
 _STRUCT_TYPE  = uuid.UUID('4238019d-7e49-4fc9-91db-b6b951d5cf8e').bytes_le
@@ -233,10 +233,11 @@ _PICTURE_TYPE = uuid.UUID('87126200-3e98-44e0-b931-ccb1d7edc497').bytes_le
 HTML_ATT_PAD = 9        # хвостовых 0x20 у кадра ВвестиHTMLДокумента со вложениями
 
 def _enc_bytes(hi, b):
-    """Двоичное значение в контейнере строки семейства hi: _a + len8 / _b + len16 LE."""
+    """Binary string: _a + u8 / _b + u16 / _c + u64 length."""
     if len(b) < 256:
         return bytes([hi | 0x0a, len(b)]) + b
-    return bytes([hi | 0x0b]) + len(b).to_bytes(2, 'little') + b
+    width, low = (2, 11) if len(b) <= 65535 else (8, 12)
+    return bytes([hi | low]) + len(b).to_bytes(width, 'little') + b
 
 def mk_attachments(attachments):
     """Аргумент «Вложения» (Структура {имя: Картинка}):
@@ -270,20 +271,26 @@ def dec_attachments(middle):
         q = middle.find(mark, i)
         if q < 0:
             break
-        j = q + 2
-        tag = middle[j]; ln = middle[j + 1]
-        name = middle[j + 2:j + 2 + ln].decode('latin1', 'replace') if (tag & 0x0f) == 0x0a \
-            else middle[j + 2:j + 2 + ln * 2].decode('utf-16le', 'replace')
-        j += value_size(middle, j)
-        v = middle.find(b'\xc2\xc1', j)
-        if v < 0:
+        size, name = _text_at(middle, q + 2, compact=False)
+        if not size:
             break
-        t = middle[v + 2]
-        if (t & 0x0f) == 0x0a:
-            n = middle[v + 3]; data = middle[v + 4:v + 4 + n]; i = v + 4 + n
-        else:
-            n = int.from_bytes(middle[v + 3:v + 5], 'little'); data = middle[v + 5:v + 5 + n]; i = v + 5 + n
-        out[name] = data
+        j = q + 2 + size
+        picture = b'\xeb\x23\x95' + _PICTURE_TYPE + b'\xc2\xc1'
+        if not middle.startswith(picture, j):
+            break
+        i = j + len(picture)
+        chunks = []
+        # 1C returns large pictures as adjacent 9b strings, usually 16 KiB each.
+        # Consume whole payloads: marker-like bytes inside an image are not structure.
+        while i < len(middle) and middle[i] in (0x9a, 0x9b, 0x9c):
+            layout = _string_layout(middle, i)
+            if layout is None or i + layout[1] > len(middle):
+                return out
+            prefix, size, _ = layout
+            chunks.append(middle[i + prefix:i + size])
+            i += size
+        if chunks:
+            out[name] = b''.join(chunks)
     return out
 
 def mk_date(year, month, day):
@@ -312,7 +319,7 @@ def mk_cell(column):
     if isinstance(column, bool):
         raise TypeError('column: expected an element name or an index, got a boolean')
     if isinstance(column, int):
-        return b'\xe0\x4b\x55\xeb\x4e' + (bytes([0x81 + column]) if 0 <= column <= 126
+        return b'\xe0\x4b\x55\xeb\x4e' + (bytes([0x81 + column]) if 0 <= column <= 9
                                           else enc_int(column))
     return b'\xe0\x4b\x55\xeb\x53' + _enc_like(0x90, column)
 
@@ -405,7 +412,7 @@ def _reply_status_offset(raw, method_guid=None):
     if raw[p:p+1] != b'\xd5':
         return None
     p += 17
-    if raw[p:p+1] not in (b'\x81', b'\x97', b'\x98', b'\x9a', b'\x9b'):
+    if raw[p:p+1] not in (b'\x81', b'\x97', b'\x98', b'\x99', b'\x9a', b'\x9b', b'\x9c'):
         return None
     if p + 3 > len(raw) - len(TR):
         return None
@@ -529,18 +536,8 @@ def decode_choice_items(strings):
                 return '', pos + 1
             if tag == 0x8b:
                 return (chr(raw[pos + 1]), pos + 2) if pos + 1 < len(raw) else None
-            if tag not in (0x97, 0x98, 0x9a, 0x9b):
-                return None
-            header = 3 if tag in (0x98, 0x9b) else 2
-            if pos + header > len(raw):
-                return None
-            size = value_size(raw, pos)
-            if pos + size > len(raw):
-                return None
-            try:
-                return raw[pos + header:pos + size].decode('utf-16le' if tag in (0x97, 0x98) else 'latin1'), pos + size
-            except UnicodeDecodeError:
-                return None
+            size, text = _text_at(raw, pos, compact=False)
+            return (text, pos + size) if size else None
         while (pos := raw.find(first, start)) >= 0:
             presentation = value(pos + len(first))
             if presentation is None:
@@ -844,20 +841,7 @@ def extract_object_keys(raw):
     (ASCII 9b/bb/db/fb, UTF-16 98/b8/d8/f8) — длинные ключи приходят у вложенных элементов."""
     keys=[]; i=0; n=len(raw)
     while i < n-1:
-        t=raw[i]; ln=raw[i+1]; s=None; adv=1
-        ln16=struct.unpack_from('<H', raw, i+1)[0] if i+3<=n else 0
-        if t in (0x9a,0xba,0xda,0xfa) and i+2+ln<=n:
-            try: s=raw[i+2:i+2+ln].decode('latin1'); adv=2+ln
-            except Exception: s=None
-        elif t in (0x97,0xb7,0xd7,0xf7) and i+2+ln*2<=n:
-            try: s=raw[i+2:i+2+ln*2].decode('utf-16le'); adv=2+ln*2
-            except Exception: s=None
-        elif t in (0x9b,0xbb,0xdb,0xfb) and i+3+ln16<=n:
-            try: s=raw[i+3:i+3+ln16].decode('latin1'); adv=3+ln16
-            except Exception: s=None
-        elif t in (0x98,0xb8,0xd8,0xf8) and i+3+ln16*2<=n:
-            try: s=raw[i+3:i+3+ln16*2].decode('utf-16le'); adv=3+ln16*2
-            except Exception: s=None
+        adv, s = _text_at(raw, i, compact=False)
         # доверяем длине тега только если это валидный ключ; иначе тег ложный -> +1
         if s is not None and _KEY_RE.match(s):
             if s not in keys: keys.append(s)
@@ -890,37 +874,27 @@ def replace_ascii_str(frame, old, new):
 
 
 def extract_uilog(raw):
-    """Извлечь uilog XML из ответа (строка длинная, 2-байтовая длина -> берём по границам)."""
-    for enc in ('utf-16le','utf-8'):
-        u=raw.decode(enc,'ignore')
-        i=u.find('<?xml'); j=u.rfind('</uilog>')
-        if i>=0 and j>i: return u[i:j+len('</uilog>')]
-        i=u.find('<uilog'); j=u.rfind('</uilog>')
-        if i>=0 and j>i: return u[i:j+len('</uilog>')]
-    return None
+    """Read the length-delimited XML after the UILog Finish result, independent of alignment."""
+    import xml.etree.ElementTree as ET
+    p = _reply_status_offset(raw)
+    if p is None or not raw.startswith(b'\x81\x81\x81\xe5', p):
+        return None
+    p += 4
+    size, text = _text_at(raw, p, compact=False)
+    if not size or raw[p + size:] != b'\x20\xa1\xa3' + TR:
+        return None
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return None
+    return text if root.tag.rsplit('}', 1)[-1] == 'uilog' else None
 
 def extract_strings(raw, min_len=1):
     """Все строки-значения из кадра. Сканируем КАЖДУЮ позицию (+1), чтобы ложный
     тег перед значением не «съедал» реальную строку. Возможны наложения/дубли."""
     out=[]; i=0; n=len(raw)
     while i<n-1:
-        tg=raw[i]; ln=raw[i+1]; s=None
-        if tg in (0x9a,0xba,0xda,0xfa) and i+2+ln<=n:
-            try: s=raw[i+2:i+2+ln].decode('latin1')
-            except Exception: s=None
-        elif tg in (0x97,0xb7,0xd7,0xf7) and i+2+ln*2<=n:
-            try: s=raw[i+2:i+2+ln*2].decode('utf-16le')
-            except Exception: s=None
-        elif tg in (0x9b,0xbb,0xdb,0xfb) and i+3<=n:   # длинная ASCII (len16 LE)
-            L=struct.unpack_from('<H',raw,i+1)[0]
-            if i+3+L<=n:
-                try: s=raw[i+3:i+3+L].decode('latin1')
-                except Exception: s=None
-        elif tg in (0x98,0xb8,0xd8,0xf8) and i+3<=n:   # длинная UTF-16 (len16 LE)
-            L=struct.unpack_from('<H',raw,i+1)[0]
-            if i+3+L*2<=n:
-                try: s=raw[i+3:i+3+L*2].decode('utf-16le')
-                except Exception: s=None
+        _, s = _text_at(raw, i, compact=False)
         # \t \n \r — законные символы данных: HTML-документ, многострочный текст поля,
         # записанный uilog. Их запрет выбрасывал ВЕСЬ документ, а не лишний символ.
         if s and len(s)>=min_len and all(ch in '\t\n\r' or ord(ch)>=0x20 for ch in s):
@@ -975,17 +949,14 @@ def _text_at(raw, i, *, compact=True):
     tag = raw[i]
     if compact and tag == 0x8b and i + 2 <= len(raw):
         return 2, chr(raw[i + 1])
-    if tag not in (0x9a, 0xba, 0xda, 0xfa, 0x97, 0xb7, 0xd7, 0xf7,
-                   0x9b, 0xbb, 0xdb, 0xfb, 0x98, 0xb8, 0xd8, 0xf8):
+    layout = _string_layout(raw, i)
+    if layout is None:
         return 0, None
-    prefix = 3 if tag & 15 in (11, 8) else 2
-    if i + prefix > len(raw):
-        return 0, None
-    size = value_size(raw, i)
+    prefix, size, encoding = layout
     if i + size > len(raw):
         return 0, None
     try:
-        value = raw[i + prefix:i + size].decode('utf-16le' if tag & 15 in (7, 8) else 'latin1')
+        value = raw[i + prefix:i + size].decode(encoding)
     except UnicodeDecodeError:
         return 0, None
     return size, value
@@ -1111,17 +1082,10 @@ def decode_area_text(raw, area):
         tag = raw[p]
         if tag == 0x8b and p + 2 == end:
             return chr(raw[p + 1])
-        if tag not in (0x9a, 0xba, 0xda, 0xfa, 0x97, 0xb7, 0xd7, 0xf7,
-                       0x9b, 0xbb, 0xdb, 0xfb, 0x98, 0xb8, 0xd8, 0xf8):
-            continue
-        prefix = 3 if tag & 0x0f in (0x0b, 0x08) else 2
-        if p + prefix > end or p + value_size(raw, p) != end:
-            continue
-        encoding = 'utf-16le' if tag & 0x0f in (0x07, 0x08) else 'latin1'
-        try:
-            return raw[p + prefix:end].decode(encoding)
-        except UnicodeDecodeError:
-            continue
+        size, value = _text_at(raw, p)
+        if size and p + size == end:
+            return value
+
 
 
 def decode_rows(raw):
@@ -1246,19 +1210,17 @@ def replace_str(frame, old, new):
 
 def _enc_like(tag, new):
     """Закодировать new с тем же старшим ниблом тега. Тип по содержимому:
-    ASCII (низкий ниббл a<256 / b>=256, длина 1/2 байта LE), иначе UTF-16 (7<256 / 8>=256)."""
+    ASCII (_a/_b/_c), иначе UTF-16 (_7/_8/_9); длина занимает 1, 2 или 8 байт LE."""
     hi = tag & 0xf0
     try:
-        nb = new.encode('latin1')
-        if len(nb) < 256:
-            return bytes([hi | 0x0a, len(nb)]) + nb
-        return bytes([hi | 0x0b]) + len(nb).to_bytes(2, 'little') + nb   # длинная ASCII
+        return _enc_bytes(hi, new.encode('latin1'))
     except UnicodeEncodeError:
         nb = new.encode('utf-16le')
         n = len(nb) // 2            # длина В КОДОВЫХ ЕДИНИЦАХ UTF-16: у символов вне BMP
         if n < 256:                 # их две на символ, и len(строки) дал бы вдвое меньше
             return bytes([hi | 0x07, n]) + nb
-        return bytes([hi | 0x08]) + n.to_bytes(2, 'little') + nb        # длинная UTF-16
+        width, low = (2, 8) if n <= 65535 else (8, 9)
+        return bytes([hi | low]) + n.to_bytes(width, 'little') + nb
 
 _FIXBLK = bytes.fromhex('81848381cb5381a3cb2395')
 
@@ -1320,7 +1282,7 @@ def _binary_frame_end(raw, start=1):
             elif low == 1:               # date
                 size = 9
             elif low in (7, 8, 9, 10, 11, 12):
-                width = {7: 1, 8: 2, 9: 4, 10: 1, 11: 2, 12: 4}[low]
+                width = {7: 1, 8: 2, 9: 8, 10: 1, 11: 2, 12: 8}[low]
                 if i + 1 + width > len(raw):
                     return None, i
                 count = int.from_bytes(raw[i + 1:i + 1 + width], 'little')
@@ -1459,6 +1421,20 @@ class TestClient:
         m=re.search(TOK_GUID+rb',\s*\{([A-Za-z0-9+/=]*)\}', fr)
         return base64.b64decode(m.group(1)) if (m and m.group(1)) else b''
 
+    def _check_handshake_reply(self, frame, stage):
+        """SCOM error envelopes are not NTLM tokens, on any handshake stage."""
+        body = frame[:-len(TR)] if frame.endswith(TR) else frame
+        text = body.decode('utf-8-sig', 'replace')
+        if re.match(r'^\{2,[0-9a-fA-F-]{36},', text):
+            messages = re.findall(r'"((?:[^"]|"")*)"', text)
+            message = next((s.replace('""', '"') for s in messages if s), 'The test client rejected the handshake.')
+            self.close()
+            raise RuntimeError('%s handshake failed: %s' % (stage, message))
+        return frame
+
+    def _handshake_reply(self, stage):
+        return self._check_handshake_reply(self._recv(self.CONNECT_TIMEOUT), stage)
+
     # версия платформы по умолчанию для intro-тикета; переопределяется через self.platform_version
     DEFAULT_VER = '8.3.27.1859'
 
@@ -1521,6 +1497,7 @@ class TestClient:
                 if ack == NETWORK_GREETING + TR:
                     num[0] = 22548
                     ack = self._network_intro(_scom(intro_ticket(user, pc)))
+                self._check_handshake_reply(ack, 'intro')
                 if TR in ack and len(ack)>100: break
                 self.close()
             except OSError:
@@ -1536,9 +1513,9 @@ class TestClient:
             if sspi is None:
                 try:
                     self._handshake_send(_scom(_anonymous_ntlm_negotiate()))
-                    challenge = self._get_tok(self._recv(self.CONNECT_TIMEOUT))
+                    challenge = self._get_tok(self._handshake_reply('authentication'))
                     self._handshake_send(_scom(_anonymous_ntlm_authenticate(challenge)))
-                    auth = self._recv(self.CONNECT_TIMEOUT)
+                    auth = self._handshake_reply('authentication')
                 except Exception:
                     self.close()
                     raise
@@ -1547,7 +1524,7 @@ class TestClient:
                                sspicon.ISC_REQ_REPLAY_DETECT|sspicon.ISC_REQ_SEQUENCE_DETECT)
                 ib=None
                 for _ in range(3):
-                    err,out=ca.authorize(ib); self._handshake_send(_scom(out[0].Buffer)); auth=self._recv(self.CONNECT_TIMEOUT)
+                    err,out=ca.authorize(ib); self._handshake_send(_scom(out[0].Buffer)); auth=self._handshake_reply('authentication')
                     if err==0: break
                     ch=self._get_tok(auth); sb=win32security.PySecBufferDescType()
                     bb=win32security.PySecBufferType(len(ch),sspicon.SECBUFFER_TOKEN); bb.Buffer=ch; sb.append(bb); ib=sb
@@ -1559,7 +1536,7 @@ class TestClient:
                                   'The test client did not grant a session after authentication.')
         self.sess=session.group(1).decode()
         # установка сессии (программный кадр)
-        self._handshake_send(build_session_frame(self.sess, num[0])); self._recv(self.CONNECT_TIMEOUT)
+        self._handshake_send(build_session_frame(self.sess, num[0])); self._handshake_reply('session')
         if self._direct_session:self._counter = num[0]
         return self.sess
 
@@ -1569,7 +1546,7 @@ class TestClient:
             try:
                 for frame in _intro_attach_frames(self.sess, self._counter + 1):
                     self._handshake_send(frame)
-                    reply = self._recv()
+                    reply = self._check_handshake_reply(self._recv(), 'attach')
                     if not reply.startswith(b'\xef\xbb\xbf{1,') or not reply.endswith(b'},0},2' + TR):
                         raise ConnectionError('The test client rejected session initialization.')
                     self._counter += 1
@@ -1578,7 +1555,7 @@ class TestClient:
             except Exception:
                 self.close()
                 raise
-        self._handshake_send(build_attach(self.sess)); return self._recv()
+        self._handshake_send(build_attach(self.sess)); return self._check_handshake_reply(self._recv(), 'attach')
 
     def send_cmd(self, method_guid, key, kind='read', middle=b'', handle=None, per_call=None, pad=None,
                  timeout=0):

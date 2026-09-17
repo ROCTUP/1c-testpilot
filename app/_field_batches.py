@@ -1,10 +1,12 @@
 """Bounded field operations. Protocol primitives and connection ownership stay in server."""
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, StrictBool
 
 LIMIT = 100
+_ROW_COLUMNS = ContextVar('testpilot_row_columns', default=None)
 FIELD_ACTIONS = {'read_fields': 'targets', 'set_fields': 'entries'}
 PROPERTIES = ('text', 'presentation', 'edit_text', 'visible', 'enabled', 'readonly')
 SCALAR_KINDS = {'InputField', 'CheckBoxField', 'RadioButtonField', 'LabelField',
@@ -291,7 +293,8 @@ def ensure_pending(S, c, allowed):
         if form_key and active_window == S._collection_parent(form_key):
             form = S._ref_live_object(c, form_key)
             current = S._input_current(c, form) if form else None
-            if current and current != pending:
+            # '' confirms no current element; None means the read was inconclusive.
+            if current is not None and current != pending:
                 c._pending_text_input = None
                 return
         # Absence from a successfully read collection establishes closure. A failed
@@ -507,7 +510,14 @@ def add_rows(S, key, handle, rows):
                 if mode is not False:
                     raise Failure('row_edit_pending' if mode is True else 'edit_state_unavailable',
                                   'Finish or cancel the current row edit before adding rows.')
-                row_objects(S, c, key, cells)
+                try:
+                    row_objects(S, c, key, cells, columns)
+                except Failure as exc:
+                    if exc.code not in ('ref_unavailable', 'invalid_column'):
+                        raise
+                    # Finishing the previous row may rebuild its columns too.
+                    columns = S._table_columns(c, key)
+                    row_objects(S, c, key, cells, columns)
             current.update(status='adding', added=None)
             require_result(S.tc_table_add_row(key, handle))
             with observations(c):
@@ -518,7 +528,15 @@ def add_rows(S, key, handle, rows):
             current.update(status='filling', added=True)
             out['added'] += 1
             # Each fill owns its native recording fragment; AddRow is recorded normally.
-            result = S.tc_set_row_values(key, handle, cells)
+            # Refresh after AddRow, which can rebuild dynamic columns. Reuse only for
+            # this nested call, retaining its public recording/diagnostic wrappers.
+            with observations(c):
+                columns = S._table_columns(c, key)
+            token = _ROW_COLUMNS.set((c, key, columns))
+            try:
+                result = S.tc_set_row_values(key, handle, cells)
+            finally:
+                _ROW_COLUMNS.reset(token)
             current['fill'] = result
             require_result(result)
             current['status'] = 'completed'
@@ -549,7 +567,9 @@ def write(S, entries=None, key=None, handle=None, cells=None):
                 if S._key_class(key) != 'Table':
                     raise Failure('invalid_table', 'Address a table.')
                 live(S, c, {'key': key, 'handle': handle})
-                objects = row_objects(S, c, key, cells)
+                cached = _ROW_COLUMNS.get()
+                columns = cached[2] if cached and cached[0] is c and cached[1] == key else None
+                objects = row_objects(S, c, key, cells, columns)
                 form = owner(S, key)
                 ensure_pending(S, c, None)
             else:

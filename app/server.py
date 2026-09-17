@@ -2,6 +2,10 @@
 """MCP-сервер управления тест-клиентом 1С напрямую (без тест-менеджера).
 Инструменты поверх tc1c.TestClient. На Windows для NTLM используется SSPI.
 """
+if __name__ == '__main__':
+    from _cli import configure
+    configure()
+
 import re, os, sys, glob, socket, time, base64, subprocess, inspect, typing, functools, threading, json
 from contextvars import ContextVar
 from mcp.server.fastmcp import FastMCP
@@ -352,7 +356,7 @@ def _scalar_text(r, cmd):
     """Значение-строка из ответа на команду `cmd`. Если обычный разбор ничего не дал, пробуем
     компактную форму «один байт» из хвоста: односимвольное значение приходит именно ею, и без
     этого «в поле один символ» неотличимо от «поле пусто»."""
-    if r.get('ok') and cmd in (G.GET_DISPLAYED_TEXT, G.GET_EDIT_TEXT, G.GET_PROPERTY):
+    if r.get('ok') and cmd in (G.GET_DISPLAYED_TEXT, G.GET_EDIT_TEXT, G.GET_PROPERTY, G.GET_TOOLTIP):
         text = tc1c.decode_field_text(r['raw'], property_value=cmd == G.GET_PROPERTY)
         if text is not None:
             return text
@@ -476,7 +480,7 @@ _VERIFY_ACTIONS = frozenset({
     'goto_date', 'calendar_next_month', 'calendar_previous_month',
     'calendar_next_year', 'calendar_previous_year',
     # таблица: строки, выделение, порядок, иерархия
-    'table_add_row', 'delete_row', 'copy_row', 'change_row', 'end_edit_row', 'choose_row',
+    'table_add_row', 'delete_row', 'delete_rows', 'copy_row', 'change_row', 'end_edit_row', 'choose_row',
     'switch_row_delete_mark', 'set_order', 'expand', 'collapse',
     'go_one_level_down', 'go_one_level_up',
     'select_row', 'deselect_row', 'select_all_rows', 'deselect_all_rows',
@@ -1200,7 +1204,7 @@ def _find_1cv8(want_version=None):
 @_action('tc_session')
 def tc_launch_client(base: str, port: int = None, server: bool = False, user: str = None,
                      password: str = None, version: str = None, exe: str = None,
-                     extra_args: list = None, wait: int = 30, connect: bool = True,
+                     extra_args: list = None, wait: int = 60, connect: bool = True,
                      desktop: typing.Literal['default', 'isolated'] = 'default') -> dict:
     """Launch a 1C test client and wait until it accepts connections on `port`, then optionally
     connect to it. `base` is a file infobase path (default), or 'server\\infobase' when `server=True`.
@@ -1210,6 +1214,7 @@ def tc_launch_client(base: str, port: int = None, server: bool = False, user: st
     or 1cv8/1cv8c on Linux (else env
     TC1C_PLATFORM_EXE or standard install path). Only the 1C platform executable is launched.
     Omit port to allocate a free local port. Each launch creates a separate connection_id.
+    wait is the startup deadline in seconds (default 60).
     On Linux, default requires DISPLAY/XAUTHORITY for a graphical session; isolated requires Xvfb.
     desktop: default = normal launch; isolated = a separate desktop on Windows 10+ or Linux,
     keeping client windows away from the user's desktop. Isolated clients stop with the server.
@@ -1232,7 +1237,7 @@ def tc_launch_client(base: str, port: int = None, server: bool = False, user: st
     # по одному порту ответ выглядел бы успехом. Заодно не остаётся процесса с модальной ошибкой
     if not server and not os.path.isdir(base):
         return {'ok': False, 'error': 'base: no such infobase directory — %s' % base}
-    if desktop == 'default' and os.name != 'nt' and not os.environ.get('DISPLAY'):
+    if desktop == 'default' and sys.platform == 'linux' and not os.environ.get('DISPLAY'):
         return {'ok': False, 'code': 'graphical_session_unavailable',
                 'error': 'Launch requires a graphical session. Start the MCP server in the desktop session '
                          'or supply its DISPLAY and XAUTHORITY environment variables.'}
@@ -1332,23 +1337,33 @@ def _finish_client_launch(result):
 @_action('tc_session')
 def tc_stop_client() -> dict:
     """Stop the test client started by launch_client in this connection, and disconnect from it.
-    Unsaved changes may be lost. If stopping fails, retain the process so the call can be retried."""
+    Unsaved changes may be lost. Disconnects before stopping; if stopping fails, retains
+    process ownership for retry, but the test-client connection is already closed."""
     pid = _state.get('launched_pid')
     if not pid:
         return {'ok': False, 'error': 'no client was launched through tc_launch_client'}
     proc = _state.get('launched_process')
     isolated = _state.get('_isolated_process')
+    # Validate ownership before disconnecting or signalling anything.
     if isolated is not None:
         if isolated is not proc or proc.pid != pid:
             return {'ok': False, 'pid': pid, 'error': 'The isolated process is no longer owned by this connection.'}
+    elif os.name != 'nt' and (proc is None or proc.pid != pid):
+        return {'ok': False, 'pid': pid, 'error': 'The launched process is no longer owned by this connection.'}
+    port = _state.get('launched_port')
+    cl = _state.get('client')
+    local = str(getattr(cl, 'host', '') or '').lower() in ('127.0.0.1', 'localhost', '::1', '')
+    if cl is not None and port is not None and getattr(cl, 'port', None) == port and local:
+        # Close our socket first: killing 1C first can leave its listening port
+        # in TIME_WAIT and prevent an immediate launch on POSIX.
+        tc_disconnect()
+    if isolated is not None:
         try:
             isolated.close()
         except (OSError, subprocess.TimeoutExpired) as exc:
             return {'ok': False, 'pid': pid, 'error': 'Could not stop the isolated client: %s' % exc}
         _state.pop('_isolated_process', None)
     elif os.name != 'nt':
-        if proc is None or proc.pid != pid:
-            return {'ok': False, 'pid': pid, 'error': 'The launched process is no longer owned by this connection.'}
         try:
             if proc.poll() is None:
                 import signal
@@ -1367,14 +1382,7 @@ def tc_stop_client() -> dict:
             proc.wait(timeout=10)
     _state['launched_pid'] = None
     _state.pop('launched_process', None)
-    port = _state.pop('launched_port', None)
-    # соединение закрываем, только если оно ведёт к ОСТАНОВЛЕННОМУ клиенту: при
-    # tc_launch_client(connect=False) активным может быть соединение с ДРУГИМ клиентом,
-    # в том числе на удалённом хосте с тем же номером порта — сверяем и хост, и порт
-    cl = _state.get('client')
-    local = str(getattr(cl, 'host', '') or '').lower() in ('127.0.0.1', 'localhost', '::1', '')
-    if cl is not None and port is not None and getattr(cl, 'port', None) == port and local:
-        tc_disconnect()
+    _state.pop('launched_port', None)
     return {'ok': True, 'stopped_pid': pid}
 
 @_action('tc_session')
@@ -1647,17 +1655,24 @@ def tc_input_text(key: str, text: str, handle: str, finish: bool = True) -> dict
     if ok and finish and text and _key_class(key) == 'EditField' and '.Table[' not in key:
         if _kind_of(c, key) == 'InputField':
             result.update(_finish_input_text(c, key, text, handle))
-    if ok and _key_class(key) == 'EditField' and '.Table[' not in key:
+    _remember_text_input(c, key, text, ok, result)
+    return result
+
+
+def _remember_text_input(c, key, text, input_ok, result=None):
+    """Share pending-input bookkeeping between direct input and scenario replay."""
+    # A failed completion does not undo the preceding successful text input.
+    result = result or {}
+    if input_ok and _key_class(key) == 'EditField' and '.Table[' not in key:
         # Only one field can own the input focus; keep this per connection, bounded.
         c._pending_text_input = (key if text and result.get('edit_finished') is not True
                                 and result.get('committed') is not True else None)
-    return result
 
 @_action('tc_doc')
 def tc_input_html(key: str, html: str, handle: str, attachments: dict = None) -> dict:
     """Set HTML/text into a formatted-document field. attachments maps an image name used in
-    the HTML (e.g. <img src="p1.png"> -> "p1") to that image as a base64 string; names must be
-    identifiers (no dots)."""
+    the HTML (e.g. <img src="p1"> -> "p1") to that image as a base64 string; src must
+    exactly match the attachment name. Names must be identifiers (no dots)."""
     c = _need()
     error = _html_target(c, key, write=True)
     if error:
@@ -1809,7 +1824,7 @@ def tc_get_tooltip(key: str, handle: str) -> dict:
     """Read an element's tooltip text (empty → None)."""
     c = _need()
     r = c.send_cmd(G.GET_TOOLTIP, key, kind='read', middle=RS, handle=handle)
-    return {'ok': r['ok'], 'target': key, 'tooltip': _scalar_text(r, G.GET_TOOLTIP)}
+    return {'ok': r['ok'], 'target': key, 'tooltip': _scalar_text(r, G.GET_TOOLTIP) or None}
 
 @_action('tc_doc')
 def tc_get_html(key: str, handle: str) -> dict:
@@ -2278,25 +2293,88 @@ def tc_copy_row(key: str, handle: str, confirm: bool = None) -> dict:
 
 @_action('tc_table')
 def tc_delete_row(key: str, handle: str, confirm: bool = None) -> dict:
-    """Delete the current table row. On 8.3.6+, prepares an empty selection and refuses
-    unfinished row edits; existing selection is preserved during preparation.
-    Set confirm=True/False to answer a deletion dialog
-    (None leaves it open). ok confirms the command; deleted=null means its effect is
-    unverified. Lists may mark records for deletion instead of removing rows."""
+    """Deprecated alias for delete_rows(scope="current"). Use delete_rows for new calls."""
     c = _need()
+    return _delete_rows(c, key, handle, confirm, 'current', action='delete_row')
+
+
+@_action('tc_table')
+def tc_delete_rows(key: str, handle: str, confirm: bool = None,
+                   scope: typing.Literal['current', 'selected'] = 'current', unmark: bool = False) -> dict:
+    """Delete the current row (default), or the selected rows with scope="selected" (8.3.6+).
+    Selected uses the table's standard context-menu Delete or Mark for deletion command,
+    preserving selection.
+    confirm=True/False answers a confirmation; None leaves it open.
+    ok means the command was accepted; deleted=null means the effect was not verified.
+    Lists may mark records instead of removing rows. unmark=True explicitly requests removal of
+    deletion marks (8.3.6+), only for lists with a standard marking command; ordinary tables refuse it."""
+    c = _need()
+    return _delete_rows(c, key, handle, confirm, scope, unmark=unmark)
+
+
+def _delete_rows(c, key, handle, confirm, scope, action='delete_rows', unmark=False):
     mark = None
-    result = {'ok': False, 'target': key, 'action': 'delete_row', 'deleted': None}
+    result = {'ok': False, 'target': key, 'action': action, 'scope': scope, 'deleted': None}
     try:
-        mark = _native_composite_begin(c, 'delete_row')
-        count = _table_prepare_delete(c, key, handle)
+        if scope not in ('current', 'selected'):
+            raise _CellEditFailure('scope must be current or selected.', {'code': 'invalid_scope'})
+        if (scope == 'selected' or unmark) and not _guid_available(c, G.GET_SELECTED_ROWS):
+            raise _CellEditFailure('Selected deletion and removing deletion marks require platform 8.3.6 or newer.',
+                                   {'code': 'unsupported_version'})
+        mark = _native_composite_begin(c, action)
+        selected = _table_prepare_delete(c, key, handle, scope=scope)
+        guid, target, target_handle = G.DELETE_ROW, key, handle
+        if scope == 'selected' or unmark:
+            command, operation = _selected_delete_command(c, key, handle)
+            if unmark and operation != 'mark_for_deletion':
+                raise _CellEditFailure('This table deletes rows and does not support deletion marks. '
+                                       'Omit unmark to delete rows.', {'code': 'unmark_not_supported'})
+            result['operation'] = 'unmark_for_deletion' if unmark else operation
+            if unmark and scope == 'current':
+                guid = G.SWITCH_ROW_DELETE_MARK
+        if scope == 'selected':
+            # Metadata reads must not silently replace the intended selection.
+            actual = _cell_step(tc_get_selected_rows(key, handle), 'Selection could not be checked.')['rows']
+            if not _same_selection(selected, actual):
+                raise _CellEditFailure('Selection changed before deletion. Select the intended rows again.',
+                                       {'code': 'selection_changed'})
+            guid, target, target_handle = G.CLICK, command['key'], command['handle']
+        elif action == 'delete_rows' and _guid_available(c, G.GET_SELECTED_ROWS):
+            _select_delete_current(c, key, handle)
+        track = getattr(c, '_track', None)
+        track_start = len(track) if track is not None else None
         for kind in ('action', 'commit'):
-            _cell_step(c.send_cmd(G.DELETE_ROW, key, kind=kind, middle=b'', handle=handle),
+            _cell_step(c.send_cmd(guid, target, kind=kind, middle=b'', handle=target_handle),
                        'The delete command was refused.')
-        ans = _answer_confirm_dialog(c, confirm, max_wait=2.0)[0] if confirm is not None else None
-        result.update(ok=True, selected_rows=count, dialog_answered=ans,
-                      deletion_status='requested', message='Delete command accepted; its effect has not been verified.')
+        if action == 'delete_rows' and track is not None:
+            # Logical event only: replay resolves the command again and preserves the scope.
+            event = json.dumps({'scope': scope, 'unmark': unmark}).encode('ascii')
+            track[track_start:] = [(_DELETE_SELECTED_STEP, key, event, 'action')]
+        guard = result.get('operation') in ('mark_for_deletion', 'unmark_for_deletion')
+        question_matches = _is_unmark_deletion_question if unmark else _is_mark_deletion_question
+        question = None
+        if guard:
+            ans, question = _answer_confirm_dialog(c, confirm, max_wait=2.0,
+                                                   question_guard=question_matches)
+        else:
+            ans = None
+            if confirm is not None:
+                # Native DeleteRow may also open a marking question in a list.
+                ans, question = _answer_confirm_dialog(c, confirm, max_wait=2.0,
+                    question_guard=lambda q: not _is_unmark_deletion_question(q))
+        result.update(ok=True, dialog_answered=ans, deletion_status='requested',
+                      message='Command accepted; its effect has not been verified.')
+        if question:
+            result['question'] = question
+            if ans is None:
+                result['deletion_status'] = 'confirmation_required'
         if ans and confirm is False:
             result.update(deleted=False, deletion_status='cancelled', message='Deletion was cancelled.')
+        elif confirm is True and ans == 'Нет':
+            result.update(ok=False, deleted=False, deletion_status='cancelled',
+                          code='deletion_confirmation_refused',
+                          message='The confirmation does not match the requested deletion-mark operation. '
+                                  'The question was declined. Inspect operation and question.')
     except Exception as exc:
         details = exc.result() if isinstance(exc, tc1c.OperationError) else getattr(exc, 'details', {})
         result.update(details, ok=False, error=str(exc))
@@ -2304,10 +2382,95 @@ def tc_delete_row(key: str, handle: str, confirm: bool = None) -> dict:
         _state['window_key'] = None
         if mark is not None:
             try:
-                _native_composite_end(c, mark, 'delete_row')
+                _native_composite_end(c, mark, action)
             except Exception as exc:
                 result.update(ok=False, code='recording_incomplete', error=str(exc))
     return result
+
+
+_DELETE_SELECTED_STEP = 'testpilot:delete_selected'  # Recording event, never sent to 1C.
+
+
+def _is_mark_deletion_question(question):
+    # Match the whole observed standard prompt; a phrase inside an object's name is insufficient.
+    return isinstance(question, str) and (question in (
+        'Пометить выделенные элементы на удаление?', 'Mark selected items for deletion?')
+        or re.fullmatch(r'(?:Пометить ".*" на удаление\?|Mark ".*" for deletion\?)', question, re.S) is not None)
+
+
+def _is_unmark_deletion_question(question):
+    return isinstance(question, str) and (question in (
+        'Снять с выделенных элементов пометку на удаление?',
+        'Remove the deletion mark from selected items?')
+        or re.fullmatch(r'(?:Снять с ".*" пометку на удаление\?|Remove the deletion mark from ".*"\?)',
+                        question, re.S) is not None)
+
+
+def _selected_delete_target(key):
+    """Recognize 1C-generated menu names, never a translated or custom button caption."""
+    if not key:
+        return None
+    menu = _collection_parent(key)
+    table = _collection_parent(menu) if menu else None
+    if not table or _key_class(table) != 'Table' or menu != table + '.ContextMenu':
+        return None
+    if _key_class(key) != 'Button':
+        return None
+    prefix = (_collection.object_name(table) or '') + 'КонтекстноеМеню'
+    name = _collection.object_name(key) or ''
+    if not name.startswith(prefix):
+        return None
+    operation = {'Удалить': 'delete', 'УстановитьПометкуУдаления': 'mark_for_deletion'}.get(name[len(prefix):])
+    return (table, operation) if operation else None
+
+
+def _selected_delete_command(c, key, handle):
+    menu_result = _cell_step(tc_get_context_menu(key, handle), 'The table context menu could not be read.')
+    menu = next((o for o in menu_result['menu'] if o.get('key') == key + '.ContextMenu'), None)
+    if menu:
+        reply = _cell_step(_read_children(c, menu['key']), 'The table commands could not be read.')
+        candidates = [o for o in _coll(reply, menu['key'])
+                      if o.get('type') == 'CommandBarButton' and o.get('handle')
+                      and (_selected_delete_target(o.get('key')) or (None,))[0] == key]
+    else:
+        candidates = []
+    if len(candidates) != 1:
+        raise _CellEditFailure('No unambiguous standard Delete or Mark for deletion command is available. '
+                               'Inspect the table context menu and click the intended custom command explicitly.',
+                               {'code': 'delete_command_unavailable'})
+    command = candidates[0]
+    for guid in (G.CURRENT_VISIBLE, G.CURRENT_ENABLE):
+        if _cell_flag(c, guid, command['key'], command['handle']) is not True:
+            raise _CellEditFailure('The standard deletion command is hidden, disabled, or its availability is unknown.',
+                                   {'code': 'delete_command_unavailable'})
+    return command, _selected_delete_target(command['key'])[1]
+
+
+def _same_selection(before, after):
+    # Selection order is unspecified; duplicates must be counted, not discarded.
+    def canonical(rows):
+        return sorted(json.dumps(row, sort_keys=True, ensure_ascii=False) for row in rows)
+    return canonical(before) == canonical(after)
+
+
+def _select_delete_current(c, key, handle):
+    """List commands can affect the entire selection, even when invoked by a native row method."""
+    window = _cell_window(c)
+    if _guid_available(c, G.DESELECT_ALL_ROWS):
+        current = _cell_step(tc_get_current_row(key, handle), 'The current row could not be read.')['row']
+        if not current:
+            raise _CellEditFailure('No current row is available.', {'code': 'no_current_row'})
+        _cell_step(tc_deselect_all_rows(key, handle), 'Selection could not be cleared.')
+        _cell_step(tc_select_row(key, handle), 'The current row could not be selected.')
+    else:
+        # No criterion: use the actual cursor, not potentially non-unique cell values.
+        _cell_step(tc_goto_row(key, handle=handle), 'The current row could not be selected.')
+    selected = _cell_step(tc_get_selected_rows(key, handle), 'Selection could not be checked.')['rows']
+    if len(selected) != 1:
+        raise _CellEditFailure('Selection could not be restricted to the current row.', {'code': 'selection_changed'})
+    if _cell_window(c) != window or _cell_flag(c, G.CURRENT_MODE_IS_EDIT, key, handle) is not False:
+        raise _CellEditFailure('The form or row editing state changed while selecting the current row.',
+                               {'code': 'target_not_interactive'})
 
 
 def _table_activate(c, key, handle, window):
@@ -2359,7 +2522,7 @@ def _table_activate(c, key, handle, window):
         raise _CellEditFailure('Finish or cancel row editing first.', {'code': 'row_edit_pending'})
 
 
-def _table_prepare_delete(c, key, handle):
+def _table_prepare_delete(c, key, handle, scope='current'):
     if _key_class(key) != 'Table':
         raise _CellEditFailure('Deletion requires a table.', {'code': 'invalid_table'})
     if not _guid_available(c, G.GET_SELECTED_ROWS):
@@ -2369,13 +2532,13 @@ def _table_prepare_delete(c, key, handle):
     if _cell_flag(c, G.CURRENT_MODE_IS_EDIT, key, handle) is not False:
         raise _CellEditFailure('Finish or cancel row editing before deletion.', {'code': 'row_edit_pending'})
     before = _cell_step(tc_get_selected_rows(key, handle), 'Selection could not be read.')['rows']
+    if scope == 'selected' and not before:
+        raise _CellEditFailure('No rows are selected. Select the intended rows before deletion.',
+                               {'code': 'no_selected_rows'})
     _table_activate(c, key, handle, window)
     selected = _cell_step(tc_get_selected_rows(key, handle), 'Selection could not be checked.')['rows']
     if before:
-        # Compare as multisets: platform selection order is unspecified, duplicates matter.
-        def canonical(rows):
-            return sorted(json.dumps(row, sort_keys=True, ensure_ascii=False) for row in rows)
-        if canonical(before) != canonical(selected):
+        if not _same_selection(before, selected):
             raise _CellEditFailure('Selection changed while activating the table. Select the intended rows again.',
                                    {'code': 'selection_changed'})
     else:
@@ -2391,7 +2554,7 @@ def _table_prepare_delete(c, key, handle):
             selected = _cell_step(tc_get_selected_rows(key, handle), 'Selection could not be checked.')['rows']
         if len(selected) != 1:
             raise _CellEditFailure('No single current row is available for deletion.', {'code': 'no_current_row'})
-    return len(selected)
+    return selected if scope == 'selected' else len(selected)
 
 @_action('tc_table')
 def tc_table_add_row(key: str, handle: str) -> dict:
@@ -3890,18 +4053,11 @@ def tc_get_max_action_time() -> dict:
 # Собираем сценарий сами из отправленных команд — не полагаясь на клиентский рекордер.
 # Это покрывает и то, что платформа НЕ пишет в нативный журнал (setOrder и пр.).
 def _synth_dec_str(b):
-    """Декод строки, закодированной _enc_like (ta ASCII / t7,t8 UTF-16)."""
+    """Decode a string written by _enc_like, including eight-byte lengths."""
     if not b:
         return ''
-    t = b[0] & 0x0f
-    try:
-        if t == 0x0a: n = b[1]; return b[2:2+n].decode('latin1', 'replace')
-        if t == 0x0b: n = int.from_bytes(b[1:3], 'little'); return b[3:3+n].decode('latin1', 'replace')
-        if t == 0x07: n = b[1]; return b[2:2+n*2].decode('utf-16le', 'replace')
-        if t == 0x08: n = int.from_bytes(b[1:3], 'little'); return b[3:3+n*2].decode('utf-16le', 'replace')
-    except Exception:
-        return ''
-    return ''
+    _, text = tc1c._text_at(b, 0, compact=False)
+    return text if text is not None else ''
 
 def _synth_dec_int(b):
     if not b: return None
@@ -3913,6 +4069,12 @@ def _synth_dec_int(b):
 def _synth_step(guid, key, middle):
     """(guid, key, middle) -> (tag, attrs, fields) для uilog, либо None (не действие сценария)."""
     m = middle or b''
+    if guid == _DELETE_SELECTED_STEP:
+        options = json.loads(m) if m else {'scope': 'selected', 'unmark': False}
+        attrs = {'scope': options['scope']}
+        if options['unmark']:
+            attrs['unmark'] = 'true'
+        return ('deleteRows', attrs, None)
     if guid == G.CHOOSE_USER_MESSAGE:
         return ('chooseUserMessage', {'text': _synth_dec_str(m)}, None)
     if guid == _batches.CHECKED_STEP:
@@ -3948,7 +4110,7 @@ def _synth_step(guid, key, middle):
         """Аргумент «Строка, Число» -> атрибут тега: e0 4b 4e + (0x81+idx) -> index;
         e0 4b 53 + строка -> presentation (устаревшая форма e0 4b 53 + int -> тоже index)."""
         if m[:3] == b'\xe0\x4b\x4e' and len(m) >= 4:
-            # индексы 0..126 — один байт 0x81+idx (len(m)==4); с 127 — явный int 8b/8d/8f
+            # Короткий индекс либо явный int 8b/8d/8f; читаем и прежние synth-записи.
             iv = _synth_dec_int(m[3:]) if len(m) > 4 else None
             return {'index': str(iv if iv is not None else m[3] - 0x81)}
         rest = after(b'\xe0\x4b\x53')
@@ -4104,7 +4266,7 @@ def _synth_fdr(m):
 
 # Действия, после которых платформа задаёт модальный вопрос Да/Нет (на него отвечает
 # _answer_confirm_dialog). Ответ пользователя сохраняем атрибутом confirm у САМОГО действия.
-_CONFIRM_ACTIONS = {G.DELETE_ROW, G.COPY_ROW, G.SWITCH_ROW_DELETE_MARK}
+_CONFIRM_ACTIONS = {G.DELETE_ROW, G.COPY_ROW, G.SWITCH_ROW_DELETE_MARK, _DELETE_SELECTED_STEP}
 _DLG_BUTTON_RE = re.compile(r'\.Group\[Buttons\]\.Button\[Button(\d)\]')
 
 def _synth_confirms(tracked):
@@ -4259,8 +4421,12 @@ def _native_composite_begin(c, action='read_rows'):
     try:
         r = c.send_cmd(G.UILOG, None, kind='read818', middle=REC_FINISH)
         _cell_step(r, 'The preceding scenario fragment could not be captured.')
-        _state.setdefault('rec_native_parts', []).append(tc1c.extract_uilog(_body(r)))
         _state['rec_native_stopped'] = True
+        xml = tc1c.extract_uilog(_body(r))
+        if xml is None:
+            raise _CellEditFailure('The native recording reply did not contain a valid scenario.',
+                                   {'code': 'recording_incomplete'})
+        _state.setdefault('rec_native_parts', []).append(xml)
         return len(c._track)
     except Exception:
         _state.setdefault('rec_native_errors', []).append(action)
@@ -4312,7 +4478,8 @@ def tc_record_finish(path: str = None) -> dict:
     """Stop recording and return the scenario XML in 'uilog', or write it to `path`, resolved against
     the SERVER working directory and echoed back absolute. If the file cannot be written the
     answer carries ok=false, the path, the reason AND the scenario in 'uilog' — recording is
-    already stopped, so a second call will not give it back. lost_actions: actions that could
+    already stopped, so a second call will not give it back. In synth mode, a failed completion
+    returns finish_not_confirmed with the preserved XML in uilog. lost_actions: actions that could
     not be captured, so the scenario is incomplete for replay. no_effect: calls whose value came
     back unchanged — a hint to check, not a verdict, and it numbers CALLS, not steps of the XML.
     observed/not_observed count the calls whose result could and could not be read back;
@@ -4336,15 +4503,20 @@ def tc_record_finish(path: str = None) -> dict:
     native_errors = _state.pop('rec_native_errors', [])
     covered = _state.pop('rec_native_covered', [])
     stopped = _state.pop('rec_native_stopped', False)
+    finish_error = None
     try:
         r = ({'ok': False, 'raw': b''} if stopped else
              c.send_cmd(G.UILOG, None, kind='read818', middle=REC_FINISH))
-    except Exception:
-        if not parts:
+    except Exception as exc:
+        if mode != 'synth' and not parts:
             raise
+        finish_error = exc.result() if isinstance(exc, tc1c.OperationError) else {'error': str(exc), 'exception_type': type(exc).__name__}
         r = {'ok': False, 'raw': b''}
-        native_errors.append('read_rows')
+        if mode != 'synth':
+            native_errors.append('read_rows')
     native_xml = tc1c.extract_uilog(_body(r))
+    if mode == 'native' and native_xml is None and not stopped:
+        native_errors.append('native_uilog')
     if parts and not r.get('ok'):
         native_errors.append('read_rows')
     xml = _synth_uilog(tracked) if mode == 'synth' else native_xml
@@ -4378,8 +4550,17 @@ def tc_record_finish(path: str = None) -> dict:
     if native_errors:
         out.update(ok=False, code='recording_incomplete',
                    error='Some actions could not be recorded completely; inspect lost_actions before replay.')
+    if mode == 'synth' and not r.get('ok'):
+        out.update(ok=False, code='finish_not_confirmed', finish_confirmed=False,
+                   error='The test client did not confirm recording completion. The locally recorded scenario is preserved.',
+                   finish_error=finish_error or {'error': 'The test client rejected recording completion.'},
+                   uilog=xml)
     if unmerged is not None:
         out['uilog_fragments'] = unmerged
+    if xml is None:
+        out.update(ok=False, uilog=None, code='recording_incomplete',
+                   error='The native recording reply did not contain a valid scenario. No file was written.')
+        return out
     if path:
         # Запись сценария к этому моменту завершена НЕОБРАТИМО: трекер снят, журнал наблюдений
         # забран, кадр завершения отправлен. Любое исключение отсюда унесло бы сценарий с собой,
@@ -4486,7 +4667,7 @@ def _walk_tree(c, root_key=None):
             out.append(it); stack.append(k)
     return out
 
-def _answer_confirm_dialog(c, confirm=True, max_wait=5.0):
+def _answer_confirm_dialog(c, confirm=True, max_wait=5.0, *, question_guard=None):
     """Ответить на модальный вопрос Да/Нет, если он появился после действия.
     Активное окно диалога (заголовок «1С:Предприятие») содержит Group[Buttons] с
     Button[Button0]=Да, Button[Button1]=Нет (заголовки в коллекции пусты — матч по ИМЕНИ).
@@ -4504,6 +4685,10 @@ def _answer_confirm_dialog(c, confirm=True, max_wait=5.0):
         question = next((it.get('title') for it in items
                          if it.get('name') == 'Message' and it.get('class') == 'Decoration'
                          and it.get('title')), None)
+        if question_guard is not None:
+            if confirm is None:
+                return None, question
+            want = 'Button0' if confirm is True and question_guard(question) else 'Button1'
         for it in items:
             k = it.get('key') or ''
             if it.get('name') == want and '.Group[Buttons].Button[' in k:
@@ -4514,7 +4699,7 @@ def _answer_confirm_dialog(c, confirm=True, max_wait=5.0):
                 for kind in ('action', 'commit'):
                     c.send_cmd(G.CLICK, k, kind=kind, middle=b'', handle=it.get('handle'))
                 _state['window_key'] = None
-                return ('Да' if confirm else 'Нет'), question
+                return ('Да' if want == 'Button0' else 'Нет'), question
         _t.sleep(0.3)
     _state['window_key'] = None
     return None, None
@@ -4523,8 +4708,8 @@ def _name_matcher(pattern):
     """Шаблон имени со знаками подстановки * ? -> регэксп (без учёта регистра)."""
     if not pattern:
         return None
-    rx = '^' + re.escape(pattern).replace(r'\*', '.*').replace(r'\?', '.') + '$'
-    return re.compile(rx, re.IGNORECASE)
+    rx = '^' + re.escape(pattern).replace(r'\*', '.*').replace(r'\?', '.') + r'\Z'
+    return re.compile(rx, re.IGNORECASE | re.DOTALL)
 
 def _search_objects(c, root_key=None):
     """Одна попытка нативного FindObjects; фильтры MCP применяются к этому ответу."""
@@ -4909,7 +5094,8 @@ def _table_cells(c, table_key):
 def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
     """Replay a recorded uilog scenario on the current form. Give the XML in `uilog` or a `path` to a
     file with it. Steps that could not be replayed are listed in `unsupported`. `total` counts
-    every step in the scenario; `played` counts the ones actually attempted, REGARDLESS of how
+    reported steps; replay stops at the first failed step and returns its 0-based stopped_at;
+    unsupported steps are skipped. `played` counts the ones actually attempted, REGARDLESS of how
     they went, so a failed step is still counted. Neither is a count of effects: `ok` says every
     attempted step was accepted, and the effect of a step is in `steps[].changed`, the same
     contract as when you call the action directly."""
@@ -4939,7 +5125,24 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
                                           'подключено %s' % (_minv, _conn_ver(c)),
                     'available_since': _minv, 'connected_version': _conn_ver(c)}
     import time as _t
+    from contextlib import contextmanager
     steps = []
+    stopped_at = None
+
+    class _ReplayStopped(Exception):
+        pass
+
+    @contextmanager
+    def _attempt(target, action):
+        try:
+            yield
+        except _ReplayStopped:
+            raise
+        except Exception as exc:
+            details = exc.result() if isinstance(exc, tc1c.OperationError) else getattr(exc, 'details', {})
+            _step({'target': target, 'action': action, **details,
+                   'ok': False, 'error': str(exc), 'exception_type': type(exc).__name__})
+
     # Статус предполётной проверки последнего отправленного кадра шага. Без него шаг с
     # подтверждённым адресом, шаг без доступной проверки и шаг с выключенной проверкой выглядят
     # одинаково — а политика «при unknown выполняем» имеет смысл только вместе с видимым статусом.
@@ -4969,6 +5172,8 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
         _chk['extra'] = {}
         _obs['v'] = None; _obs['applies'] = False; _obs['args'] = {}
         steps.append(d)
+        if not d.get('ok') and not d.get('skipped'):
+            raise _ReplayStopped()
 
     class _VerErr(Exception):
         """Шаг сценария выполнить нельзя: метод новее платформы либо цели нет по адресу."""
@@ -5030,6 +5235,8 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
             _obs['busy'] = False
         if ok and guid == G.END_EDIT_CURRENT_AREA:
             _clear_pending_area_edit(c, key)
+        if guid in (G.CANCEL_EDIT, G.CHOOSE_FROM_DROP_LIST, G.EXECUTE_CHOICE_FROM_CHOICE_LIST):
+            _resolved_text_input(c, key, ok)
         if desc is not None:
             _obs['v'] = (desc, before,
                          _observe_guid(c, guid, key, handle, _obs['args'], prepared=desc)[1])
@@ -5067,17 +5274,20 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
                     _chk.update(v=page['target_check'], hidden=page['visible'], extra=page)
                     ok = page.get('ok', True)
             return ok
-        if a == 'inputText':
-            guid, middle = _input_text_command(act.get('text', ''), c, key)
-            return _ac(guid, key, handle, middle)
+        if a in ('inputText', 'clear'):
+            text = act.get('text', '') if a == 'inputText' else ''
+            guid, middle = _input_text_command(text, c, key)
+            ok = _ac(guid, key, handle, middle)
+            if a == 'inputText':
+                _remember_text_input(c, key, text, ok)
+            else:
+                _resolved_text_input(c, key, ok)
+            return ok
         if a == 'inputHTML':
             att = {k.split('.', 1)[1]: base64.b64decode(v)
                    for k, v in act.attrib.items() if k.startswith('attachment.')}
             mid = tc1c.mk_html(act.get('HTML') or act.get('html') or '', att or None)
             return _ac(G.INPUT_HTML, key, handle, mid, tc1c.HTML_ATT_PAD if att else None)
-        if a == 'clear':
-            guid, middle = _input_text_command('', c, key)
-            return _ac(guid, key, handle, middle)
         if a == 'setCheck':      return _ac(G.SET_CHECK, key, handle)
         if a == 'setChecked':
             value = act.get('checked')
@@ -5178,6 +5388,8 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
                     'gotoNextItem', 'gotoPreviousItem', 'activate')
 
     def _process_form(frm):
+        if not len(frm):
+            return
         # пере-перечисляем активную форму под ЭТОТ блок (мультиформенность: список->карточка->...)
         elems = _form_elements(c)
         formobj = _form_object(c)
@@ -5191,15 +5403,16 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
                           if 'ciPath' in node.attrib else elems.get(name))
                     for act in list(node):
                         a = act.tag.split('}')[-1]
-                        if not el:
-                            _step({'target': name, 'action': a, 'ok': False, 'error': 'element not found'}); continue
-                        try:
-                            res = _replay(el['key'], el['handle'], act)
-                        except _VerErr as e:
-                            _step({'target': name, 'action': a, 'ok': False, 'error': str(e), **e.details}); continue
-                        _step({'target': name, 'action': a, 'ok': bool(res), 'skipped': res is None})
-                        if a in ('click', 'startChoosing'):
-                            _t.sleep(0.8)            # дать открыться новой форме/выбору
+                        with _attempt(name, a):
+                            if not el:
+                                _step({'target': name, 'action': a, 'ok': False, 'error': 'element not found'}); continue
+                            try:
+                                res = _replay(el['key'], el['handle'], act)
+                            except _VerErr as e:
+                                _step({'target': name, 'action': a, 'ok': False, 'error': str(e), **e.details}); continue
+                            _step({'target': name, 'action': a, 'ok': bool(res), 'skipped': res is None})
+                            if a in ('click', 'startChoosing'):
+                                _t.sleep(0.8)            # дать открыться новой форме/выбору
                 elif tag == 'FormTable':
                     tname = node.get('name'); tel = elems.get(tname)
                     if not tel:
@@ -5207,134 +5420,141 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
                     cells = _table_cells(c, tel['key'])
                     for act in list(node):
                         a = act.tag.split('}')[-1]
-                        try:
-                            if a == 'addRow':
-                                ok = _ac(G.ACTIVATE, tel['key'], tel['handle']) and _ac(G.ADD_ROW, tel['key'], tel['handle'])
-                                cells = _table_cells(c, tel['key'])
-                                _step({'target': tname, 'action': 'addRow', 'ok': ok})
-                            elif a == 'choose':          # открыть текущую строку (напр. элемент списка)
-                                ok = _ac(G.CHOOSE_ROW, tel['key'], tel['handle'])
-                                _step({'target': tname, 'action': 'choose', 'ok': ok})
-                                _t.sleep(0.8)
-                            elif a in ('gotoNextRow', 'gotoPreviousRow', 'gotoFirstRow', 'gotoLastRow'):
-                                guid = {'gotoFirstRow': G.GOTO_FIRST_ROW, 'gotoNextRow': G.GOTO_NEXT_ROW,
-                                        'gotoPreviousRow': G.GOTO_PREVIOUS_ROW, 'gotoLastRow': G.GOTO_LAST_ROW}[a]
-                                tgl = (act.get('toggleSelection') or act.get('switchSelection') or 'false') == 'true'
-                                r = _send(guid, tel['key'], kind='read', middle=(b'\xe2' if tgl else RS), handle=tel['handle'])
-                                _step({'target': tname, 'action': a, 'ok': r['ok']})
-                            elif a == 'gotoRow':     # поиск строки ПО ЗНАЧЕНИЯМ колонок либо
-                                #                          (без Field) переключение выделения ТЕКУЩЕЙ строки
-                                fields = _fields_of(act)
-                                error = _row_criteria_error(c, tel['key'], fields)
-                                if error:
-                                    raise _CellEditFailure(error['error'], error)
-                                if not fields and _guid_available(c, G.CURRENT_MODE_IS_EDIT):
-                                    if _cell_flag(c, G.CURRENT_MODE_IS_EDIT, tel['key'], tel['handle']) is not False:
-                                        raise _CellEditFailure('Finish or cancel row editing first.', {'code': 'row_edit_pending'})
-                                    _table_activate(c, tel['key'], tel['handle'], _cell_window(c))
-                                    if _guid_available(c, G.GET_CURRENT_ROW) and not _cell_step(
-                                            tc_get_current_row(tel['key'], tel['handle']),
-                                            'The current row could not be read.')['row']:
-                                        raise _CellEditFailure('No current row is available.', {'code': 'no_current_row'})
-                                _obs['args'] = {'column': fields[0][0]} if fields else {}
-                                tgl = (act.get('switchSelection') or act.get('toggleSelection') or 'false') == 'true'
-                                mid = tc1c.mk_gotorow(fields=fields, toggle_selection=tgl,
-                                                      direction=act.get('direction', 'down'))
-                                r = _send(G.GOTO_ROW, tel['key'], kind='read', middle=mid,
-                                               pad=(tc1c.GOTOROW_PAD if fields else None), handle=tel['handle'])
-                                _step({'target': tname, 'action': 'gotoRow', 'ok': r['ok'], 'row': dict(fields)})
-                            elif a == 'setOrder':
-                                col = act.get('columnTitle') or act.get('column') or ''
-                                ok = True
-                                for kind in ('action', 'commit'):
-                                    ok = _send(G.SET_ORDER, tel['key'], kind=kind, middle=tc1c.mk_order(col), handle=tel['handle'])['ok'] and ok
-                                _step({'target': tname, 'action': 'setOrder', 'ok': ok})
-                            elif a in ('gotoNextItem', 'gotoPreviousItem'):
-                                res = _replay(tel['key'], tel['handle'], act)
-                                _step({'target': tname, 'action': a, 'ok': bool(res), 'skipped': res is None})
-                            elif a in ('goOneLevelDown', 'goOneLevelUp'):
-                                guid = G.GO_ONE_LEVEL_DOWN if a == 'goOneLevelDown' else G.GO_ONE_LEVEL_UP
-                                fields = _tree_criteria(c, tel['key'], _fields_of(act))
-                                mid = tc1c.mk_tree_middle(RC, pairs=fields)
-                                ok = _ac(guid, tel['key'], tel['handle'], mid,
-                                         pad=tc1c.tree_row_pad(pairs=fields))
-                                _step({'target': tname, 'action': a, 'ok': ok})
-                            elif a == 'endEditRow':
-                                cancel = (act.get('cancel', 'false') == 'true')
-                                ok = True
-                                for kind in ('action', 'commit'):
-                                    mid = b'\xe2' if cancel else RS
-                                    ok = _send(G.END_EDIT_ROW, tel['key'], kind=kind, middle=mid, handle=tel['handle'])['ok'] and ok
-                                _step({'target': tname, 'action': 'endEditRow', 'ok': ok})
-                            elif a == 'deleteRow':
-                                selected_count = _table_prepare_delete(c, tel['key'], tel['handle'])
-                                ok = _ac(G.DELETE_ROW, tel['key'], tel['handle'])
-                                want = _confirm_of(act)          # None -> при записи не отвечали
-                                if want is not None:
-                                    try: _answer_confirm_dialog(c, want, max_wait=2.0)
-                                    except Exception: pass
-                                _step({'target': tname, 'action': 'deleteRow', 'ok': ok,
-                                       'selected_rows': selected_count, 'deleted': None})
-                                _t.sleep(0.4)
-                            elif a == 'copyRow':
-                                ok = _ac(G.COPY_ROW, tel['key'], tel['handle'])
-                                want = _confirm_of(act)          # None -> при записи не отвечали
-                                if want is not None:
-                                    try: _answer_confirm_dialog(c, want, max_wait=2.0)
-                                    except Exception: pass
-                                _step({'target': tname, 'action': 'copyRow', 'ok': ok})
-                                _t.sleep(0.4)
-                            elif a == 'changeRow':
-                                _step({'target': tname, 'action': 'changeRow', 'ok': _ac(G.CHANGE_ROW, tel['key'], tel['handle'])})
-                            elif a in ('selectAllRows', 'deselectAllRows', 'selectRow', 'deselectRow'):
-                                guid = {'selectAllRows': G.SELECT_ALL_ROWS, 'deselectAllRows': G.DESELECT_ALL_ROWS,
-                                        'selectRow': G.SELECT_ROW, 'deselectRow': G.DESELECT_ROW}[a]
-                                mid = RC if a in ('selectRow', 'deselectRow') else b''
-                                _step({'target': tname, 'action': a,
-                                              'ok': _ac(guid, tel['key'], tel['handle'], mid)})
-                            elif a == 'switchRowDeleteMark':
-                                ok = _ac(G.SWITCH_ROW_DELETE_MARK, tel['key'], tel['handle'])
-                                want = _confirm_of(act)          # None -> при записи не отвечали
-                                if want is not None:
-                                    try: _answer_confirm_dialog(c, want, max_wait=3.0)
-                                    except Exception: pass
-                                _step({'target': tname, 'action': 'switchRowDeleteMark', 'ok': ok})
-                                _t.sleep(0.4)
-                            elif a in ('expand', 'collapse'):
-                                fields = _tree_criteria(c, tel['key'], _fields_of(act))
-                                # наблюдение адресуем ТОЙ ЖЕ строке, что и действие
-                                _obs['args'] = {'row_pairs': fields} if fields else {}
-                                if a == 'expand':
-                                    # subordinates="true" -> развернуть вместе с подчинёнными строками
-                                    base = b'\xe2\xcb\x55' if act.get('subordinates') == 'true' else b'\xe1\xcb\x55'
-                                    mid = tc1c.mk_tree_middle(base, pairs=fields); guid = G.EXPAND_TABLE
+                        with _attempt(tname, a):
+                            try:
+                                if a == 'addRow':
+                                    ok = _ac(G.ACTIVATE, tel['key'], tel['handle']) and _ac(G.ADD_ROW, tel['key'], tel['handle'])
+                                    cells = _table_cells(c, tel['key'])
+                                    _step({'target': tname, 'action': 'addRow', 'ok': ok})
+                                elif a == 'choose':          # открыть текущую строку (напр. элемент списка)
+                                    ok = _ac(G.CHOOSE_ROW, tel['key'], tel['handle'])
+                                    _step({'target': tname, 'action': 'choose', 'ok': ok})
+                                    _t.sleep(0.8)
+                                elif a in ('gotoNextRow', 'gotoPreviousRow', 'gotoFirstRow', 'gotoLastRow'):
+                                    guid = {'gotoFirstRow': G.GOTO_FIRST_ROW, 'gotoNextRow': G.GOTO_NEXT_ROW,
+                                            'gotoPreviousRow': G.GOTO_PREVIOUS_ROW, 'gotoLastRow': G.GOTO_LAST_ROW}[a]
+                                    tgl = (act.get('toggleSelection') or act.get('switchSelection') or 'false') == 'true'
+                                    r = _send(guid, tel['key'], kind='read', middle=(b'\xe2' if tgl else RS), handle=tel['handle'])
+                                    _step({'target': tname, 'action': a, 'ok': r['ok']})
+                                elif a == 'gotoRow':     # поиск строки ПО ЗНАЧЕНИЯМ колонок либо
+                                    #                          (без Field) переключение выделения ТЕКУЩЕЙ строки
+                                    fields = _fields_of(act)
+                                    error = _row_criteria_error(c, tel['key'], fields)
+                                    if error:
+                                        raise _CellEditFailure(error['error'], error)
+                                    if not fields and _guid_available(c, G.CURRENT_MODE_IS_EDIT):
+                                        if _cell_flag(c, G.CURRENT_MODE_IS_EDIT, tel['key'], tel['handle']) is not False:
+                                            raise _CellEditFailure('Finish or cancel row editing first.', {'code': 'row_edit_pending'})
+                                        _table_activate(c, tel['key'], tel['handle'], _cell_window(c))
+                                        if _guid_available(c, G.GET_CURRENT_ROW) and not _cell_step(
+                                                tc_get_current_row(tel['key'], tel['handle']),
+                                                'The current row could not be read.')['row']:
+                                            raise _CellEditFailure('No current row is available.', {'code': 'no_current_row'})
+                                    _obs['args'] = {'column': fields[0][0]} if fields else {}
+                                    tgl = (act.get('switchSelection') or act.get('toggleSelection') or 'false') == 'true'
+                                    mid = tc1c.mk_gotorow(fields=fields, toggle_selection=tgl,
+                                                          direction=act.get('direction', 'down'))
+                                    r = _send(G.GOTO_ROW, tel['key'], kind='read', middle=mid,
+                                                   pad=(tc1c.GOTOROW_PAD if fields else None), handle=tel['handle'])
+                                    _step({'target': tname, 'action': 'gotoRow', 'ok': r['ok'], 'row': dict(fields)})
+                                elif a == 'setOrder':
+                                    col = act.get('columnTitle') or act.get('column') or ''
+                                    ok = True
+                                    for kind in ('action', 'commit'):
+                                        ok = _send(G.SET_ORDER, tel['key'], kind=kind, middle=tc1c.mk_order(col), handle=tel['handle'])['ok'] and ok
+                                    _step({'target': tname, 'action': 'setOrder', 'ok': ok})
+                                elif a in ('gotoNextItem', 'gotoPreviousItem'):
+                                    res = _replay(tel['key'], tel['handle'], act)
+                                    _step({'target': tname, 'action': a, 'ok': bool(res), 'skipped': res is None})
+                                elif a in ('goOneLevelDown', 'goOneLevelUp'):
+                                    guid = G.GO_ONE_LEVEL_DOWN if a == 'goOneLevelDown' else G.GO_ONE_LEVEL_UP
+                                    fields = _tree_criteria(c, tel['key'], _fields_of(act))
+                                    mid = tc1c.mk_tree_middle(RC, pairs=fields)
+                                    ok = _ac(guid, tel['key'], tel['handle'], mid,
+                                             pad=tc1c.tree_row_pad(pairs=fields))
+                                    _step({'target': tname, 'action': a, 'ok': ok})
+                                elif a == 'endEditRow':
+                                    cancel = (act.get('cancel', 'false') == 'true')
+                                    ok = True
+                                    for kind in ('action', 'commit'):
+                                        mid = b'\xe2' if cancel else RS
+                                        ok = _send(G.END_EDIT_ROW, tel['key'], kind=kind, middle=mid, handle=tel['handle'])['ok'] and ok
+                                    _step({'target': tname, 'action': 'endEditRow', 'ok': ok})
+                                elif a == 'deleteRow':
+                                    _table_prepare_delete(c, tel['key'], tel['handle'])
+                                    ok = _ac(G.DELETE_ROW, tel['key'], tel['handle'])
+                                    want = _confirm_of(act)          # None -> при записи не отвечали
+                                    if want is not None:
+                                        try: _answer_confirm_dialog(c, want, max_wait=2.0)
+                                        except Exception: pass
+                                    _step({'target': tname, 'action': 'deleteRow', 'ok': ok,
+                                           'deleted': None})
+                                    _t.sleep(0.4)
+                                elif a == 'deleteRows':
+                                    result = tc_delete_rows(tel['key'], tel['handle'],
+                                        confirm=_confirm_of(act), scope=act.get('scope', 'current'),
+                                        unmark=act.get('unmark', 'false').lower() == 'true')
+                                    _step({**result, 'target': tname, 'action': 'deleteRows'})
+                                elif a == 'copyRow':
+                                    ok = _ac(G.COPY_ROW, tel['key'], tel['handle'])
+                                    want = _confirm_of(act)          # None -> при записи не отвечали
+                                    if want is not None:
+                                        try: _answer_confirm_dialog(c, want, max_wait=2.0)
+                                        except Exception: pass
+                                    _step({'target': tname, 'action': 'copyRow', 'ok': ok})
+                                    _t.sleep(0.4)
+                                elif a == 'changeRow':
+                                    _step({'target': tname, 'action': 'changeRow', 'ok': _ac(G.CHANGE_ROW, tel['key'], tel['handle'])})
+                                elif a in ('selectAllRows', 'deselectAllRows', 'selectRow', 'deselectRow'):
+                                    guid = {'selectAllRows': G.SELECT_ALL_ROWS, 'deselectAllRows': G.DESELECT_ALL_ROWS,
+                                            'selectRow': G.SELECT_ROW, 'deselectRow': G.DESELECT_ROW}[a]
+                                    mid = RC if a in ('selectRow', 'deselectRow') else b''
+                                    _step({'target': tname, 'action': a,
+                                                  'ok': _ac(guid, tel['key'], tel['handle'], mid)})
+                                elif a == 'switchRowDeleteMark':
+                                    ok = _ac(G.SWITCH_ROW_DELETE_MARK, tel['key'], tel['handle'])
+                                    want = _confirm_of(act)          # None -> при записи не отвечали
+                                    if want is not None:
+                                        try: _answer_confirm_dialog(c, want, max_wait=3.0)
+                                        except Exception: pass
+                                    _step({'target': tname, 'action': 'switchRowDeleteMark', 'ok': ok})
+                                    _t.sleep(0.4)
+                                elif a in ('expand', 'collapse'):
+                                    fields = _tree_criteria(c, tel['key'], _fields_of(act))
+                                    # наблюдение адресуем ТОЙ ЖЕ строке, что и действие
+                                    _obs['args'] = {'row_pairs': fields} if fields else {}
+                                    if a == 'expand':
+                                        # subordinates="true" -> развернуть вместе с подчинёнными строками
+                                        base = b'\xe2\xcb\x55' if act.get('subordinates') == 'true' else b'\xe1\xcb\x55'
+                                        mid = tc1c.mk_tree_middle(base, pairs=fields); guid = G.EXPAND_TABLE
+                                    else:
+                                        mid = tc1c.mk_tree_middle(RC, pairs=fields); guid = G.COLLAPSE_TABLE
+                                    ok = _ac(guid, tel['key'], tel['handle'], mid, tc1c.tree_row_pad(pairs=fields))
+                                    _step({'target': tname, 'action': a, 'ok': ok})
+                                elif a == 'FormField':
+                                    cn = act.get('name'); cell = cells.get(cn)
+                                    for cact in list(act):
+                                        ca = cact.tag.split('}')[-1]
+                                        with _attempt('%s/%s' % (tname, cn), ca):
+                                            if not cell:
+                                                _step({'target': '%s/%s' % (tname, cn), 'action': ca, 'ok': False, 'error': 'column not found'}); continue
+                                            res = _replay(cell['key'], cell['handle'], cact)
+                                            _step({'target': '%s/%s' % (tname, cn), 'action': ca, 'ok': bool(res), 'skipped': res is None})
+                                else:                          # прочие элементные действия над самой таблицей (view-status, write и т.п.)
+                                    res = _replay(tel['key'], tel['handle'], act)
+                                    _step({'target': tname, 'action': a, 'ok': bool(res), 'skipped': res is None})
+                            except _CellEditFailure as e:
+                                _step({'target': tname, 'action': a, **e.details, 'ok': False, 'error': str(e)})
+                            except tc1c.OperationError as e:
+                                _step({'target': tname, 'action': a, **e.result()})
+                            except _TreeCriterionError as e:
+                                _step({'target': tname, 'action': a, 'ok': False, 'code': e.code, 'error': str(e)})
+                            except _VerErr as e:   # метод новее подключённой платформы
+                                if (a == 'gotoRow' and isinstance(e.__cause__, tc1c.OperationError)
+                                        and e.__cause__.status == 13 and _fields_of(act)):
+                                    _step({'target': tname, 'action': a, **_row_search_refusal(_fields_of(act))})
                                 else:
-                                    mid = tc1c.mk_tree_middle(RC, pairs=fields); guid = G.COLLAPSE_TABLE
-                                ok = _ac(guid, tel['key'], tel['handle'], mid, tc1c.tree_row_pad(pairs=fields))
-                                _step({'target': tname, 'action': a, 'ok': ok})
-                            elif a == 'FormField':
-                                cn = act.get('name'); cell = cells.get(cn)
-                                for cact in list(act):
-                                    ca = cact.tag.split('}')[-1]
-                                    if not cell:
-                                        _step({'target': '%s/%s' % (tname, cn), 'action': ca, 'ok': False, 'error': 'column not found'}); continue
-                                    res = _replay(cell['key'], cell['handle'], cact)
-                                    _step({'target': '%s/%s' % (tname, cn), 'action': ca, 'ok': bool(res), 'skipped': res is None})
-                            else:                          # прочие элементные действия над самой таблицей (view-status, write и т.п.)
-                                res = _replay(tel['key'], tel['handle'], act)
-                                _step({'target': tname, 'action': a, 'ok': bool(res), 'skipped': res is None})
-                        except _CellEditFailure as e:
-                            _step({'target': tname, 'action': a, **e.details, 'ok': False, 'error': str(e)})
-                        except tc1c.OperationError as e:
-                            _step({'target': tname, 'action': a, **e.result()})
-                        except _TreeCriterionError as e:
-                            _step({'target': tname, 'action': a, 'ok': False, 'code': e.code, 'error': str(e)})
-                        except _VerErr as e:   # метод новее подключённой платформы
-                            if (a == 'gotoRow' and isinstance(e.__cause__, tc1c.OperationError)
-                                    and e.__cause__.status == 13 and _fields_of(act)):
-                                _step({'target': tname, 'action': a, **_row_search_refusal(_fields_of(act))})
-                            else:
-                                _step({'target': tname, 'action': a, 'ok': False, 'error': str(e), **e.details})
+                                    _step({'target': tname, 'action': a, 'ok': False, 'error': str(e), **e.details})
                 elif tag in FORM_ACTIONS:
                     try:
                         res = _replay_form(formobj, node)
@@ -5352,7 +5572,8 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
     def _window_action(node, tag):
         """Действие уровня окна/сессии из сценария."""
         if tag == 'Form':
-            _process_form(node); _t.sleep(0.4)
+            if len(node):
+                _process_form(node); _t.sleep(0.4)
         elif tag == 'close':
             result = _close_active_window(c, send=_send, native_only=node.get('native') == 'true')
             _step({'target': '<window>', 'action': 'close', **result})
@@ -5400,18 +5621,24 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
 
     # обход по ОКНАМ (ClientApplicationWindow) в порядке документа: форма + закрытие окна
     windows = [w for w in root.iter() if w.tag.split('}')[-1] == 'ClientApplicationWindow']
-    for w in windows:
-        for node in list(w):
-            tag = node.tag.split('}')[-1]
-            try:
-                _window_action(node, tag)
-            except _VerErr as e:
-                _step({'target': '<window>', 'action': tag, 'ok': False, 'error': str(e), **e.details})
+    try:
+        for w in windows:
+            for node in list(w):
+                tag = node.tag.split('}')[-1]
+                try:
+                    with _attempt('<form>' if tag == 'Form' else '<window>', tag):
+                        _window_action(node, tag)
+                except _VerErr as e:
+                    _step({'target': '<window>', 'action': tag, 'ok': False, 'error': str(e), **e.details})
+
+    except _ReplayStopped:
+        stopped_at = len(steps) - 1
 
     unsupported = sorted(set(s['action'] for s in steps if s.get('skipped')))
     played = [s for s in steps if not s.get('skipped')]
     return {'ok': all(s['ok'] for s in played) if played else False,
-            'played': len(played), 'total': len(steps), 'unsupported': unsupported, 'steps': steps}
+            'played': len(played), 'total': len(steps), 'unsupported': unsupported, 'steps': steps,
+            **({'stopped_at': stopped_at} if stopped_at is not None else {})}
 
 class _CellEditFailure(Exception):
     def __init__(self, message, details=None):

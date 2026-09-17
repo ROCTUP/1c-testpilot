@@ -244,6 +244,17 @@ def present(payload, action, registry):
             if _collection.is_object_key(key):
                 pairs.setdefault(key, args.get('handle') or registry.get(key))
                 argument_targets[field] = key
+    missing_cell_refs = set()
+    if action == 'set_cell_text' and len(pairs) > registry.limit:
+        # The edit has already happened. Keep its result and target even when
+        # the current editor or a suggested call cannot receive another reference.
+        optional = dict.fromkeys([o['key'] for o in objects] + list(argument_targets.values()))
+        for key in reversed(optional):
+            if len(pairs) <= registry.limit:
+                break
+            if key not in echoes.values():
+                pairs.pop(key, None)
+                missing_cell_refs.add(key)
     if action in ('click', 'start_choosing', 'execute_command') and len(pairs) > registry.limit and isinstance(value, dict):
         # The action has already happened. Losing an optional window ref must not
         # turn its response into a failed action that the caller might repeat.
@@ -273,6 +284,10 @@ def present(payload, action, registry):
                 pairs[obj['key']] = obj.get('handle') or registry.get(obj['key'])
     refs = registry.publish(pairs)
     def node(obj):
+        if isinstance(obj, dict) and obj.get('key') in missing_cell_refs:
+            return {'ref': None, **{k: v for k, v in obj.items() if k not in ('key', 'handle')},
+                    'reference_status': 'unavailable', 'code': 'ref_limit_exceeded',
+                    'message': 'The editor reference exceeds TC1C_REF_LIMIT. Find the column by name to obtain its reference.'}
         if not isinstance(obj, dict) or obj.get('key') not in refs:
             return obj
         return {'ref': refs[obj['key']], **{k: v for k, v in obj.items() if k not in ('key', 'handle')}}
@@ -309,7 +324,9 @@ def present(payload, action, registry):
         out['observed'] = {**payload['observed'], 'reference_status': 'unavailable',
                            'code': 'ref_limit_exceeded', 'missing_refs': missing_window_refs,
                            'message': 'Window references exceed TC1C_REF_LIMIT. Find the window separately.'}
-    if argument_targets:
+    if any(key in missing_cell_refs for key in argument_targets.values()):
+        out['suggested_call'] = None
+    elif argument_targets:
         converted = dict(args)
         for field, key in argument_targets.items():
             converted.pop(field)
