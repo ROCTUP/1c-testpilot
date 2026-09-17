@@ -73,7 +73,7 @@ class Connection:
 
     def info(self):
         c = self.state.get('client')
-        return {'connection_id': self.id, 'host': self.host, 'port': self.port,
+        return {'connection_id': self.id, 'profile': self.state.get('profile'), 'host': self.host, 'port': self.port,
                 'base': self.base, 'user': self.user,
                 'version': getattr(c, 'platform_version', None),
                 'connected': c is not None, 'starting': self.starting,

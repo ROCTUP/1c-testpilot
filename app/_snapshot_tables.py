@@ -37,11 +37,10 @@ def prepare(S, c, form, objects):
     # No automatic focus changes or restoration. Finishing edits is the user's decision.
     if S._window(c).get('key') != S._collection_parent(form['key']):
         raise Failure('inactive_form', 'Activate this form before including table rows.')
-    if getattr(c, '_pending_area_edits', None):
-        raise Failure('other_input_pending', 'Finish or cancel pending input before including table rows.')
     # Reconcile remembered text input with the live focus, as batch writes do.
     # This only reads state; it must never finish editing or move focus itself.
     try:
+        batches.ensure_area_pending(S, c, form['key'])
         batches.ensure_pending(S, c, None)
     except (batches.Failure, S._CellEditFailure) as exc:
         raise Failure('other_input_pending', 'Finish or cancel pending input before including table rows.') from exc

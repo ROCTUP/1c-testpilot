@@ -256,9 +256,12 @@ def _read_string(raw, i, end):
 
 
 def _read_record_string(raw, i, end):
-    # Unlike metadata scanning, do not skip e1: it means this caption is absent.
+    # The descriptor's e1 string slot is an explicitly empty string. Skipping it
+    # would read the following object name as the caption. A missing slot stays unknown.
     j = i
     if j < end and raw[j] in (0x81, 0x82): j += 1
+    if j < end and raw[j] == 0xe1:
+        return '', j + 1
     text, nxt, _ = _read_string(raw, j, end)
     return (text, nxt) if text is not None else (None, i)
 
@@ -288,8 +291,59 @@ def _metadata_name(raw, i, end, cls):
         i = nxt
     return None
 
+
+def _navigation_string(raw, i, end, empty_tags):
+    """A metadata string, including the compact tags used by window URLs."""
+    if i >= end:
+        return None, i
+    if raw[i] in empty_tags:
+        return '', i + 1
+    tag = raw[i]
+    if tag not in (0x97, 0x98, 0x9a, 0x9b, 0xf7, 0xf8, 0xfa, 0xfb):
+        return None, i
+    header = 3 if tag & 15 in (8, 11) else 2
+    if i + header > end:
+        return None, i
+    wide = tag & 15 in (7, 8)
+    size = int.from_bytes(raw[i+1:i+header], 'little')
+    stop = i + header + size * (2 if wide else 1)
+    if stop > end:
+        return None, i
+    try:
+        return raw[i+header:stop].decode('utf-16le' if wide else 'latin1'), stop
+    except UnicodeDecodeError:
+        return None, i
+
+
+def _navigation_metadata(raw, ke, end, cls):
+    """Properties stored in the object descriptor, not separate remote methods.
+
+    Bound every read to this record. In particular, an absent URL in an older
+    descriptor must not become an empty URL or consume the next object's data.
+    """
+    _, q = _read_record_string(raw, ke, end)
+    if cls == 'CIButton':
+        if raw[q:q+2] != b'\xe1\x81':
+            return {}
+        value, _ = _navigation_string(raw, q+2, end, (0xe1,))
+        return {'url': value} if value is not None else {}
+    if cls not in ('MainFrame', 'SecondaryFrame', 'HomePage'):
+        return {}
+    class_name, q, _ = _read_string(raw, q, end)
+    if class_name != cls or q + 3 > end or raw[q] != 0x81:
+        return {}
+    # Empty object name, window kind (normal/main), home-page flag, URL.
+    if raw[q+1] not in (0xe1, 0xe2) or raw[q+2] not in (0x81, 0x82):
+        return {}
+    result = {'is_main': raw[q+1] == 0xe2, 'home_page': raw[q+2] == 0x82}
+    value, _ = _navigation_string(raw, q+3, end, (0x81,))
+    if value is not None:
+        result['url'] = value
+    return result
+
 def decode_collection(raw, parent=None):
-    """Ответ GetChildObjects -> [{key, handle, title, name, class, type, form_name}].
+    """Ответ GetChildObjects -> объекты с key, handle, title, name, class, type.
+    Свойства конкретных классов: form_name; url; home_page, is_main.
     title/name приходят в ответе; type — значение перечня платформы, выбранное по байт-коду
     после них (сам код наружу не отдаётся); class — из ключа; form_name — только у управляемой
     формы и только когда имя реально прочитано.
@@ -311,6 +365,7 @@ def decode_collection(raw, parent=None):
         nm, cls = _key_name_class(key)
         if nm is not None: item['name'] = nm
         item['class'] = cls
+        item.update(_navigation_metadata(raw, ke, rec_end, cls))
         # Имя формы в метаданных — единственное сведение участка, которое не выражается ни
         # ключом, ни заголовком: у формы name равен GUID из скобок ключа, а title бывает пуст.
         # Ключ не ставим, когда имени нет: отсутствие поля и пустое значение — разные утверждения

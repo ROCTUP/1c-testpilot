@@ -16,6 +16,9 @@ import _field_batches as _batches
 import _snapshots
 import _form_context
 import _action_diagnostics
+import _row_search
+import _call_logging
+import _profiles
 from mcp.types import CallToolResult, ImageContent, TextContent
 import anyio
 # Минимальная версия платформы 1С: по инструменту и по GUID метода (для воспроизведения
@@ -51,8 +54,12 @@ _state = _connections.State()
 _pool = _connections.Pool(_state)
 _snapshot_store = _snapshots.Store()
 SCREENSHOTS = os.environ.get('TC1C_SCREENSHOTS', 'true').strip().lower() not in ('false', '0', 'no', 'off')
+LOGGING = _call_logging.enabled('TC1C_LOGGING')
+_log_store = _call_logging.Store() if LOGGING else None
+_log_auto_start = LOGGING and _call_logging.enabled('TC1C_LOG_AUTO_START', 'false')
 
 _ACTIONS = {}          # группа -> {действие: функция-обработчик}
+_APPLICATION_ROOT = object()
 
 _SPREADSHEET_ACTIONS = frozenset({
     'set_current_area', 'get_current_area_address', 'get_current_area_text',
@@ -1059,8 +1066,9 @@ def _window(c):
     r = c.send_cmd(G.GET_ACTIVE_WINDOW, None, kind='read', middle=RC)
     # у кадра отказа фрагмент выглядел бы настоящим заголовком, хотя это остаток диагностики
     keys = tc1c.extract_object_keys(r['raw']) if r.get('ok') else []
-    title = next((it.get('title') for it in tc1c.decode_collection(r['raw'])
-                  if keys and it.get('key') == keys[0]), None) if r.get('ok') else None
+    metadata = next((it for it in tc1c.decode_collection(r['raw'])
+                     if keys and it.get('key') == keys[0]), {}) if r.get('ok') else {}
+    title = metadata.get('title')
     cls = keys[0].split('[')[0] if keys else None
     _state['window_key'] = keys[0] if keys else None
     if not keys:
@@ -1071,7 +1079,8 @@ def _window(c):
         elif r.get('ok'):
             out.update(_unavailable_window())
         return out
-    return {'ok': r['ok'], 'key': keys[0], 'class': cls, 'title': title, 'addressable': True}
+    return {'ok': r['ok'], 'key': keys[0], 'class': cls, 'title': title, 'addressable': True,
+            **{k: metadata[k] for k in ('url', 'home_page', 'is_main') if k in metadata}}
 
 
 def _native_active_window(c):
@@ -1126,6 +1135,7 @@ def _form_title(c, window_key):
 @_action('tc_session')
 def tc_connect(port: int, host: str = '127.0.0.1', version: str = None) -> str:
     """Connect to a running 1C test client (started with /TESTCLIENT -TPort <port>).
+    Supply port, or profile from list_profiles. Explicit parameters override profile settings.
     `version` is the platform version
     (e.g. '8.5.1.1343') and MUST match the running platform, else the handshake fails; if
     omitted a built-in default is used. Call this before any other tc_* tool.
@@ -1194,6 +1204,7 @@ def tc_launch_client(base: str, port: int = None, server: bool = False, user: st
                      desktop: typing.Literal['default', 'isolated'] = 'default') -> dict:
     """Launch a 1C test client and wait until it accepts connections on `port`, then optionally
     connect to it. `base` is a file infobase path (default), or 'server\\infobase' when `server=True`.
+    Supply base, or profile from list_profiles. Explicit parameters override profile settings.
     `user`/`password` — infobase credentials (optional; the password is passed on the command line
     and is visible in the OS process list). `exe` — full path to 1cv8.exe or 1cv8c.exe on Windows,
     or 1cv8/1cv8c on Linux (else env
@@ -1377,9 +1388,58 @@ def tc_disconnect() -> str:
 
 @_action('tc_session')
 def tc_list_connections() -> dict:
-    """List registered clients with connection_id, host, port, base, user and recording status.
+    """List registered clients with connection_id, profile, host, port, base, user and recording status.
     base/user are known for clients launched here; listing does not probe client health."""
     return {'ok': True, 'connections': _pool.list()}
+
+
+@_action('tc_session')
+def tc_list_profiles() -> dict:
+    """List named launch/connect profiles and their descriptions and settings, without passwords.
+    Pass the name as profile to the listed action. Does not connect to or launch a client."""
+    return _profiles.listing()
+
+# ============================== журнал вызовов ===============================
+@_action('tc_session')
+def tc_start_logging(screenshot_mode: typing.Literal['off', 'actions', 'all'] = None) -> dict:
+    """Start a call journal. Repeated start keeps the current journal.
+    screenshot_mode: off, actions (changes and errors), or all calls; default follows server settings.
+    Saves JSONL, PNG and an HTML report on the MCP server. Images are not added to tool responses."""
+    if not LOGGING:
+        return {'ok': False, 'code': 'logging_disabled', 'error': 'Call logging is disabled.'}
+    if _state.get('client') is None and not _state.get('connection_id'):
+        return {'ok': False, 'code': 'not_connected', 'error': 'Connect or launch a test client before starting call logging.'}
+    if screenshot_mode is not None and screenshot_mode not in _call_logging.MODES:
+        return {'ok': False, 'code': 'invalid_logging_mode', 'error': 'screenshot_mode must be off, actions or all.'}
+    journal = _state.get('_call_journal')
+    if journal is not None and journal.active:
+        return {**journal.status(), 'already_active': True}
+    if journal is not None:
+        journal.stop()
+    journal = _log_store.start(_state.get('connection_id'), screenshot_mode)
+    if isinstance(journal, dict):
+        return journal
+    _state['_call_journal'] = journal
+    return journal.status()
+
+
+@_action('tc_session')
+def tc_stop_logging() -> dict:
+    """Stop call logging and return the JSONL journal and HTML report paths. Does not stop the client."""
+    if not LOGGING:
+        return {'ok': False, 'code': 'logging_disabled', 'error': 'Call logging is disabled.'}
+    journal = _state.get('_call_journal')
+    return journal.stop() if journal is not None else {'ok': True, 'active': False}
+
+
+@_action('tc_session')
+def tc_get_logging_status() -> dict:
+    """Return call logging status, paths, call count, disk usage and any reason recording stopped."""
+    if not LOGGING:
+        return {'ok': False, 'code': 'logging_disabled', 'error': 'Call logging is disabled.'}
+    journal = _state.get('_call_journal')
+    return journal.status() if journal is not None else {'ok': True, 'active': False}
+
 
 # ============================== окно / дерево ================================
 @_action('tc_app')
@@ -1399,7 +1459,8 @@ def tc_get_screenshot(scale: int = 100, grid: bool = False, region: list[int] = 
 @_action('tc_app')
 def tc_get_active_window() -> dict:
     """Return the application's active window: {key, class, title, platform_version} and sometimes
-    form_name. title is the caption of the window's managed form — null only when the window has
+    form_name. url is the navigation link (empty if none); home_page and is_main identify the
+    start page and main window when provided by the platform. title is the caption of the window's managed form — null only when the window has
     no form or the caption could not be read. form_name is the form's name in the configuration
     metadata ('Справочник.Контрагенты.Форма.ФормаСписка'), unrelated to name, which for a form
     is a GUID. form_name is read only when the window itself gave no caption and may be absent
@@ -1434,7 +1495,7 @@ def tc_activate_window() -> dict:
     return {'ok': ok, 'window': w['key']}
 
 @_action('tc_app')
-def tc_get_child_objects(key: str = None) -> dict:
+def tc_get_child_objects(key: str = None, scope: typing.Literal['window', 'application'] = 'window') -> dict:
     """List one level of child UI objects under the addressed parent. If its address is omitted,
     use the last observed active window, querying the client if no window has been observed.
     For a whole subtree in one call use tc_find(action="find_objects").
@@ -1443,8 +1504,16 @@ def tc_get_child_objects(key: str = None) -> dict:
     (e.g. CheckBoxField or Pages), and may be null when no kind is known for that object.
     A ManagedForm row can also carry form_name, its name in configuration metadata
     (e.g. 'Справочник.Контрагенты.Форма.ФормаСписка'), useful when the title is empty.
+    scope=application with no parent lists all application windows. Window and command-button
+    metadata may include url; window metadata may also include home_page and is_main.
     Always obtain object addresses from tool results."""
     c = _need()
+    if scope not in ('window', 'application') or (scope == 'application' and key):
+        return {'ok': False, 'code': 'invalid_argument',
+                'error': 'Use scope=application without an element address, or scope=window with an optional parent.'}
+    if scope == 'application':
+        r = c.send_cmd(G.GET_CHILD_OBJECTS, None, kind='read', middle=CHILD_MIDDLE)
+        return {'ok': r['ok'], 'parent': None, 'children': _coll(r)}
     target = key or _state.get('window_key')
     if not target:
         target = _window(c)['key']
@@ -1649,12 +1718,13 @@ def tc_activate(key: str, handle: str) -> dict:
 
 def _click_guid(key):
     return {'Button': G.CLICK, 'EditField': G.CLICK_FIELD,
+            'Group': G.CLICK_FIELD,
             'Decoration': G.CLICK_DECORATION, 'CIButton': G.CLICK_CI}.get(_key_class(key))
 
 
 @_action('tc_field')
 def tc_click(key: str, handle: str, diagnostics: bool = False, diagnostics_wait: float = 2.0) -> dict:
-    """Click a button, field, decoration or command-interface button. The element must support
+    """Click a button, field, form group, decoration or command-interface button. The element must support
     clicking. To focus an input, table cell or page, use activate.
     When present, window describes the active window after the click.
     diagnostics=True requests the active window and its messages, which may include earlier actions.
@@ -1669,12 +1739,17 @@ def tc_click(key: str, handle: str, diagnostics: bool = False, diagnostics_wait:
     guid = _click_guid(key)
     if guid is None:
         return {'ok': False, 'target': key, 'code': 'unsupported_element_type',
-                'error': 'Click requires a button, field, decoration or command-interface button.',
+                'error': 'Click requires a button, field, form group, decoration or command-interface button.',
                 'suggested_action': 'activate'}
+    mark = _native_composite_begin(c, 'click') if _key_class(key) == 'Group' else None
     ok = True
-    for kind in ('action', 'commit'):
-        r = c.send_cmd(guid, key, kind=kind, middle=b'', handle=handle)
-        ok = ok and r['ok']
+    try:
+        for kind in ('action', 'commit'):
+            r = c.send_cmd(guid, key, kind=kind, middle=b'', handle=handle)
+            ok = ok and r['ok']
+    finally:
+        if mark is not None:
+            _native_composite_end(c, mark, 'click')
     _state['window_key'] = None          # клик мог открыть новое окно — кэш недействителен
     result = {'ok': ok, 'target': key}
     if ok and (READBACK or diagnostics):
@@ -1802,7 +1877,7 @@ def tc_get_selected_rows(key: str, handle: str) -> dict:
 
 @_action('tc_field')
 def tc_get_choice_list(key: str, handle: str) -> dict:
-    """Read radio-button options or an input's open drop-down list. For an input, open its list
+    """Read radio-button options, an input's open drop-down list or a form's open choice list. For an input, open its list
     immediately before reading: the answer describes whichever drop-down is currently open.
     items contains {presentation, text}; presentations contains the displayed texts to select.
     A closed input list may return items=[] with status=unknown."""
@@ -2166,6 +2241,27 @@ def tc_read_rows(key: str, handle: str, max_rows: int = 500) -> dict:
                 result.update(ok=False, code='recording_incomplete',
                               error='Scenario recording could not continue after this action: ' + str(exc))
     return result
+
+@_action('tc_table')
+def tc_find_rows(key: str, handle: str, conditions: _row_search.Conditions,
+                 columns: _row_search.Columns = None, case_sensitive: bool = False,
+                 max_rows: int = 500, max_matches: int = 50) -> dict:
+    """Find matching selectable rows of the current table, respecting filters and collapsed groups;
+    never a database-wide search. conditions is an AND-list of {column, text, match}; column is a
+    displayed column TITLE. match is exact (default), contains, starts_with or ends_with; literal
+    displayed text is compared without case by default. Known search highlighting is ignored
+    during comparison; returned values are unchanged.
+    Optional columns lists titles to return. Empty text matches displayed emptiness only.
+    max_rows limits checked rows (not the client response); max_matches limits returned matches.
+    complete refers only to this table; matches_truncated reports omitted matches. No stable order
+    or row identifiers. Uses read_rows: temporarily selects rows, clears previous selection and
+    may reposition an unavailable cursor on older platforms. Refuses unfinished row edits."""
+    c, error = _need_ver('8.3.6')
+    if error:
+        return error
+    return _row_search.search(sys.modules[__name__], c, key, handle, conditions, columns,
+                              case_sensitive, max_rows, max_matches)
+
 
 @_action('tc_table')
 def tc_copy_row(key: str, handle: str, confirm: bool = None) -> dict:
@@ -2640,6 +2736,26 @@ def _user_messages_result(r):
                     message='The message list could not be read; this does not establish that it is empty.')
     return dict(ok=True, messages=messages)
 
+
+@_action('tc_window')
+def tc_choose_user_message(text: str) -> dict:
+    """Click the first user message matching text in the active window; * and ? are wildcards.
+    Use get_user_message_texts to read the available messages first."""
+    c = _need()
+    wk = _winkey(c)
+    middle = tc1c.mk_command(text)
+    mark = _native_composite_begin(c, 'choose_user_message')
+    try:
+        for kind in ('action', 'commit'):
+            r = c.send_cmd(G.CHOOSE_USER_MESSAGE, wk, kind=kind, middle=middle)
+            if not r['ok']:
+                return {'ok': False}
+    finally:
+        if mark is not None:
+            _native_composite_end(c, mark, 'choose_user_message')
+    _state['window_key'] = None
+    return {'ok': True}
+
 @_action('tc_window')
 def tc_answer_dialog(confirm: bool = True, timeout: int = 5) -> dict:
     """Answer a modal Yes/No question raised by the configuration. The question is an ordinary window
@@ -2907,6 +3023,12 @@ def _area_action_window(c):
     except Exception:
         return None
 
+def _clear_pending_area_edit(c, key):
+    getattr(c, '_pending_area_edits', set()).discard(key)
+    if getattr(c, '_pending_text_input', None) == key:
+        c._pending_text_input = None
+
+
 @_action('tc_doc')
 def tc_end_edit_current_area(key: str, handle: str, cancel: bool = False) -> dict:
     """Finish editing the current spreadsheet-document area. Set cancel to discard the edit
@@ -2919,9 +3041,7 @@ def tc_end_edit_current_area(key: str, handle: str, cancel: bool = False) -> dic
     for kind in ('action', 'commit'):
         ok = c.send_cmd(G.END_EDIT_CURRENT_AREA, key, kind=kind, middle=mid, handle=handle)['ok'] and ok
     if ok:
-        getattr(c, '_pending_area_edits', set()).discard(key)
-        if getattr(c, '_pending_text_input', None) == key:
-            c._pending_text_input = None
+        _clear_pending_area_edit(c, key)
     return {'ok': ok, 'target': key, 'cancelled': bool(cancel)}
 
 @_action('tc_doc')
@@ -3793,6 +3913,8 @@ def _synth_dec_int(b):
 def _synth_step(guid, key, middle):
     """(guid, key, middle) -> (tag, attrs, fields) для uilog, либо None (не действие сценария)."""
     m = middle or b''
+    if guid == G.CHOOSE_USER_MESSAGE:
+        return ('chooseUserMessage', {'text': _synth_dec_str(m)}, None)
     if guid == _batches.CHECKED_STEP:
         return ('setChecked', {'checked': 'true' if m == b'1' else 'false'}, None)
     def after(pfx): return m[len(pfx):] if m.startswith(pfx) else m
@@ -4019,6 +4141,9 @@ def _synth_uilog(tracked):
             attrs, files = _synth_fdr(mid or b'') if guid == G.SET_FILE_DIALOG_RESULT else ({}, [])
             parsed.append({'winnav': _SYNTH_COMMIT_ONLY[guid], 'attrs': attrs,
                            'children': [('File', {'name': f}) for f in files]}); continue
+        if guid == G.CHOOSE_USER_MESSAGE:
+            parsed.append({'winnav': 'chooseUserMessage', 'attrs': {'text': _synth_dec_str(mid)}})
+            continue
         if guid in _SYNTH_WINLEVEL:
             parsed.append({'winnav': _SYNTH_WINLEVEL[guid],
                            'attrs': {'native': 'true'} if guid == G.CLOSE and mid == b'\xe2' else {}}); continue
@@ -4403,14 +4528,24 @@ def _name_matcher(pattern):
 
 def _search_objects(c, root_key=None):
     """Одна попытка нативного FindObjects; фильтры MCP применяются к этому ответу."""
-    start = root_key or _window(c)['key']
-    if not start:
+    application = root_key is _APPLICATION_ROOT
+    start = None if application else root_key or _window(c)['key']
+    if not start and not application:
         return []
+    windows = []
+    if application:
+        # An unfiltered native application search returns form elements, but omits
+        # the windows returned by its typed window search. Include the root collection
+        # so local class/title filtering cannot silently lose those native targets.
+        r = c.send_cmd(G.GET_CHILD_OBJECTS, None, kind='read', middle=CHILD_MIDDLE)
+        if not r.get('ok'):
+            raise RuntimeError('Could not read application windows; retry the search.')
+        windows = _coll(r)
     r = c.send_cmd(G.GET_CHILD_OBJECTS, start, kind='read', middle=FIND_MIDDLE)
     if not r.get('ok'):
         raise RuntimeError('Could not read the search result; retry the search.')
     seen = {start}; out = []
-    for item in _coll(r, start):
+    for item in windows + _coll(r, start):
         key = item.get('key')
         if key and key not in seen:
             seen.add(key)
@@ -4441,8 +4576,9 @@ def _find(c, name=None, cls=None, type=None, root_key=None, title=None, seen_cla
         # form_name добавляется ОТДЕЛЬНО и только при наличии ключа: у прочих классов его нет, и
         # общий it.get поставил бы null в каждую строку каждой выдачи. Способ сборки остальных
         # шести полей не трогаем — иначе изменились бы и ответы, где ни одной формы нет
-        if 'form_name' in it:
-            row['form_name'] = it['form_name']
+        for field in ('form_name', 'url', 'home_page', 'is_main'):
+            if field in it:
+                row[field] = it[field]
         res.append(row)
     return res
 
@@ -4462,7 +4598,8 @@ def _find_wait(c, name=None, cls=None, type=None, root_key=None, title=None, tim
 
 @_action('tc_find')
 def tc_find_objects(name: str = None, cls: str = None, type: str = None, root_key: str = None,
-                    title: str = None, timeout: int = 0) -> dict:
+                    title: str = None, timeout: int = 0,
+                    scope: typing.Literal['window', 'application'] = 'window') -> dict:
     """Find all objects in the UI tree matching the criteria. name and title take the wildcards * and
     ?; cls is the class and type is the platform's element kind (both as reported by
     tc_get_child_objects, e.g. CheckBoxField or Popup); root_key is where to start (default: the
@@ -4470,8 +4607,14 @@ def tc_find_objects(name: str = None, cls: str = None, type: str = None, root_ke
     single pass). An empty result is not an error, so ok stays true. When nothing matched and a
     cls or type was given, the answer also says whether the server knows that filter and what
     was actually present, so a misspelling is distinguishable from an object that never
-    appeared."""
+    appeared. scope=application searches across application windows; omit root_key in this scope.
+    Window and command-button results include url when available."""
     c = _need()
+    if scope not in ('window', 'application') or (scope == 'application' and root_key):
+        return {'ok': False, 'code': 'invalid_argument',
+                'error': 'Use scope=application without a search root, or scope=window with an optional root.'}
+    if scope == 'application':
+        root_key = _APPLICATION_ROOT
     seen_c = set() if cls else None
     seen_t = set() if type else None
     objs = _find_wait(c, name, cls, type, root_key, title, timeout,
@@ -4489,10 +4632,16 @@ def tc_find_objects(name: str = None, cls: str = None, type: str = None, root_ke
 
 @_action('tc_find')
 def tc_find_object(name: str = None, cls: str = None, type: str = None, root_key: str = None,
-                   title: str = None, timeout: int = 0) -> dict:
+                   title: str = None, timeout: int = 0,
+                   scope: typing.Literal['window', 'application'] = 'window') -> dict:
     """Find the first object matching the criteria (parameters as in tc_find_objects). When
     nothing matched, the answer carries the same filter diagnostics as tc_find_objects."""
     c = _need()
+    if scope not in ('window', 'application') or (scope == 'application' and root_key):
+        return {'ok': False, 'code': 'invalid_argument',
+                'error': 'Use scope=application without a search root, or scope=window with an optional root.'}
+    if scope == 'application':
+        root_key = _APPLICATION_ROOT
     seen_c = set() if cls else None
     seen_t = set() if type else None
     res = _find_wait(c, name, cls, type, root_key, title, timeout,
@@ -4879,6 +5028,8 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
                            guarded=True)['ok'] and ok
         finally:
             _obs['busy'] = False
+        if ok and guid == G.END_EDIT_CURRENT_AREA:
+            _clear_pending_area_edit(c, key)
         if desc is not None:
             _obs['v'] = (desc, before,
                          _observe_guid(c, guid, key, handle, _obs['args'], prepared=desc)[1])
@@ -5220,6 +5371,11 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
             wk = _winkey(c); ok = True
             for kind in ('action', 'commit'):
                 ok = _send(G.CLOSE_USER_MESSAGES_PANEL, wk, kind=kind, middle=b'')['ok'] and ok
+            _step({'target': '<window>', 'action': tag, 'ok': ok})
+        elif tag == 'chooseUserMessage':
+            ok = _ac(G.CHOOSE_USER_MESSAGE, _winkey(c), None,
+                     tc1c.mk_command(node.get('text', '')))
+            _state['window_key'] = None
             _step({'target': '<window>', 'action': tag, 'ok': ok})
         elif tag == 'setFileDialogResult':
             want = node.get('result', 'true') != 'false'
@@ -5972,6 +6128,8 @@ def _common_hint(group, acts, published):
 
 def _public_parameters(fn):
     for p in inspect.signature(fn).parameters.values():
+        if fn.__name__ in ('tc_connect', 'tc_launch_client') and p.name in ('port', 'base'):
+            p = p.replace(default=None)
         if fn.__name__ in ('tc_read_fields', 'tc_set_fields') and p.name in ('targets', 'entries'):
             p = p.replace(annotation=_batches.public_type(p.name, _response.REF_MODE))
         if _response.REF_MODE == 'id':
@@ -5980,6 +6138,8 @@ def _public_parameters(fn):
             if p.name in ('key', 'root_key'):
                 p = p.replace(name='ref' if p.name == 'key' else 'root_ref')
         yield p
+    if fn.__name__ in ('tc_connect', 'tc_launch_client'):
+        yield inspect.Parameter('profile', inspect.Parameter.KEYWORD_ONLY, default=None, annotation=str)
 
 
 # These operations need explicit address instructions; their common descriptions
@@ -6107,7 +6267,86 @@ def _ref_live_object(c, key):
     return next((o for o in candidates if o.get('key') == key), None)
 
 
+_LOG_CHANGING = _VERIFY_ACTIONS | frozenset({
+    'connect', 'launch_client', 'disconnect', 'stop_client', 'close_window', 'activate_window',
+    'goto_next_window', 'goto_previous_window', 'goto_start_page',
+    'execute_command', 'answer_dialog', 'close_user_messages_panel', 'choose_user_message',
+    'set_fields', 'set_row_values', 'add_rows', 'set_cell_text', 'set_area_text', 'run_scenario',
+    'read_rows', 'find_rows', 'create_snapshot', 'compare_snapshot', 'get_context',
+})
+
+
+def _logging_targets(arguments):
+    """Resolve journal addresses without changing LRU order or sending 1C requests."""
+    registry = getattr(_state.get('client'), '_object_handles', None)
+    out = {}
+    def visit(value):
+        if isinstance(value, dict):
+            for name, item in value.items():
+                if name in ('ref', 'root_ref') and isinstance(item, str) and isinstance(registry, _refs.Registry):
+                    key = registry._keys.get(item)
+                    if key is not None:
+                        out[item] = {'key': key, 'handle': registry._entries[key][1]}
+                elif name in ('key', 'root_key') and isinstance(item, str):
+                    out[item] = {'key': item, 'handle': value.get('handle')}
+                elif name in ('targets', 'entries'):
+                    visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+    visit(arguments)
+    return out
+
+
 def _dispatch_connected_action(acts, group, kw, connection_id=None):
+    action = kw.get('action')
+    if not LOGGING or action in _call_logging.ACTIONS:
+        return _dispatch_connected_action_impl(acts, group, kw, connection_id)
+    journal = _state.get('_call_journal')
+    if journal is None and _log_auto_start:
+        tc_start_logging()
+        journal = _state.get('_call_journal')
+    call = None
+    if journal is not None and journal.active:
+        try:
+            call = journal.begin(group, action, dict(kw), _logging_targets(kw))
+        except Exception:
+            journal.pause('log_write_failed')
+    token = _call_logging.CURRENT.set(call)
+    try:
+        return _dispatch_connected_action_impl(acts, group, kw, connection_id)
+    except Exception as exc:
+        _call_logging.observe(_profiles.redact({'ok': False, 'exception': type(exc).__name__, 'error': str(exc)}))
+        raise
+    finally:
+        _call_logging.CURRENT.reset(token)
+        if call is not None:
+            try:
+                result = call['result']
+                failed = isinstance(result, dict) and result.get('ok') is False
+                capture = None
+                if journal.mode == 'all' or (journal.mode == 'actions' and (action in _LOG_CHANGING or failed)):
+                    def capture():
+                        return _screenshots.capture(_state.get('client'))
+                journal.finish(call, capture)
+            except Exception:
+                journal.pause('log_write_failed')
+        stop_reason = None
+        if _state.get('client') is None:
+            if action in ('disconnect', 'stop_client'):
+                stop_reason = action
+            elif action in ('connect', 'launch_client') and not _state.get('launched_pid'):
+                # Pool.finish will discard this connection. Finish its journal first,
+                # after recording the failed call, so retention can reclaim it.
+                stop_reason = action + '_failed'
+        if journal is not None and stop_reason is not None:
+            try:
+                journal.stop(reason=stop_reason)
+            except Exception:
+                journal.pause('log_write_failed')
+
+
+def _dispatch_connected_action_impl(acts, group, kw, connection_id=None):
     name = kw.pop('action', None)
     fn = acts.get(name)
     if fn is None:
@@ -6136,6 +6375,7 @@ def _dispatch_connected_action(acts, group, kw, connection_id=None):
             metadata = dict(res.metadata)
             if connection_id is not None:
                 metadata['connection_id'] = connection_id
+            _call_logging.observe(metadata, res)
             message = _response.respond(metadata)
             if not isinstance(message, str):
                 message = json.dumps(message, ensure_ascii=False)
@@ -6158,6 +6398,10 @@ def _dispatch_connected_action(acts, group, kw, connection_id=None):
         res = {**res, 'connection_id': connection_id}
         if name in ('set_cell_text', 'get_cell_text') and isinstance(res.get('suggested_call'), dict):
             res['suggested_call']['arguments']['connection_id'] = connection_id
+    if name in ('connect', 'launch_client') and _state.get('profile') and isinstance(res, dict):
+        res['profile'] = _state['profile']
+    res = _profiles.redact(res)
+    _call_logging.observe(res)
     return _response.respond(res, addrs=('tc_' + name) in _response.ADDR_TOOLS)
 
 
@@ -6166,15 +6410,23 @@ def _dispatch_action(acts, group, kw):
     name = kw.get('action')
     connection_id = kw.pop('connection_id', None)
     connection = None
+    profile = None
+    password_token = None
     try:
         if name not in acts:
             return _dispatch_connected_action(acts, group, kw)
-        if name == 'list_connections':
+        if name in ('list_connections', 'list_profiles'):
             if connection_id is not None:
-                raise _connections.ConnectionError('invalid_connection_id', 'list_connections lists all connections; omit connection_id.')
+                raise _connections.ConnectionError('invalid_connection_id', f'{name} does not select a connection; omit connection_id.')
+            if name == 'list_profiles':
+                return _dispatch_connected_action_impl(acts, group, kw)
             return _dispatch_connected_action(acts, group, kw)
         if name in ('connect', 'launch_client'):
             args = {k: v for k, v in kw.items() if k != 'action' and v is not None}
+            args, profile = _profiles.resolve(name, args)
+            kw = {'action': name, **args}
+            if profile is not None:
+                password_token = _profiles.PASSWORD.set(args.get('password'))
             bound = inspect.signature(acts[name]).bind(**args)
             bound.apply_defaults()
             params = bound.arguments
@@ -6188,20 +6440,29 @@ def _dispatch_action(acts, group, kw):
             refs.extend(_batches.refs(name, kw))
             connection = _pool.select(connection_id, refs, stop=name == 'stop_client')
         with _pool.use(connection):
+            previous_profile = _state.get('profile')
+            previous_client = _state.get('client')
+            if profile is not None:
+                _state['profile'] = profile
             try:
                 return _dispatch_connected_action(acts, group, kw, connection.id if connection else None)
             except Exception as exc:
                 if name not in ('connect', 'launch_client'): raise
-                return _response.respond({'ok': False, 'code': 'connection_failed', 'error': str(exc),
-                                          'connection_id': connection.id})
+                return _response.respond(_profiles.redact({'ok': False, 'code': 'connection_failed', 'error': str(exc),
+                                          'connection_id': connection.id}))
             finally:
+                if profile is not None and name == 'connect' and _state.get('client') is previous_client:
+                    _state['profile'] = previous_profile
                 if name in ('connect', 'launch_client', 'disconnect', 'stop_client'):
                     _pool.finish(connection)
-    except _connections.ConnectionError as exc:
+    except (_connections.ConnectionError, _profiles.ProfileError) as exc:
         result = {'ok': False, 'code': exc.code, 'error': str(exc)}
         if exc.code in ('connection_required', 'connection_not_found', 'not_connected'):
             result['connections'] = _pool.list()
-        return _response.respond(result)
+        return _response.respond(_profiles.redact(result))
+    finally:
+        if password_token is not None:
+            _profiles.PASSWORD.reset(password_token)
 
 
 def _register_groups():
@@ -6212,7 +6473,8 @@ def _register_groups():
     for group, actions in _ACTIONS.items():
         acts = {a: fn for a, fn in actions.items()
                 if not (tv and _ver_tuple(TOOL_MIN_VERSION.get('tc_' + a, '')) > tv)
-                and (a != 'get_screenshot' or SCREENSHOTS)}
+                and (a != 'get_screenshot' or SCREENSHOTS)
+                and (a not in _call_logging.ACTIONS or LOGGING)}
         if acts:
             published[group] = acts        # группа без доступных действий не публикуется вовсе
     pub_group = {a: g for g, acts in published.items() for a in acts}
@@ -6283,7 +6545,14 @@ def main():
         else:
             mcp.run()
     finally:
-        _pool.close()
+        try:
+            for connection in list(_pool.entries.values()):
+                with _pool.use(connection):
+                    journal = _state.get('_call_journal')
+                    if journal is not None:
+                        journal.stop(reason='server_stopped')
+        finally:
+            _pool.close()
 
 if __name__ == '__main__':
     main()

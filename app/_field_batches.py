@@ -249,6 +249,37 @@ def read_fields(S, entries, properties):
     return out
 
 
+def form_closed(S, c, form_key):
+    """Only successful enumeration can establish closure; an inactive form is still open."""
+    if not form_key or not S._guid_available(c, S.G.GET_CHILD_OBJECTS):
+        return False
+    window = S._collection_parent(form_key)
+    roots = S._read_children(c, None)
+    if not roots.get('ok'):
+        return False
+    if not any(o.get('key') == window for o in S._coll(roots, remember=False)):
+        return True
+    forms = S._read_children(c, window)
+    return bool(forms.get('ok') and not any(
+        o.get('key') == form_key for o in S._coll(forms, window, remember=False)))
+
+
+def ensure_area_pending(S, c, active_form):
+    """Forget edits only when their form is confirmed closed, without changing focus."""
+    closed = {}
+    for key in tuple(getattr(c, '_pending_area_edits', ())):
+        form_key = owner(S, key)
+        if form_key not in closed:
+            try:
+                closed[form_key] = form_key != active_form and form_closed(S, c, form_key)
+            except Exception:
+                closed[form_key] = False
+        if closed[form_key]:
+            S._clear_pending_area_edit(c, key)
+    if getattr(c, '_pending_area_edits', None):
+        raise Failure('input_pending', 'Finish or cancel the existing document edit before reading table rows.')
+
+
 def ensure_pending(S, c, allowed):
     pending = getattr(c, '_pending_text_input', None)
     if pending and pending != allowed:
@@ -265,19 +296,9 @@ def ensure_pending(S, c, allowed):
                 return
         # Absence from a successfully read collection establishes closure. A failed
         # lookup, another active window or a preview alone does not establish it.
-        if form_key and form is None and S._guid_available(c, S.G.GET_CHILD_OBJECTS):
-            window = S._collection_parent(form_key)
-            roots = S._read_children(c, None)
-            if roots.get('ok'):
-                windows = S._coll(roots, remember=False)
-                absent = not any(o.get('key') == window for o in windows)
-                if not absent:
-                    forms = S._read_children(c, window)
-                    absent = forms.get('ok') and not any(
-                        o.get('key') == form_key for o in S._coll(forms, window, remember=False))
-                if absent:
-                    c._pending_text_input = None
-                    return
+        if form is None and form_closed(S, c, form_key):
+            c._pending_text_input = None
+            return
         raise Failure('input_pending', 'Finish or cancel the existing field input before filling other fields.')
 
 

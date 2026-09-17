@@ -3,6 +3,7 @@
 Сгенерированный файл — не редактировать вручную."""
 
 TOOL_MIN_VERSION = {
+    'tc_choose_user_message':                '8.3.3',
     'tc_activate_window':                    '8.3.3',
     'tc_begin_edit_current_area':            '8.3.1',
     'tc_calendar_next_month':                '8.3.1',
@@ -111,6 +112,7 @@ TOOL_MIN_VERSION = {
     'tc_open_field':                         '8.3.1',
     'tc_read_fields':                        '8.3.12',
     'tc_read_rows':                          '8.3.6',
+    'tc_find_rows':                          '8.3.6',
     'tc_record_cancel':                      '8.3.2',
     'tc_record_finish':                      '8.3.2',
     'tc_record_pause':                       '8.3.2',
@@ -139,6 +141,7 @@ TOOL_MIN_VERSION = {
 }
 
 GUID_MIN_VERSION = {
+    '34768fe8-4493-45d5-8f6f-6b67ff84b037': '8.3.3',
     '3ddbc6b6-bef1-4a8b-962f-f762cecf6caa': '8.3.1',
     '318d6f6b-a021-42b0-acf8-125671dfa516': '8.3.3',
     '76f01cfd-5645-4ca0-92ba-e6f06cb4a879': '8.3.1',

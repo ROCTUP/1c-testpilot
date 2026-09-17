@@ -1,0 +1,27 @@
+profiles:
+  ut_admin:
+    description: Демо УТ, администратор
+    base: 'G:\1C\1C\_DB\УправлениеТорговлей\_Демо'
+    user: Администратор
+    password: ''
+    desktop: isolated
+
+  ut_manager:
+    description: Демо УТ, менеджер
+    base: 'G:\1C\1C\_DB\УправлениеТорговлей\_Демо'
+    user: Менеджер
+    password_env: UT_MANAGER_PASSWORD
+    desktop: isolated
+
+  ut_server:
+    description: УТ, серверная база
+    base: 'server1c\Trade'
+    server: true
+    user: Администратор
+    password_env: UT_SERVER_PASSWORD
+
+  remote_demo:
+    description: Уже запущенный удалённый тест-клиент
+    host: 192.168.1.101
+    port: 1600
+    version: '8.3.27.1859'
