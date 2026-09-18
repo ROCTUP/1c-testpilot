@@ -3932,14 +3932,19 @@ def tc_write_content_to_file(key: str, handle: str, filename: str = None,
 @_action('tc_field')
 def tc_wait_for_drop_list_generation(key: str, handle: str, timeout: int = 60) -> dict:
     """Wait up to timeout seconds for a drop-down list to be generated.
+    timeout must be an integer from 0 to 65535.
     Returns generated=True if a list appeared within the timeout, else False. The answer is not
     tied to the element you addressed — it can come back true before this field's list is open at
     all, the same way get_choice_list describes. Open the list on the field you care about first
     (tc_field(action="open_drop_list")) and read it right after."""
+    try:
+        middle = tc1c.mk_wait(timeout)
+    except ValueError as exc:
+        return {'ok': False, 'code': 'invalid_timeout', 'error': str(exc)}
     c = _need()
     # ответ придёт только по окончании ожидания на клиенте -> ждём его дольше самого ожидания
-    r = c.send_cmd(G.WAIT_FOR_DROP_LIST_GENERATION, key, kind='wait', middle=tc1c.mk_wait(timeout),
-                   handle=handle, timeout=max(int(timeout), 0) + tc1c.TestClient.RECV_TIMEOUT)
+    r = c.send_cmd(G.WAIT_FOR_DROP_LIST_GENERATION, key, kind='wait', middle=middle,
+                   handle=handle, timeout=timeout + tc1c.TestClient.RECV_TIMEOUT)
     return {'ok': r['ok'], 'target': key, 'timeout': timeout, 'generated': _scalar(r, tc1c.decode_bool)}
 
 @_action('tc_doc')
