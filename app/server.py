@@ -3867,7 +3867,10 @@ def tc_write_content_to_file(key: str, handle: str, filename: str = None,
     it with file_format. Without either option the dialog's first file type is selected.
     Without filename, saves under the current name unless save_as=true. If a dialog can appear,
     prepare it before EACH call using tc_app(action="set_file_dialog_result").
-    ok confirms that the save request was accepted, not that a file has finished writing."""
+    ok confirms that the save request was accepted, not that a file has finished writing.
+    A later cleanup failure is reported in cleanup_error with dialog_answer_cleared=false;
+    it does not change the save result. Before the next save, use
+    tc_app(action="clear_file_dialog_result") to clear pending answers."""
     c = _need()
     kind = _kind_of(c, key)
     if kind not in _WRITE_KINDS:
@@ -3922,12 +3925,18 @@ def tc_write_content_to_file(key: str, handle: str, filename: str = None,
                             middle=b'\xe2' if use_save_as else RS, handle=handle)['ok'] and ok
         out['ok'] = ok
         return out
+    except tc1c.OperationError as exc:
+        out.update(exc.result())
+        return out
     finally:
         if filename and can_clear:
-            cleaned = c.send_cmd(G.CLEAR_FILE_DIALOG_RESULT, None, kind='commit', middle=b'')
+            try:
+                cleaned = c.send_cmd(G.CLEAR_FILE_DIALOG_RESULT, None, kind='commit', middle=b'')
+            except Exception as exc:
+                cleaned = {'ok': False, 'error': str(exc)}
             out['dialog_answer_cleared'] = cleaned['ok']
             if not cleaned['ok']:
-                out.update(ok=False, error='the pending file-dialog answer could not be cleared')
+                out['cleanup_error'] = cleaned.get('error') or 'the pending file-dialog answer could not be cleared'
 
 @_action('tc_field')
 def tc_wait_for_drop_list_generation(key: str, handle: str, timeout: int = 60) -> dict:
