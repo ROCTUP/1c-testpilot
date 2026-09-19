@@ -15,6 +15,7 @@ import uuid
 ACTIONS = frozenset({'start_logging', 'stop_logging', 'get_logging_status'})
 MODES = ('off', 'actions', 'all')
 CURRENT = ContextVar('testpilot_logged_call', default=None)
+WAIT = ContextVar('testpilot_logged_wait', default=None)
 _SECRET_KEYS = {'password', 'pwd', 'secret', 'token', 'authorization', 'auth'}
 
 
@@ -73,9 +74,11 @@ header h1{font-size:26px;line-height:1.3;margin:0 0 18px;letter-spacing:-.4px}
 @media(max-width:600px){header h1{font-size:22px}.search-box{flex-basis:100%}.error-filter{flex:1}.header-note{flex-direction:column}}
 article{border:1px solid #ccd3dd;border-radius:8px;padding:16px;margin:16px 0}
 article.failed{border-left:5px solid #b42318}summary{cursor:pointer}
+.wait-probe{margin:12px 0;padding:12px;border:1px solid #dce2ea;border-radius:8px}
+article.waiting{border-left:5px solid #64748b}
 .call-title{font-size:18px}.call-meta{display:block;margin-top:10px}.call-body{margin-top:12px}
-pre{white-space:pre-wrap;word-break:normal;overflow-wrap:anywhere;font-size:13px}
-.json-line{display:block}
+pre{white-space:break-spaces;word-break:normal;overflow-wrap:anywhere;font-size:13px}
+.json-line{display:block;padding-left:var(--json-indent);text-indent:calc(-1 * var(--json-indent))}
 mark.search-hit{background:#fde68a;color:#182332;border-radius:2px}
 img{max-width:100%;max-height:420px}small{color:#526071}.notice{color:#9d271c}
 .screenshot-link{cursor:zoom-in}
@@ -230,25 +233,28 @@ document.addEventListener('fullscreenchange',updateFullscreenButton);
 def json_block(value):
     lines = []
     for line in json.dumps(value, ensure_ascii=False, indent=2).splitlines():
-        # Continue below the value, leaving the property names at the left edge.
+        # Keep a hanging indent without letting long object-address keys fill the block.
         key = re.match(r'^\s*"(?:[^"\\]|\\.)*":\s*', line)
         leading = len(line) - len(line.lstrip(' '))
-        indent = max(leading + 8, key.end() + 1 if key else 0)
+        indent = min(24, max(leading + 8, key.end() + 1 if key else 0))
         content = re.sub(r'([.\-\u2013\u2014])', r'\1<wbr>', html.escape(line, quote=True))
-        lines.append(f'<span class="json-line" style="padding-left:{indent}ch;text-indent:-{indent}ch">'
+        lines.append(f'<span class="json-line" style="--json-indent:min({indent}ch,20vw)">'
                      + content + '</span>')
     return '<pre>' + ''.join(lines) + '</pre>'
 
 
-def card(event):
+def card(event, probe=False):
     esc = lambda v: html.escape(str(v), quote=True)
     result = event['result']
     failed = isinstance(result, dict) and (result.get('ok') is False or 'exception' in result)
-    text = (f'<article class="{"failed" if failed else "passed"}"><details class="call" open>'
+    tag = 'div' if probe else 'article'
+    state = 'wait-probe' if probe else ('failed' if failed else 'passed')
+    status = 'Проверка' if probe else ('Ошибка' if failed else 'Ответ получен')
+    text = (f'<{tag} class="{state}"><details class="call" open>'
             f'<summary><strong class="call-title">#{event["call_id"]} '
             f'{esc(event["tool"])} / {esc(event["action"])}</strong><small class="call-meta">'
             f'{esc(event["time"])} · {esc(event["connection_id"])} · '
-            f'{event["duration_ms"]} мс · {"Ошибка" if failed else "Ответ получен"}</small></summary>'
+            f'{event["duration_ms"]} мс · {status}</small></summary>'
             '<div class="call-body">')
     for label, key in [('Параметры', 'arguments'), ('Адреса элементов', 'targets'), ('Результат', 'result')]:
         text += f'<details><summary>{label}</summary>{json_block(event.get(key, {}))}</details>'
@@ -258,7 +264,7 @@ def card(event):
         text += f'<p><a class="screenshot-link" href="{path}" target="_blank"><img loading="lazy" src="{path}" alt="Состояние после вызова"></a></p>'
     if shot:
         text += '<details><summary>Захват экрана</summary>' + json_block(shot) + '</details>'
-    return (text + '</div></details></article>\n').encode('utf-8')
+    return (text + f'</div></details></{tag}>\n').encode('utf-8')
 
 
 class Journal:
@@ -289,6 +295,9 @@ class Journal:
         self.calls += 1
         call = dict(event='start', call_id=self.calls, time=now(), connection_id=self.connection_id,
                     tool=tool, action=action, arguments=clean(arguments), targets=clean(targets))
+        waiting = WAIT.get()
+        if waiting is not None and waiting[0] is self:
+            call['wait_id'] = waiting[1]
         if not self.store.append(self, 'events.jsonl', encode(call)):
             return None
         return dict(call, clock=time.monotonic(), result=None, picture=None)
@@ -302,7 +311,9 @@ class Journal:
         if not self.store.append(self, 'events.jsonl', encode(event)):
             return
         self.completed += 1
-        if capture is not None or (self.mode != 'off' and call['picture'] is not None):
+        # Polling belongs to one wait step, not to the screenshot timeline.
+        # In particular, an expected missing window must not trigger capture.
+        if 'wait_id' not in call and (capture is not None or (self.mode != 'off' and call['picture'] is not None)):
             shot = {'captured_at': now()}
             try:
                 picture = call['picture'] if call['picture'] is not None else capture()
@@ -318,7 +329,35 @@ class Journal:
             event['screenshot'] = shot
             if not self.store.append(self, 'events.jsonl', encode(dict(event='screenshot', call_id=call['call_id'], **shot))):
                 return
-        self.store.append(self, 'report.html', card(event))
+        self.store.append(self, 'report.html', card(event, probe='wait_id' in event))
+
+    def begin_wait(self, description, timeout, interval):
+        identity = 'wait-' + uuid.uuid4().hex
+        event = dict(event='wait_start', wait_id=identity, time=now(),
+                     connection_id=self.connection_id, description=description,
+                     timeout=timeout, interval=interval)
+        self.store.append(self, 'events.jsonl', encode(event))
+        heading = (f'<article id="{identity}" class="waiting"><details class="call" open>'
+                   f'<summary><strong class="call-title">{html.escape(description)}</strong>'
+                   '<small class="call-meta">Ожидание выполняется</small></summary>'
+                   '<details><summary>Подробности проверок</summary>\n')
+        self.store.append(self, 'report.html', heading.encode('utf8'))
+        return identity
+
+    def finish_wait(self, identity, result, attempts, seconds):
+        event = dict(event='wait_finish', wait_id=identity, time=now(),
+                     connection_id=self.connection_id, result=clean(result),
+                     attempts=attempts, duration_ms=round(seconds * 1000))
+        self.store.append(self, 'events.jsonl', encode(event))
+        failed = not result.get('ok')
+        status = 'Ошибка ожидания' if failed else 'Ожидание завершено'
+        summary = json.dumps(f'{status} · {seconds:.2f} с · Проверок: {attempts}', ensure_ascii=False)
+        ending = ('</details><details><summary>Результат ожидания</summary>'
+                  + json_block(result) + '</details></details></article>\n'
+                  + f'<script>(()=>{{const e=document.getElementById("{identity}");'
+                  + f'e.className="{"failed" if failed else "passed"}";'
+                  + f'e.querySelector(".call-meta").textContent={summary};}})();</script>\n')
+        self.store.append(self, 'report.html', ending.encode('utf8'))
 
     def stop(self, reason='stopped'):
         if self.active:
@@ -331,7 +370,7 @@ class Journal:
 
 
 class Store:
-    def __init__(self, root=None, max_bytes=None, screenshots=None):
+    def __init__(self, root=None, max_bytes=None, screenshots=None, default_mode=None):
         self.root = Path(root or os.environ.get('TC1C_LOG_DIR', 'logs')).expanduser().absolute()
         try:
             self.max_bytes = max_bytes if max_bytes is not None else int(os.environ.get('TC1C_LOG_MAX_MB', '1024')) * 1024 * 1024
@@ -340,6 +379,9 @@ class Store:
         if not isinstance(self.max_bytes, int) or isinstance(self.max_bytes, bool) or self.max_bytes <= 0:
             raise ValueError('TC1C_LOG_MAX_MB must be a positive integer')
         self.screenshots = enabled('TC1C_LOG_SCREENSHOTS') if screenshots is None else screenshots
+        self.default_mode = default_mode
+        if default_mode is not None and default_mode not in MODES:
+            raise ValueError('default_mode must be off, actions or all')
         self.lock = threading.RLock()
         self.active = set()
         self.total = None
@@ -419,7 +461,7 @@ class Store:
                 return False
 
     def start(self, connection_id, mode=None):
-        mode = mode or ('actions' if self.screenshots else 'off')
+        mode = mode or self.default_mode or ('actions' if self.screenshots else 'off')
         if mode not in MODES:
             return {'ok': False, 'code': 'invalid_logging_mode', 'error': 'screenshot_mode must be off, actions or all.'}
         if mode != 'off' and not self.screenshots:

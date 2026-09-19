@@ -129,7 +129,7 @@ def run(S, key=None, save_as_snapshot=False, include_tables=False, max_rows=500)
                       **context, complete=not errors, errors=errors)
         if include_tables:
             result['table_rows'] = list(current['tables'].values())
-        if S._response.REF_MODE == 'id':
+        if S._address_mode() == 'id':
             registry = S._refs.for_client(c)
             if len(S._refs.context_pairs(result, registry)) > registry.limit:
                 raise S._refs.RefError('ref_limit_exceeded',
@@ -137,7 +137,7 @@ def run(S, key=None, save_as_snapshot=False, include_tables=False, max_rows=500)
         if save_as_snapshot:
             owner, generation, connection_id = snapshots.identity(S)
             try:
-                saved = S._snapshot_store.add(owner, generation, connection_id, form, current)
+                saved = S._snapshot_storage().add(owner, generation, connection_id, form, current)
                 result.update(snapshot_id=saved['snapshot_id'], snapshot_complete=current['complete'])
             except snapshots.Failure as exc:
                 result['snapshot_error'] = dict(code=exc.code, message=str(exc))

@@ -327,7 +327,8 @@ def mk_cell(column):
 
 def mk_set_file_dialog_result(result, filename=None, filter_index=0):
     """Аргумент SetFileDialogResult (kind=commit, nil-ключ, pad=4):
-      Истина -> e2 <0x81+ИндексФильтра> <0x81+ЧислоИмён> <имя1 семейства d_> <имя2..N семейства 9_>
+      Истина -> e2 <ИндексФильтра> <ЧислоИмён> <имя1 семейства d_> <имя2..N семейства 9_>
+      Числа 0..9 — короткий тег 0x81+N; большие — enc_int.
       Ложь   -> e1 81 82 c1 (имя/индекс игнорируются).
     filename: строка (одно имя) либо список/кортеж имён — имитация множественного выбора;
     список из одного имени даёт тот же кадр, что одиночная строка."""
@@ -336,7 +337,9 @@ def mk_set_file_dialog_result(result, filename=None, filter_index=0):
     names = [filename or ''] if isinstance(filename, str) or filename is None else list(filename)
     if not names:
         names = ['']
-    out = b'\xe2' + bytes([0x81 + (filter_index or 0)]) + bytes([0x81 + len(names)])
+    index = filter_index or 0
+    out = b'\xe2' + (bytes([0x81 + index]) if 0 <= index <= 9 else enc_int(index))
+    out += bytes([0x81 + len(names)]) if len(names) <= 9 else enc_int(len(names))
     out += _enc_like(0xd0, names[0])                       # первое имя — семейство d_
     for n in names[1:]:
         out += _enc_like(0x90, n)                          # последующие — семейство 9_
@@ -447,6 +450,27 @@ def empty_current_form_item(raw):
     """Recognize an explicit absent current item, not a failed object scan."""
     p = _reply_status_offset(raw, 'cf73f146-1108-428c-b89e-9790567846c4')
     return p is not None and raw[p:] == b'\x81\x81\x81\xe0\x4b\x55\x20\x20\xa1\xa3' + TR
+
+
+class ConnectionFailure(RuntimeError):
+    """A failed connection with the endpoint and original failure preserved."""
+    def __init__(self, host, port, stage, message, cause=None, attempts=None):
+        self.host, self.port, self.stage = host, port, stage
+        self.cause, self.attempts = cause, attempts
+        super().__init__('%s handshake failed: %s (host=%s, port=%s)' %
+                         (stage, message, host, port))
+
+    def result(self):
+        out = dict(ok=False, code='connection_failed', error=str(self),
+                   host=self.host, port=self.port, stage=self.stage)
+        if self.cause is not None:
+            out.update(exception_type=type(self.cause).__name__,
+                       reason=str(self.cause) or type(self.cause).__name__)
+            if getattr(self.cause, 'errno', None) is not None:
+                out['errno'] = self.cause.errno
+        if self.attempts is not None:
+            out['attempts'] = self.attempts
+        return out
 
 
 class OperationError(RuntimeError):
@@ -1426,12 +1450,14 @@ class TestClient:
     def _check_handshake_reply(self, frame, stage):
         """SCOM error envelopes are not NTLM tokens, on any handshake stage."""
         body = frame[:-len(TR)] if frame.endswith(TR) else frame
+        if body.startswith(NETWORK_GREETING):
+            body = body[len(NETWORK_GREETING):]
         text = body.decode('utf-8-sig', 'replace')
         if re.match(r'^\{2,[0-9a-fA-F-]{36},', text):
             messages = re.findall(r'"((?:[^"]|"")*)"', text)
             message = next((s.replace('""', '"') for s in messages if s), 'The test client rejected the handshake.')
             self.close()
-            raise RuntimeError('%s handshake failed: %s' % (stage, message))
+            raise ConnectionFailure(self.host, self.port, stage, message)
         return frame
 
     def _handshake_reply(self, stage):
@@ -1490,9 +1516,13 @@ class TestClient:
         def _scom(tok):
             n = num[0]; num[0] += 1
             return build_scom(conn_guid, n, sub_guid, pc, base64.b64encode(tok), ver)
-        for _ in range(retries):
+        last_error = None
+        stage = 'connect'
+        for attempt in range(retries):
             try:
+                stage = 'connect'
                 self.s=socket.create_connection((self.host,self.port),timeout=self._io_timeout(5))
+                stage = 'intro'
                 self._buf=b''; self._pending=0      # новый сокет — прошлый поток кадров не в счёт
                 self._direct_session=False; self._first_binary=False
                 self._handshake_send(_scom(intro_ticket(user, pc))); ack=self._recv(self.CONNECT_TIMEOUT)
@@ -1501,13 +1531,18 @@ class TestClient:
                     ack = self._network_intro(_scom(intro_ticket(user, pc)))
                 self._check_handshake_reply(ack, 'intro')
                 if TR in ack and len(ack)>100: break
+                last_error = ConnectionError('Unexpected intro response (%d bytes).' % len(ack))
                 self.close()
-            except OSError:
+            except OSError as exc:
+                last_error = exc
                 self.close()
                 num[0]=22548
-            time.sleep(self._io_timeout(1))
+            if attempt + 1 < retries:
+                time.sleep(self._io_timeout(1))
         else:
-            raise RuntimeError('intro handshake failed')
+            reason = (type(last_error).__name__ + ': ' + (str(last_error) or 'No response received.')) if last_error else 'No connection attempts were made.'
+            raise ConnectionFailure(self.host, self.port, stage, reason,
+                                    last_error, retries) from last_error
         # The peer may supply a session in intro (native Linux client), or require NTLM.
         self._direct_session = bool(re.search(SESS_BLOCK+rb',\s*\{([0-9a-f-]{36})\}', ack))
         auth = ack

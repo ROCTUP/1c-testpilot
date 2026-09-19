@@ -104,7 +104,7 @@ def resolve_arguments(S, action, kw):
     slot = FIELD_ACTIONS[action]
     if slot not in kw:
         return kw  # The ordinary signature check reports a missing argument.
-    id_mode = S._response.REF_MODE == 'id'
+    id_mode = S._address_mode() == 'id'
     names = ['ref'] if id_mode else ['key', 'handle']
     if action == 'set_fields': names.append('text')
     entries = bounded(kw[slot], names)

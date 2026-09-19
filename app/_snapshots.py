@@ -302,7 +302,7 @@ def run(S, action, key=None, snapshot_id=None, include_tables=False, max_rows=50
         except ValueError as exc:
             return dict(ok=False, code='invalid_argument', error=str(exc))
         owner, generation, connection_id = identity(S)
-        store = S._snapshot_store
+        store = S._snapshot_storage()
         if action == 'delete_snapshot':
             store.delete(snapshot_id, owner)
             return dict(ok=True, deleted_snapshot_id=snapshot_id, storage=store.stats())
@@ -344,7 +344,7 @@ def run(S, action, key=None, snapshot_id=None, include_tables=False, max_rows=50
             if error:
                 return error
         current = capture(S, c, form, **options)
-        if (S._response.REF_MODE == 'id'
+        if (S._address_mode() == 'id'
                 and len({e['key'] for e in current['errors']} | set(current.get('tables', {}))) > S._refs.for_client(c).limit):
             raise Failure('ref_limit_exceeded', 'The snapshot result exceeds TC1C_REF_LIMIT; no snapshot was stored.')
         info = store.add(owner, generation, connection_id, form, current)

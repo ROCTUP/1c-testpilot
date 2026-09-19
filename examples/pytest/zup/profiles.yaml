@@ -1,0 +1,9 @@
+profiles:
+  zup_demo:
+    description: Демо ЗУП — приём нового сотрудника с назначением оклада
+    base: 'G:\1C\1C_DB\HRM_Demo'
+    user: Администратор
+    exe: 'G:\1C\Program Files\1cv8\8.3.27.1936\bin\1cv8.exe'
+    version: '8.3.27.1936'
+    desktop: isolated
+    wait: 120

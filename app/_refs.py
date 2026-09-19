@@ -207,10 +207,9 @@ def present(payload, action, registry):
         objects = [v for v in value if isinstance(v, dict) and _collection.is_object_key(v.get('key'))]
     elif isinstance(value, dict) and _collection.is_object_key(value.get('key')):
         objects = [value]
-    if action == 'set_row_values':
-        objects.extend(v['page'] for v in payload.get('results', [])
-                       if isinstance(v, dict) and isinstance(v.get('page'), dict)
-                       and _collection.is_object_key(v['page'].get('key')))
+    if action == 'set_row_values' and isinstance(value, dict):
+        # The page is failure diagnostics; the table target takes priority.
+        objects = []
     snapshot_slots = ('changes', 'observed', 'added', 'errors', 'tables', 'table_changes') if action in ('create_snapshot', 'compare_snapshot') else ()
     for field in snapshot_slots:
         objects.extend(v for v in payload.get(field, []) if isinstance(v, dict)
@@ -221,8 +220,6 @@ def present(payload, action, registry):
         pairs[obj['key']] = obj.get('handle') or registry.get(obj['key'])
     envelopes = list(_envelopes(payload, action))
     extra_pages = [v['page'] for v in envelopes if isinstance(v.get('page'), dict) and v['page'].get('key')]
-    for obj in extra_pages:
-        pairs[obj['key']] = obj.get('handle') or registry.get(obj['key'])
     # Address echoes at the top level have defined semantics, unlike arbitrary UI data.
     echoes = {}
     echo_fields = ['target', 'parent', 'window']
@@ -264,6 +261,13 @@ def present(payload, action, registry):
             value = {**value, 'key': None, 'reference_status': 'unavailable',
                      'code': 'ref_limit_exceeded',
                      'message': 'The window reference exceeds TC1C_REF_LIMIT. Find the window separately.'}
+    missing_page_refs = set()
+    for obj in extra_pages:
+        key = obj['key']
+        if key in pairs or len(pairs) < registry.limit:
+            pairs[key] = obj.get('handle') or registry.get(key)
+        else:
+            missing_page_refs.add(key)
     # Window observations are optional readback of an already attempted action.
     # Keep the target usable; prefer the current window when only one more ref fits.
     missing_window_refs = []
@@ -284,6 +288,10 @@ def present(payload, action, registry):
                 pairs[obj['key']] = obj.get('handle') or registry.get(obj['key'])
     refs = registry.publish(pairs)
     def node(obj):
+        if isinstance(obj, dict) and obj.get('key') in missing_page_refs:
+            return {'ref': None, **{k: v for k, v in obj.items() if k not in ('key', 'handle')},
+                    'reference_status': 'unavailable', 'code': 'ref_limit_exceeded',
+                    'message': 'The page reference exceeds TC1C_REF_LIMIT. Find the page separately.'}
         if isinstance(obj, dict) and obj.get('key') in missing_cell_refs:
             return {'ref': None, **{k: v for k, v in obj.items() if k not in ('key', 'handle')},
                     'reference_status': 'unavailable', 'code': 'ref_limit_exceeded',

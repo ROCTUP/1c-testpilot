@@ -1,0 +1,5 @@
+{
+  "test": "examples/pytest/zup/test_hire_employee.py::test_hire_employee_with_salary",
+  "outcome": "passed",
+  "cleanup_error": null
+}

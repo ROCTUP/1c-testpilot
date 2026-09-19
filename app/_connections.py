@@ -83,14 +83,18 @@ class Connection:
 
 
 class Pool:
-    def __init__(self, state, limit=None):
+    def __init__(self, state, limit=None, legacy=None):
         self.state = state
+        self.legacy = legacy
         self.limit = int(os.environ.get('TC1C_CONNECTION_LIMIT', '16')) if limit is None else limit
         if isinstance(self.limit, bool) or not isinstance(self.limit, int) or self.limit < 1:
             raise ValueError('TC1C_CONNECTION_LIMIT must be a positive integer')
         self.lock = threading.RLock()
         self.entries = {}
         self.legacy_lock = threading.RLock()
+
+    def legacy_state(self):
+        return self.state.legacy if self.legacy is None else self.legacy
 
     def list(self):
         with self.lock: return [c.info() for c in self.entries.values()]
@@ -145,7 +149,7 @@ class Pool:
                         break
                 if owner is None:
                     # Preserve standalone Python-handler use with its legacy client.
-                    if not self.entries and connection_id is None and self.state.legacy.get('client') is not None:
+                    if not self.entries and connection_id is None and self.legacy_state().get('client') is not None:
                         return None
                     raise ConnectionError('stale_ref', 'Unknown or expired element reference. Find the element again.')
                 owners.add(owner)
@@ -165,7 +169,7 @@ class Pool:
     @contextmanager
     def use(self, connection):
         if connection is None:
-            with self.legacy_lock, self.state.bind(self.state.legacy): yield
+            with self.legacy_lock, self.state.bind(self.legacy_state()): yield
             return
         with connection.lock:
             with self.lock:
@@ -197,14 +201,15 @@ class Pool:
                         continue
                 connection.state.clear()
                 with self.lock: self.entries.pop(connection.id, None)
-        isolated = self.state.legacy.get('_isolated_process')
+        legacy = self.legacy_state()
+        isolated = legacy.get('_isolated_process')
         if isolated is not None:
             try:
                 isolated.close()
-                c = self.state.legacy.get('client')
+                c = legacy.get('client')
                 if c is not None: c.close()
-                self.state.legacy.clear()
-                self.state.legacy.update(empty_state())
+                legacy.clear()
+                legacy.update(empty_state())
             except Exception as exc: failures.append(exc)
         if failures:
             raise OSError('Could not release an isolated client: %s' % failures[0])

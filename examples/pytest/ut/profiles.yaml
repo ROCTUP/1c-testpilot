@@ -1,0 +1,9 @@
+profiles:
+  ut_demo:
+    description: Демо УТ — пример повторного заказа клиента
+    base: 'G:\1C\1C_DB\УправлениеТорговлей_Демо'
+    user: Администратор
+    exe: 'G:\1C\Program Files\1cv8\8.3.27.1936\bin\1cv8.exe'
+    version: '8.3.27.1936'
+    desktop: isolated
+    wait: 120

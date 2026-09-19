@@ -1,0 +1,25 @@
+{
+  "ok": true,
+  "target": "SecondaryFrame[107b28de-ba1c-42a1-a059-d0d31f423c71].ManagedForm[7e96dd0d-ead0-480d-af6b-260072830d38].Group[ФормаКоманднаяПанель].Group[ГруппаКнопкиКоманднойПанели].Group[ФормаПроведение].Button[КомандаПровести]",
+  "window": {
+    "ok": true,
+    "key": "SecondaryFrame[107b28de-ba1c-42a1-a059-d0d31f423c71]",
+    "class": "SecondaryFrame",
+    "title": "Прием на работу 0000-000011 от 01.10.2021",
+    "addressable": true,
+    "url": "e1cib/data/Документ.ПриемНаРаботу?ref=80265464acd0db1411f1b30fdc1378ef",
+    "home_page": false,
+    "is_main": false
+  },
+  "diagnostics": {
+    "status": "unavailable",
+    "messages": null,
+    "messages_scope": "window",
+    "timed_out": true,
+    "code": "user_messages_unavailable",
+    "message": "The message panel is closed or unavailable.",
+    "seconds": 2.75
+  },
+  "target_check": "present",
+  "connection_id": "cc286560ee2714ae0"
+}
