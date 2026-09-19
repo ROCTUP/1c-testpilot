@@ -156,7 +156,9 @@ LEAD = {'read': b'\x88\x81\x81', 'action': b'\x88\x82\x81',
 def mk_wait(timeout):
     """Аргумент WaitForDropListGeneration: int8/int16 таймаут + маркер результата e1.
     Идёт после 2-байтового lead 'wait' (88 81): 8b<t8>e1 (<256) / 8d<t16>e1 (иначе)."""
-    t = int(timeout) & 0xffff
+    if type(timeout) is not int or not 0 <= timeout <= 65535:
+        raise ValueError('timeout must be an integer from 0 to 65535')
+    t = timeout
     return (b'\x8b' + bytes([t]) if t < 256 else b'\x8d' + struct.pack('<H', t)) + b'\xe1'
 
 def _pad_len(middle):
