@@ -3,15 +3,18 @@ from collections.abc import MutableMapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 import os
+import math
 import socket
 import threading
+import time
 import uuid
 
 
 class ConnectionError(ValueError):
-    def __init__(self, code, message):
+    def __init__(self, code, message, **details):
         super().__init__(message)
         self.code = code
+        self.details = details
 
 
 def empty_state():
@@ -70,25 +73,39 @@ class Connection:
         self.state['connection_id'] = self.id
         self.lock = threading.RLock()
         self.starting = True
+        self.active = None
+        self.disconnect_cleanup = None
+
+    def activity(self):
+        active = self.active
+        return {'busy': active is not None,
+                'active_action': active[0] if active else None,
+                'active_seconds': round(time.monotonic() - active[1], 3) if active else None}
 
     def info(self):
         c = self.state.get('client')
+        sock = getattr(c, 's', None)
         return {'connection_id': self.id, 'profile': self.state.get('profile'), 'host': self.host, 'port': self.port,
                 'base': self.base, 'user': self.user,
                 'version': getattr(c, 'platform_version', None),
-                'connected': c is not None, 'starting': self.starting,
+                'connected': (c is not None and getattr(c, 's', True) is not None
+                              and (sock is None or sock.fileno() != -1)
+                              and not getattr(c, '_interrupted', False)), 'starting': self.starting,
                 'launched': bool(self.state.get('launched_pid')),
                 'desktop': self.state.get('desktop'),
-                'recording': bool(self.state.get('rec_active'))}
+                'recording': bool(self.state.get('rec_active')), **self.activity()}
 
 
 class Pool:
-    def __init__(self, state, limit=None, legacy=None):
+    def __init__(self, state, limit=None, legacy=None, wait_timeout=None):
         self.state = state
         self.legacy = legacy
         self.limit = int(os.environ.get('TC1C_CONNECTION_LIMIT', '16')) if limit is None else limit
         if isinstance(self.limit, bool) or not isinstance(self.limit, int) or self.limit < 1:
             raise ValueError('TC1C_CONNECTION_LIMIT must be a positive integer')
+        self.wait_timeout = float(os.environ.get('TC1C_QUEUE_TIMEOUT', '60') if wait_timeout is None else wait_timeout)
+        if not math.isfinite(self.wait_timeout) or self.wait_timeout <= 0:
+            raise ValueError('TC1C_QUEUE_TIMEOUT must be a finite positive number')
         self.lock = threading.RLock()
         self.entries = {}
         self.legacy_lock = threading.RLock()
@@ -167,15 +184,75 @@ class Pool:
             return None
 
     @contextmanager
-    def use(self, connection):
+    def use(self, connection, action=None):
         if connection is None:
-            with self.legacy_lock, self.state.bind(self.legacy_state()): yield
+            if not self.legacy_lock.acquire(timeout=self.wait_timeout):
+                raise ConnectionError('connection_busy', 'The previous action is still running.',
+                                      queue_timeout=self.wait_timeout)
+            try:
+                with self.state.bind(self.legacy_state()): yield
+            finally:
+                self.legacy_lock.release()
             return
-        with connection.lock:
+        if not connection.lock.acquire(timeout=self.wait_timeout):
+            raise ConnectionError('connection_busy', 'The previous action is still running. Check list_connections or disconnect with force=true.',
+                                  connection_id=connection.id, queue_timeout=self.wait_timeout, **connection.activity())
+        previous = connection.active
+        try:
             with self.lock:
                 if self.entries.get(connection.id) is not connection:
                     raise ConnectionError('connection_not_found', 'This connection has been closed. Use list_connections.')
+                if connection.disconnect_cleanup is not None:
+                    raise ConnectionError('connection_busy', 'Forced disconnection is finishing.',
+                                          connection_id=connection.id, **connection.activity())
+                if previous is None and action is not None:
+                    connection.active = (action, time.monotonic())
             with self.state.bind(connection.state): yield
+        finally:
+            with self.lock:
+                cleanup = connection.disconnect_cleanup if previous is None else None
+            try:
+                # Clear state only after the owning worker stops using it. Do not
+                # hold the whole pool while finalizing this connection's journal.
+                if cleanup is not None:
+                    with self.state.bind(connection.state): cleanup()
+            finally:
+                with self.lock:
+                    if cleanup is not None: connection.disconnect_cleanup = None
+                    connection.active = previous
+                    connection.lock.release()
+
+    def force_disconnect(self, connection, cleanup):
+        if connection is None:
+            raise ConnectionError('not_connected', 'No registered connection to disconnect.')
+        with self.lock:
+            if self.entries.get(connection.id) is not connection:
+                raise ConnectionError('connection_not_found', 'This connection has been closed.')
+            activity = connection.activity()
+            c = connection.state.get('client')
+            acquired = connection.lock.acquire(blocking=False)
+            try:
+                if not acquired and (c is None or not hasattr(c, 'interrupt')
+                                     or activity['active_action'] in ('connect', 'launch_client')):
+                    raise ConnectionError('connection_busy', 'The running action has no interruptible connection yet.',
+                                          connection_id=connection.id, **activity)
+                if c is not None and hasattr(c, 'interrupt'):
+                    c.interrupt()
+                connection.disconnect_cleanup = cleanup
+            except BaseException:
+                if acquired: connection.lock.release()
+                raise
+        if acquired:
+            try:
+                with self.state.bind(connection.state): cleanup()
+            finally:
+                with self.lock:
+                    connection.disconnect_cleanup = None
+                    connection.lock.release()
+        return {'ok': True, 'connection_id': connection.id, 'connected': False,
+                'forced': True, 'cleanup_pending': not acquired,
+                'interrupted_action': activity['active_action'],
+                'outcome_unknown': activity['busy']}
 
     def finish(self, connection):
         if connection is None: return

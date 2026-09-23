@@ -10,6 +10,7 @@ import re
 import threading
 import time
 import uuid
+import _log_reports
 
 
 ACTIONS = frozenset({'start_logging', 'stop_logging', 'get_logging_status'})
@@ -190,7 +191,7 @@ const link=event.target.closest('a.screenshot-link');
 if(!link||event.ctrlKey||event.metaKey||event.shiftKey||event.altKey||event.button!==0)return;
 if(typeof imageViewer.showModal!=='function')return;
 event.preventDefault();
-imageLinks=[...document.querySelectorAll('article:not([hidden]) a.screenshot-link')];
+imageLinks=[...document.querySelectorAll('a.screenshot-link')].filter(link=>!link.closest('[hidden]'));
 showImage(imageLinks.indexOf(link));
 viewerNote.hidden=true;imageViewer.classList.remove('expanded');
 previousOverflow=document.documentElement.style.overflow;document.documentElement.style.overflow='hidden';
@@ -246,13 +247,14 @@ def json_block(value):
 def card(event, probe=False):
     esc = lambda v: html.escape(str(v), quote=True)
     result = event['result']
-    failed = isinstance(result, dict) and (result.get('ok') is False or 'exception' in result)
+    skipped = isinstance(result, dict) and result.get('skipped')
+    failed = not skipped and isinstance(result, dict) and (result.get('ok') is False or 'exception' in result)
     tag = 'div' if probe else 'article'
-    state = 'wait-probe' if probe else ('failed' if failed else 'passed')
-    status = 'Проверка' if probe else ('Ошибка' if failed else 'Ответ получен')
+    state = 'wait-probe' if probe else ('skipped' if skipped else 'failed' if failed else 'passed')
+    status = 'Проверка' if probe else ('Пропущено' if skipped else 'Ошибка' if failed else 'Ответ получен')
     text = (f'<{tag} class="{state}"><details class="call" open>'
             f'<summary><strong class="call-title">#{event["call_id"]} '
-            f'{esc(event["tool"])} / {esc(event["action"])}</strong><small class="call-meta">'
+            f'{esc(_log_reports.title(event))}</strong><small class="call-meta">'
             f'{esc(event["time"])} · {esc(event["connection_id"])} · '
             f'{event["duration_ms"]} мс · {status}</small></summary>'
             '<div class="call-body">')
@@ -268,13 +270,30 @@ def card(event, probe=False):
 
 
 class Journal:
-    def __init__(self, store, directory, connection_id, mode):
+    def __init__(self, store, directory, connection_id, mode, reports=('html',)):
         self.store, self.directory = store, directory
         self.connection_id, self.mode = connection_id, mode
         self.active = True
         self.reason = None
         self.calls = self.completed = self.bytes = self.screenshot_errors = 0
         self.started_at = now()
+        self.reports = reports
+        self.report_errors = []
+        self.sink = None
+        self.stopped = False
+
+    def report_event(self, method, event):
+        if self.sink is not None:
+            try:
+                getattr(self.sink, method)(event)
+            except Exception as exc:
+                if len(self.report_errors) < 10:
+                    self.report_errors.append(dict(format='allure', error=str(exc)))
+                logging.getLogger(__name__).warning('Allure report failed: %s', exc)
+
+    def html(self, data):
+        if 'html' in self.reports:
+            self.store.append(self, 'report.html', data)
 
     def status(self):
         return dict(ok=True, active=self.active, logging_id=self.directory.name,
@@ -282,7 +301,10 @@ class Journal:
                     started_at=self.started_at, calls=self.calls, completed=self.completed,
                     bytes=self.bytes, screenshot_errors=self.screenshot_errors,
                     directory=str(self.directory), journal=str(self.directory / 'events.jsonl'),
-                    report=str(self.directory / 'report.html'), reason=self.reason)
+                    report=str(self.directory / 'report.html') if 'html' in self.reports else None,
+                    reports=list(self.reports), report_errors=list(self.report_errors),
+                    allure_results=(str(self.store.allure_directory or self.directory / 'allure-results')
+                                    if 'allure' in self.reports else None), reason=self.reason)
 
     def pause(self, reason):
         self.active = False
@@ -295,20 +317,32 @@ class Journal:
         self.calls += 1
         call = dict(event='start', call_id=self.calls, time=now(), connection_id=self.connection_id,
                     tool=tool, action=action, arguments=clean(arguments), targets=clean(targets))
+        parent = CURRENT.get()
+        if parent is not None and parent.get('connection_id') == self.connection_id:
+            call['parent_call_id'] = parent['call_id']
         waiting = WAIT.get()
         if waiting is not None and waiting[0] is self:
             call['wait_id'] = waiting[1]
         if not self.store.append(self, 'events.jsonl', encode(call)):
             return None
+        self.report_event('begin', call)
+        if action == 'run_scenario':
+            self.html((f'<article id="scenario-{self.calls}" class="waiting"><details class="call" open>'
+                       f'<summary><strong class="call-title">#{self.calls} Сценарий / run_scenario</strong>'
+                       '<small class="call-meta">Сценарий выполняется</small></summary><div class="call-body">'
+                       '<details><summary>Параметры</summary>' + json_block(call['arguments'])
+                       + '</details>\n').encode('utf8'))
         return dict(call, clock=time.monotonic(), result=None, picture=None)
 
     def finish(self, call, capture=None):
-        if call is None or not self.active:
+        if call is None:
             return
         event = {k: v for k, v in call.items() if k not in ('clock', 'picture')}
         event.update(event='finish', time=now(), duration_ms=round((time.monotonic() - call['clock']) * 1000))
+        event = clean(event)
         # Persist the outcome BEFORE capture: a helper crash must not hide a performed action.
         if not self.store.append(self, 'events.jsonl', encode(event)):
+            self.report_event('finish', event)
             return
         self.completed += 1
         # Polling belongs to one wait step, not to the screenshot timeline.
@@ -328,25 +362,41 @@ class Journal:
             shot['captured_at'] = now()
             event['screenshot'] = shot
             if not self.store.append(self, 'events.jsonl', encode(dict(event='screenshot', call_id=call['call_id'], **shot))):
+                self.report_event('finish', event)
                 return
-        self.store.append(self, 'report.html', card(event, probe='wait_id' in event))
+        if call['action'] == 'run_scenario':
+            failed = isinstance(event.get('result'), dict) and event['result'].get('ok') is False
+            summary = json.dumps(f'{event["duration_ms"]} мс · ' + ('Ошибка' if failed else 'Сценарий завершён'), ensure_ascii=False)
+            self.html(('<details><summary>Результат сценария</summary>' + json_block(event['result'])
+                       + '</details></div></details></article>\n<script>(()=>{const e=document.getElementById("scenario-'
+                       + str(call['call_id']) + '");e.className="'
+                       + ('failed' if failed else 'passed') + '";e.querySelector(".call-meta").textContent='
+                       + summary + ';})();</script>\n').encode('utf8'))
+        else:
+            self.html(card(event, probe='wait_id' in event))
+        self.report_event('finish', event)
 
     def begin_wait(self, description, timeout, interval):
         identity = 'wait-' + uuid.uuid4().hex
         event = dict(event='wait_start', wait_id=identity, time=now(),
                      connection_id=self.connection_id, description=description,
                      timeout=timeout, interval=interval)
+        parent = CURRENT.get()
+        if parent is not None:
+            event['parent_call_id'] = parent['call_id']
         self.store.append(self, 'events.jsonl', encode(event))
+        self.report_event('begin', event)
         heading = (f'<article id="{identity}" class="waiting"><details class="call" open>'
                    f'<summary><strong class="call-title">{html.escape(description)}</strong>'
                    '<small class="call-meta">Ожидание выполняется</small></summary>'
                    '<details><summary>Подробности проверок</summary>\n')
-        self.store.append(self, 'report.html', heading.encode('utf8'))
+        self.html(heading.encode('utf8'))
         return identity
 
     def finish_wait(self, identity, result, attempts, seconds):
+        result = clean(result)
         event = dict(event='wait_finish', wait_id=identity, time=now(),
-                     connection_id=self.connection_id, result=clean(result),
+                     connection_id=self.connection_id, result=result,
                      attempts=attempts, duration_ms=round(seconds * 1000))
         self.store.append(self, 'events.jsonl', encode(event))
         failed = not result.get('ok')
@@ -357,11 +407,16 @@ class Journal:
                   + f'<script>(()=>{{const e=document.getElementById("{identity}");'
                   + f'e.className="{"failed" if failed else "passed"}";'
                   + f'e.querySelector(".call-meta").textContent={summary};}})();</script>\n')
-        self.store.append(self, 'report.html', ending.encode('utf8'))
+        self.html(ending.encode('utf8'))
+        self.report_event('finish', event)
 
     def stop(self, reason='stopped'):
+        if self.stopped:
+            return self.status()
+        self.stopped = True
         if self.active:
             self.store.append(self, 'events.jsonl', encode(dict(event='stop', time=now(), reason=reason)))
+        self.report_event('stop', reason)
         self.active = False
         self.reason = self.reason or reason
         # A completion marker allows retention to remove only our finished journals.
@@ -370,7 +425,8 @@ class Journal:
 
 
 class Store:
-    def __init__(self, root=None, max_bytes=None, screenshots=None, default_mode=None):
+    def __init__(self, root=None, max_bytes=None, screenshots=None, default_mode=None,
+                 reports=None, allure_factory=None, allure_directory=None):
         self.root = Path(root or os.environ.get('TC1C_LOG_DIR', 'logs')).expanduser().absolute()
         try:
             self.max_bytes = max_bytes if max_bytes is not None else int(os.environ.get('TC1C_LOG_MAX_MB', '1024')) * 1024 * 1024
@@ -380,6 +436,9 @@ class Store:
             raise ValueError('TC1C_LOG_MAX_MB must be a positive integer')
         self.screenshots = enabled('TC1C_LOG_SCREENSHOTS') if screenshots is None else screenshots
         self.default_mode = default_mode
+        self.reports = _log_reports.formats(os.environ.get('TC1C_LOG_REPORTS', 'html') if reports is None else reports)
+        self.allure_factory = allure_factory or _log_reports.SessionAllure
+        self.allure_directory = allure_directory
         if default_mode is not None and default_mode not in MODES:
             raise ValueError('default_mode must be off, actions or all')
         self.lock = threading.RLock()
@@ -401,14 +460,13 @@ class Store:
                 if marker.is_symlink() or json.loads(marker.read_text('utf-8')).get('format') != 'testpilot-call-log-1':
                     continue
                 paths = list(directory.iterdir())
-                shots = directory / 'screenshots'
-                if shots.exists() and not shots.is_symlink():
-                    paths.extend(shots.iterdir())
+                folders = [directory / name for name in ('screenshots', 'allure-results')]
+                for folder in folders:
+                    if folder.exists() and not folder.is_symlink() and not (hasattr(folder, 'is_junction') and folder.is_junction()):
+                        paths.extend(folder.iterdir())
                 if any(p.is_symlink() or (hasattr(p, 'is_junction') and p.is_junction()) for p in paths):
                     continue
-                if any(p.is_dir() and p != shots for p in paths):
-                    continue
-                if any(p.is_dir() for p in paths if p.parent == shots):
+                if any(p.is_dir() and p not in folders for p in paths):
                     continue
                 size = sum(p.stat().st_size for p in paths if p.is_file())
                 found.append((directory, size, paths))
@@ -430,9 +488,10 @@ class Store:
             for path in paths:
                 if path.is_file():
                     path.unlink()
-            shots = directory / 'screenshots'
-            if shots.exists():
-                shots.rmdir()
+            for name in ('screenshots', 'allure-results'):
+                folder = directory / name
+                if folder.exists():
+                    folder.rmdir()
             directory.rmdir()
             self.total -= size
             if self.total + count <= self.max_bytes:
@@ -460,7 +519,11 @@ class Store:
                 journal.pause('log_write_failed')
                 return False
 
-    def start(self, connection_id, mode=None):
+    def start(self, connection_id, mode=None, reports=None):
+        try:
+            reports = self.reports if reports is None else _log_reports.formats(reports)
+        except ValueError as exc:
+            return dict(ok=False, code='invalid_logging_reports', error=str(exc))
         mode = mode or self.default_mode or ('actions' if self.screenshots else 'off')
         if mode not in MODES:
             return {'ok': False, 'code': 'invalid_logging_mode', 'error': 'screenshot_mode must be off, actions or all.'}
@@ -468,12 +531,15 @@ class Store:
             return {'ok': False, 'code': 'log_screenshots_disabled', 'error': 'Screenshot logging is disabled on this server; use screenshot_mode="off".'}
         with self.lock:
             directory = self.root / ('session-' + datetime.now().astimezone().strftime('%Y%m%dT%H%M%S') + '-' + uuid.uuid4().hex[:12])
-            journal = Journal(self, directory, connection_id, mode)
+            journal = Journal(self, directory, connection_id, mode, reports)
             try:
                 self.root.mkdir(parents=True, exist_ok=True)
-                initial = [('session.json', encode(dict(format='testpilot-call-log-1', connection_id=connection_id, started_at=journal.started_at))),
-                           ('report.html', _HTML.encode('utf-8')),
-                           ('events.jsonl', encode(dict(event='session_start', time=now(), connection_id=connection_id, screenshot_mode=mode)))]
+                initial = [('session.json', encode(dict(format='testpilot-call-log-1', connection_id=connection_id,
+                                                       started_at=journal.started_at, reports=reports))),
+                           ('events.jsonl', encode(dict(event='session_start', time=now(), connection_id=connection_id,
+                                                       screenshot_mode=mode, reports=reports)))]
+                if 'html' in reports:
+                    initial.append(('report.html', _HTML.encode('utf-8')))
                 if not self.room(sum(len(data) for _, data in initial)):
                     return {'ok': False, 'code': 'log_limit_exceeded', 'error': 'No room for a new call journal.'}
                 directory.mkdir(mode=0o700 if os.name != 'nt' else 0o777)
@@ -483,6 +549,11 @@ class Store:
                     if not self.append(journal, filename, data):
                         self.complete(journal)
                         return {'ok': False, 'code': journal.reason, 'error': 'Could not start call logging.'}
+                if 'allure' in reports:
+                    try:
+                        journal.sink = self.allure_factory(journal)
+                    except Exception as exc:
+                        journal.report_errors.append(dict(format='allure', error=str(exc)))
                 return journal
             except Exception:
                 self.active.discard(directory)

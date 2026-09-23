@@ -1,6 +1,6 @@
 [project]
 name = "1c-testpilot"
-version = "1.6.0"
+version = "1.7.0"
 description = "MCP-сервер для управления тест-клиентом 1С:Предприятие"
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -30,6 +30,7 @@ Repository = "https://github.com/ROCTUP/1c-testpilot"
 
 [project.optional-dependencies]
 test = ["pytest>=8,<10"]
+allure = ["pytest>=8,<10", "allure-pytest>=2.13,<3"]
 
 [project.entry-points.pytest11]
 testpilot = "testpilot_pytest"
@@ -40,4 +41,4 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 package-dir = { "" = "app" }
-py-modules = ["server", "_runtime", "_mcp", "testpilot", "testpilot_pytest", "_cli", "tc1c", "guids", "_collection", "_response", "_refs", "_connections", "_profiles", "_field_batches", "_row_search", "_snapshots", "_snapshot_tables", "_form_context", "_action_diagnostics", "_call_logging", "_native_window", "_desktop_windows", "_desktop_linux", "_screenshots", "_screenshot_windows", "_screenshot_linux", "_screenshot_image", "tool_versions"]
+py-modules = ["server", "_runtime", "_client_shutdown", "_mcp", "testpilot", "testpilot_pytest", "_cli", "tc1c", "guids", "_collection", "_response", "_refs", "_connections", "_profiles", "_code_execution", "_service_metadata", "_field_batches", "_row_search", "_snapshots", "_snapshot_tables", "_form_context", "_action_diagnostics", "_call_logging", "_log_reports", "_native_window", "_desktop_windows", "_desktop_linux", "_screenshots", "_screenshot_windows", "_screenshot_linux", "_screenshot_image", "tool_versions"]

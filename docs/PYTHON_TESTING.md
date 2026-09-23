@@ -34,6 +34,13 @@ python -m pytest tests/test_document.py --tc-profile ut_admin --tc-artifacts tes
 
 `testpilot` — fixture, которая для каждого теста создаёт отдельное подключение.
 Профиль с `base` запускает клиент; профиль с `host`/`port` подключает уже запущенный.
+После теста запущенный клиент завершается штатно с подтверждением известных вопросов выхода.
+Если за 15 секунд он не завершился, процесс останавливается принудительно. Это также
+действует для `Client.close()`. Для явной остановки можно вызвать
+`client.stop_client(graceful_timeout=30)`; допустимо 0–120 секунд, 0 — сразу принудительно.
+Ответ содержит `shutdown`: `graceful`, `forced` или `already_exited`; при `forced`
+поле `shutdown_reason` объясняет причину. Несохранённые изменения могут быть потеряны.
+
 Следующий пример рассчитан на конфигурацию с документом `ЗаказКлиента` и полем
 `Комментарий`. Имена нужно предварительно проверить в вашей базе через MCP.
 
@@ -186,5 +193,102 @@ assert result["code"] == "no_selected_rows"
 `TC1C_SCREENSHOTS`, `TC1C_LOGGING` и `TC1C_LOG_SCREENSHOTS` должны разрешать захват.
 Это не запрещает самому тесту явно вызвать `get_screenshot`, если функция разрешена.
 
+## Форматы отчётов
+
+`--tc-reports` выбирает `html`, `allure`, `html,allure` или `none` (только JSONL).
+По умолчанию используется `TC1C_LOG_REPORTS`, а если переменная не задана — `html`.
+Журнал и скриншоты собираются один раз; HTML и Allure используют одни и те же события.
+`TC1C_LOGGING` включает журналирование, `--tc-screenshots` задаёт режим снимков.
+
+Для Allure установите дополнительную зависимость:
+
+```bash
+pip install "1c-testpilot[allure]"
+python -m pytest examples/pytest/zup/test_hire_employee.py --tc-profile zup_demo --tc-reports html,allure --tc-screenshots actions --tc-artifacts test-results/zup --junitxml test-results/zup.xml
+```
+
+При выборе Allure результаты сохраняются в `<tc-artifacts>/allure-results`.
+Путь можно переопределить стандартным `--alluredir`. Для сборки и просмотра нужен
+[Allure Report](https://allurereport.org/docs/install/):
+
+```bash
+allure generate test-results/zup/allure-results -o allure-report
+allure open allure-report
+```
+
+Каждый pytest-тест имеет собственный результат Allure. Действия Testpilot отображаются
+как шаги с параметрами, ответами и скриншотами; `wait_until` группирует проверки ожидания,
+а `run_scenario` — шаги воспроизведения. При падении прикладывается полученный контекст формы.
+Подготовка и завершение клиента отображаются в соответствующих fixture.
+Ожидаемый отказ, прочитанный с `check=False`, остаётся виден в шаге, но итог теста определяет pytest.
+Смысловые этапы при необходимости можно объединять стандартным `with allure.step("…")`.
+
+JUnit XML независимо включается параметром `--junitxml`. Каталог результатов Allure
+управляется плагином `allure-pytest`; лимит `TC1C_LOG_MAX_MB` относится к журналам Testpilot.
+
 Запись XML-сценариев и `run_scenario` доступны через тот же Python API. Для новых
 pytest-тестов действия и проверки можно писать непосредственно на Python.
+
+## Код и запросы в текущем сеансе 1С
+
+Для `execute_code` и `execute_query` запустите клиент с
+[внешней обработкой Testpilot](../onec/Testpilot/README.md).
+В профиле, выбранном через `--tc-profile`, укажите `code_epf`:
+
+```yaml
+profiles:
+  demo:
+    base: 'D:/Bases/Demo'
+    code_epf: 'D:/Tools/1c-testpilot/onec/Testpilot/Testpilot.epf'
+```
+
+При запуске профиля обработка автоматически открывается и проверяется на готовность.
+После этого доступны `execute_code`, `execute_query`, `get_metadata`,
+`list_custom_bsl_functions` и `execute_custom_bsl_function`. Настройки публикации
+MCP (`TC1C_CODE_EXECUTION`, `TC1C_QUERY_EXECUTION`, `TC1C_METADATA`, `TC1C_FUNCTIONS`)
+для Python-тестов не требуются. Пользовательские функции добавляются в
+[реестр обработки](../onec/Testpilot/CUSTOM_FUNCTIONS.md).
+
+При запуске из кода путь можно передать непосредственно:
+
+```python
+from testpilot import Client
+
+with Client() as client:
+    client.launch_client(
+        base="D:/Bases/Demo",
+        code_epf="D:/Tools/1c-testpilot/onec/Testpilot/Testpilot.epf",
+    )
+    assert client.execute_query(query="ВЫБРАТЬ 1 КАК Число")["rows"] == [{"Число": 1}]
+```
+
+Общий путь можно задать через `TC1C_CODE_EPF` до импорта `testpilot`.
+Приоритет: аргумент `code_epf`, затем профиль, затем переменная окружения.
+`code_epf=""` в `launch_client` или `start` запускает клиент без обработки даже при
+заданном пути в профиле или окружении. При подключении к работающему клиенту
+используется уже открытая обработка; если её нет, выполнение сообщает `helper_not_ready`.
+
+Пример теста со стандартной фикстурой и профилем с `code_epf`:
+
+```python
+def test_document_was_saved(testpilot):
+    # Перед этим тест создаёт документ через обычные действия над формой.
+    rows = testpilot.execute_query(
+        query="ВЫБРАТЬ Номер, Проведен ИЗ Документ.ЗаказКлиента ГДЕ Номер = &Номер",
+        parameters={"Номер": "ТД00-000001"},
+        limit=2,
+    )
+    assert rows["returned_rows"] == 1
+    assert rows["rows"][0]["Проведен"] is True
+
+    value = testpilot.execute_code(
+        context="client",
+        code='Результат = Параметры["текст"] + "!";',
+        parameters={"текст": "Проверка"},
+    )
+    assert value["result"] == "Проверка!"
+```
+
+Запросы учитывают текущие права пользователя 1С.
+Возвращаемые даты, ссылки и перечисления имеют явное JSON-представление,
+описанное в документации обработки. Ошибки возвращаются через `ActionError`.

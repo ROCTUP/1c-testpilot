@@ -18,6 +18,8 @@ import _action_diagnostics
 import _row_search
 import _call_logging
 import _profiles
+import _code_execution
+import _client_shutdown
 # Минимальная версия платформы 1С: по инструменту и по GUID метода (для воспроизведения
 # сценариев, где метод известен только по GUID).
 try:
@@ -137,10 +139,17 @@ def _with_operation_errors(fn):
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
         try:
+            client = _state.get('client')
+            if client is not None and vars(client).get('_service_roots'):
+                arguments = sig.bind(*args, **kwargs).arguments
+                for name in ('key', 'root_key'):
+                    _code_execution.guard(client, None, arguments.get(name))
             result = fn(*args, **kwargs)
         except tc1c.OperationError as exc:
             result = exc.result()
         except _PlatformVersionError as exc:
+            return exc.result
+        except _code_execution.Failure as exc:
             return exc.result
         if fn.__name__[3:] in _action_diagnostics.FAILURE_ACTIONS and isinstance(result, dict) and result.get('ok') is False:
             bound = sig.bind(*args, **kwargs).arguments
@@ -453,7 +462,8 @@ def _active_column_editor(c, key):
 
 def _remember_handles(objects):
     c = _state.get('client')
-    if c is not None:
+    objects = _code_execution.filter_objects(c, objects)
+    if c is not None and not _code_execution.internal_access(c):
         registry = _refs.for_client(c)
         for obj in objects:
             if obj.get('key') and obj.get('handle'):
@@ -464,6 +474,7 @@ def _remember_handles(objects):
 def _coll(r, parent=None, remember=True):
     """Коллекция объектов ответа; у отказа — пусто."""
     objects = tc1c.decode_collection(r['raw'], parent) if r.get('ok') else []
+    objects = _code_execution.filter_objects(_state.get('client'), objects)
     return _remember_handles(objects) if remember else objects
 
 def _rows(r):
@@ -1109,6 +1120,8 @@ def _window(c):
     keys = tc1c.extract_object_keys(r['raw']) if r.get('ok') else []
     metadata = next((it for it in tc1c.decode_collection(r['raw'])
                      if keys and it.get('key') == keys[0]), {}) if r.get('ok') else {}
+    if keys:
+        _code_execution.guard(c, G.GET_ACTIVE_WINDOW, keys[0])
     title = metadata.get('title')
     cls = keys[0].split('[')[0] if keys else None
     _state['window_key'] = keys[0] if keys else None
@@ -1201,11 +1214,23 @@ def tc_connect(port: int, host: str = '127.0.0.1', version: str = None) -> str:
     if old is not None:
         old.close()
     _state['client'] = c
+    _code_execution.install(c)
     isolated = _state.get('_isolated_process')
     if isolated is not None and port == _state.get('launched_port') and host in ('127.0.0.1', 'localhost', '::1'):
         c._isolated_process = isolated
     _state['window_key'] = None
     _rec_reset()          # запись принадлежит конкретному клиенту: новая сессия её не наследует
+    if (_state.get('_code_launch_path') or
+            (_execution.get() is None and _code_execution.SETTINGS.enabled)) and not _state.get('_launch_deadline'):
+        if _state.get('_code_launch_path'):
+            try:
+                _code_execution.prepare(sys.modules[__name__], c, _state['_code_launch_path'], time.monotonic() + 120)
+            except _code_execution.Failure as exc:
+                return _finish_client_launch(dict(exc.result))
+            except (OSError, RuntimeError) as exc:
+                return _finish_client_launch(dict(ok=False, code='helper_startup_failed', error=str(exc)))
+        else:
+            _code_execution.discover(sys.modules[__name__], c)
     # версию соединения сообщаем сразу: иначе её неоткуда узнать, кроме текста отказа
     # «метод требует платформу 1С 8.5.1+, подключено …»
     return f'подключено, сессия {sess}, платформа {_conn_ver(c)}'
@@ -1287,22 +1312,30 @@ def tc_launch_client(base: str, port: int = None, server: bool = False, user: st
         version = actual_version or None
     if port is None:
         port = _connections.free_port()
+    helper_path = _code_execution.launch_path(_state.get('_code_epf'), python_api=_execution.get() is not None)
+    if helper_path and any(str(a).lower().startswith('/execute') for a in (extra_args or [])):
+        return {'ok': False, 'code': 'conflicting_execute_argument',
+                'error': 'The configured Testpilot processing already uses /Execute.'}
     args = [exe, 'ENTERPRISE', ('/S' if server else '/F') + base,
             '/TESTCLIENT', '-TPort' + str(port), '/DisableStartupMessages']
     if user:     args.append('/N' + user)
     if password: args.append('/P' + password)
     if extra_args:
         args += [str(a) for a in extra_args]
+    if helper_path:
+        args += ['/Execute', helper_path]
     flags = 0
     for fl in ('DETACHED_PROCESS', 'CREATE_NEW_PROCESS_GROUP'):
         flags |= getattr(subprocess, fl, 0)
+    deadline = time.monotonic() + max(1, wait)
     try:
         if desktop == 'isolated':
             if os.name == 'nt':
                 from _desktop_windows import IsolatedProcess
+                proc = IsolatedProcess(args)
             else:
                 from _desktop_linux import IsolatedProcess
-            proc = IsolatedProcess(args)
+                proc = IsolatedProcess(args, deadline=deadline)
             _state['_isolated_process'] = proc
         else:
             proc = subprocess.Popen(args, creationflags=flags, close_fds=True,
@@ -1315,7 +1348,7 @@ def tc_launch_client(base: str, port: int = None, server: bool = False, user: st
     _state['launched_pid'] = proc.pid
     _state['launched_process'] = proc
     _state['launched_port'] = port      # чтобы tc_stop_client закрыл соединение именно с ним
-    deadline = time.monotonic() + max(1, wait)
+    _state['_code_launch_path'] = helper_path
     up = False
     while time.monotonic() < deadline:
         if proc.poll() is not None:
@@ -1363,23 +1396,39 @@ def tc_launch_client(base: str, port: int = None, server: bool = False, user: st
                 time.sleep(max(0, min(0.5, deadline - time.monotonic())))
             finally:
                 _state.pop('_launch_deadline', None)
+    if helper_path and connect and out['ok']:
+        try:
+            _code_execution.prepare(sys.modules[__name__], _state['client'], helper_path, deadline)
+            out['execution_ready'] = True
+        except _code_execution.Failure as exc:
+            out.update(exc.result)
+        except (OSError, RuntimeError) as exc:
+            out.update(ok=False, code='helper_startup_failed', error=str(exc))
+    elif helper_path:
+        out['execution_ready'] = False
     return _finish_client_launch(out)
 
 
 def _finish_client_launch(result):
     # При неудачном запуске останавливаем созданный нами клиент в любом режиме рабочего стола.
     if not result['ok'] and _state.get('launched_pid'):
-        cleanup = tc_stop_client()
+        cleanup = tc_stop_client(graceful_timeout=0)
         result['client_stopped'] = cleanup['ok']
         if not cleanup['ok']:
             result['cleanup_error'] = cleanup['error']
     return result
 
 @_action('tc_session')
-def tc_stop_client() -> dict:
+def tc_stop_client(graceful_timeout: float = 15) -> dict:
     """Stop the test client started by launch_client in this connection, and disconnect from it.
-    Unsaved changes may be lost. Disconnects before stopping; if stopping fails, retains
-    process ownership for retry, but the test-client connection is already closed."""
+    Tries normal exit for graceful_timeout seconds (0..120, default 15), confirming known exit
+    questions, then forces termination if needed. 0 forces termination immediately.
+    Unsaved changes may be lost. Returns shutdown: graceful, forced, or already_exited;
+    forced includes shutdown_reason. A failed stop retains process ownership for retry."""
+    import math
+    if (isinstance(graceful_timeout, bool) or not isinstance(graceful_timeout, (int, float))
+            or not math.isfinite(graceful_timeout) or not 0 <= graceful_timeout <= 120):
+        return {'ok': False, 'code': 'invalid_timeout', 'error': 'graceful_timeout must be a number from 0 to 120 seconds.'}
     pid = _state.get('launched_pid')
     if not pid:
         return {'ok': False, 'error': 'no client was launched through tc_launch_client'}
@@ -1389,12 +1438,23 @@ def tc_stop_client() -> dict:
     if isolated is not None:
         if isolated is not proc or proc.pid != pid:
             return {'ok': False, 'pid': pid, 'error': 'The isolated process is no longer owned by this connection.'}
-    elif os.name != 'nt' and (proc is None or proc.pid != pid):
+    elif proc is None or proc.pid != pid:
         return {'ok': False, 'pid': pid, 'error': 'The launched process is no longer owned by this connection.'}
     port = _state.get('launched_port')
     cl = _state.get('client')
     local = str(getattr(cl, 'host', '') or '').lower() in ('127.0.0.1', 'localhost', '::1', '')
-    if cl is not None and port is not None and getattr(cl, 'port', None) == port and local:
+    own_connection = cl is not None and port is not None and getattr(cl, 'port', None) == port and local
+    shutdown = {'shutdown': 'already_exited'}
+    if proc.poll() is None:
+        if not graceful_timeout:
+            reason = {'shutdown_reason': 'graceful_shutdown_disabled'}
+        elif not own_connection or getattr(cl, 's', None) is None:
+            reason = {'shutdown_reason': 'test_connection_unavailable'}
+        else:
+            with _code_execution.internal(cl):
+                reason = _client_shutdown.graceful_exit(cl, proc, graceful_timeout)
+        shutdown = {'shutdown': 'forced', **reason} if reason else {'shutdown': 'graceful'}
+    if own_connection:
         # Close our socket first: killing 1C first can leave its listening port
         # in TIME_WAIT and prevent an immediate launch on POSIX.
         tc_disconnect()
@@ -1402,7 +1462,7 @@ def tc_stop_client() -> dict:
         try:
             isolated.close()
         except (OSError, subprocess.TimeoutExpired) as exc:
-            return {'ok': False, 'pid': pid, 'error': 'Could not stop the isolated client: %s' % exc}
+            return {'ok': False, 'pid': pid, **shutdown, 'error': 'Could not stop the isolated client: %s' % exc}
         _state.pop('_isolated_process', None)
     elif os.name != 'nt':
         try:
@@ -1412,23 +1472,31 @@ def tc_stop_client() -> dict:
                 os.killpg(pid, signal.SIGKILL)
             proc.wait(timeout=10)
         except (OSError, subprocess.TimeoutExpired) as e:
-            return {'ok': False, 'pid': pid, 'error': 'Could not stop the test client: %s' % e}
+            return {'ok': False, 'pid': pid, **shutdown, 'error': 'Could not stop the test client: %s' % e}
     elif proc is None or proc.poll() is None:
-        p = subprocess.run(['taskkill', '/PID', str(pid), '/F', '/T'], capture_output=True)
+        try:
+            p = subprocess.run(['taskkill', '/PID', str(pid), '/F', '/T'], capture_output=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {'ok': False, 'pid': pid, **shutdown, 'error': 'Could not stop the test client: %s' % exc}
         if p.returncode != 0:
             err = (p.stderr or p.stdout or b'').decode('cp866', 'replace').strip()
-            return {'ok': False, 'pid': pid, 'returncode': p.returncode,
+            return {'ok': False, 'pid': pid, **shutdown, 'returncode': p.returncode,
                     'error': 'taskkill did not end the process: %s' % (err or 'code %d' % p.returncode)}
         if proc is not None:
-            proc.wait(timeout=10)
+            try:
+                proc.wait(timeout=10)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                return {'ok': False, 'pid': pid, **shutdown, 'error': 'Could not reap the test client: %s' % exc}
     _state['launched_pid'] = None
     _state.pop('launched_process', None)
     _state.pop('launched_port', None)
-    return {'ok': True, 'stopped_pid': pid}
+    _state.pop('_code_launch_path', None)
+    return {'ok': True, 'stopped_pid': pid, **shutdown}
 
 @_action('tc_session')
-def tc_disconnect() -> str:
-    """Close the connection to the test client."""
+def tc_disconnect(force: bool = False) -> str:
+    """Close the connection to the test client. force=true interrupts a pending network call;
+    its result may be unknown. The 1C application remains running."""
     c = _state['client']
     if c: c.close(); _state['client'] = None; _state['window_key'] = None
     _rec_reset()          # с отключением накопленное недостижимо: «запись идёт» стало бы ложью
@@ -1438,7 +1506,8 @@ def tc_disconnect() -> str:
 @_action('tc_session')
 def tc_list_connections() -> dict:
     """List registered clients with connection_id, profile, host, port, base, user and recording status.
-    base/user are known for clients launched here; listing does not probe client health."""
+    busy, active_action and active_seconds describe the running call. connected reports an open
+    connection, not client responsiveness. base/user are known for clients launched here."""
     return {'ok': True, 'connections': _connection_pool().list()}
 
 
@@ -1448,12 +1517,109 @@ def tc_list_profiles() -> dict:
     Pass the name as profile to the listed action. Does not connect to or launch a client."""
     return _profiles.listing()
 
+
+@_action('tc_execute_code')
+def tc_execute_code(code: str, context: typing.Literal['client', 'server'],
+                    parameters: dict = None, timeout: float = 180) -> dict:
+    """Execute BSL code in the test client's service form or its server context.
+    Pass named input values in the optional parameters object. The BSL code receives
+    them in a variable named Параметры. For example, parameters={"amount": 100}
+    and code='Результат = Параметры["amount"] * 2;' returns 200.
+    Assign the value you want to return to the BSL variable Результат.
+    Each entry in parameters is a name and its value. For a 1C date, reference or enum,
+    put a typed object under that name; it is converted to the corresponding 1C value.
+    Examples of the complete parameters argument:
+    parameters={"amount": 100}
+    parameters={"text": "Example"}
+    parameters={"numbers": [10, 20, 30]}
+    parameters={"date": {"$type":"date","value":"2026-09-21T12:00:00"}}
+    parameters={"item": {"$type":"ref","metadata":"Справочник.Номенклатура","uuid":"..."}}
+    parameters={"vat": {"$type":"enum","metadata":"Перечисление.СтавкиНДС","value":"НДС20"}}
+    Read a value by its name, e.g. Параметры["amount"] is a number and
+    Параметры["numbers"] is a 1C Array. Multiple entries can be passed together.
+    Returned reference objects can be reused unchanged as parameter values.
+    timeout is the maximum wait in seconds (default 180); must be greater than 0 and at most 3600.
+    A timeout does not cancel execution; the next call reads the pending
+    result before accepting new code. Dates and references are returned with type information."""
+    return _code_execution.execute(sys.modules[__name__], _need(), mode='code', context=context,
+                                   code=code, parameters=parameters, timeout=timeout,
+                                   check_permissions=_execution.get() is None)
+
+
+@_action('tc_execute_query')
+def tc_execute_query(query: str, parameters: dict = None, limit: int = 100, timeout: float = 180) -> dict:
+    """Execute a 1C query or batch with the current user's permissions.
+    Batches can create and drop temporary tables; returns the final selection result.
+    Pass query parameter names without & in parameters:
+    a query using &amount receives its value from parameters={"amount": 100}.
+    For a 1C date, reference or enum, put a typed object under the parameter name;
+    it is converted to the corresponding 1C value before executing the query.
+    Examples of the complete parameters argument:
+    parameters={"amount": 100}
+    parameters={"text": "Example"}
+    parameters={"numbers": [10, 20, 30]}
+    parameters={"date": {"$type":"date","value":"2026-09-21T12:00:00"}}
+    parameters={"item": {"$type":"ref","metadata":"Справочник.Номенклатура","uuid":"..."}}
+    parameters={"vat": {"$type":"enum","metadata":"Перечисление.СтавкиНДС","value":"НДС20"}}
+    Use the matching name in the query, e.g. &amount or В (&numbers).
+    Arrays become 1C Arrays. Multiple entries can be passed together.
+    Returned reference objects can be reused unchanged as parameter values.
+    РАЗРЕШЕННЫЕ is added if absent to the first ВЫБРАТЬ of each batch statement.
+    limit is 1..500 returned rows (default 100).
+    Returns columns, rows, returned_rows and truncated. Access restrictions affect the result.
+    timeout is the maximum wait in seconds (default 180); must be greater than 0 and at most 3600.
+    A timeout does not cancel a running query."""
+    return _code_execution.execute(sys.modules[__name__], _need(), mode='query', context='server',
+                                   query=query, parameters=parameters, limit=limit, timeout=timeout,
+                                   check_permissions=_execution.get() is None)
+
+@_action('tc_get_metadata')
+def tc_get_metadata(name: str = None, meta_type: str = None, search: str = None,
+                    field_search: str = None, sections: list[str] = None,
+                    limit: int = 100, offset: int = 0, timeout: float = 180) -> dict:
+    """Get metadata of the current 1C configuration. No filters: configuration summary.
+    Use name (e.g. Документ.ЗаказКлиента) for object details; sections selects
+    fields, table_parts, values, properties. Or filter objects by meta_type
+    (e.g. Справочник) and search; field_search finds fields instead.
+    Both searches match part of a name or synonym, ignoring case.
+    Lists: limit 1..500, offset >= 0. timeout: maximum wait in seconds, 0 < timeout <= 3600."""
+    from _service_metadata import metadata_options
+    options = metadata_options(name, meta_type, search, field_search, sections, limit, offset)
+    return _code_execution.execute(sys.modules[__name__], _need(), mode='metadata', context='server',
+                                   options=options, timeout=timeout, check_permissions=_execution.get() is None)
+
+
+@_action('tc_list_custom_bsl_functions')
+def tc_list_custom_bsl_functions() -> dict:
+    """List available custom BSL functions.
+    Returns their names, descriptions, execution contexts, parameters and result descriptions.
+    Use execute_custom_bsl_function to run a listed function."""
+    from _service_metadata import list_functions
+    return list_functions(sys.modules[__name__], _need(), check_permissions=_execution.get() is None)
+
+
+@_action('tc_execute_custom_bsl_function')
+def tc_execute_custom_bsl_function(name: str, parameters: dict = None, timeout: float = 180) -> dict:
+    """Execute a custom BSL function.
+    Pass its name and parameters obtained from tc_list_custom_bsl_functions.
+    The registered function determines the execution context. Returns result.
+    Parameters support JSON values and typed date/reference/enum objects, as in execute_code.
+    timeout is the maximum wait in seconds (default 180), greater than 0 and at most 3600.
+    A timeout does not cancel execution; the next execution call first reads the pending result."""
+    return _code_execution.execute(sys.modules[__name__], _need(), mode='function', context='server',
+                                   name=name, parameters=parameters, timeout=timeout,
+                                   check_permissions=_execution.get() is None)
+
+
 # ============================== журнал вызовов ===============================
 @_action('tc_session')
-def tc_start_logging(screenshot_mode: typing.Literal['off', 'actions', 'all'] = None) -> dict:
+def tc_start_logging(screenshot_mode: typing.Literal['off', 'actions', 'all'] = None,
+                     reports: list[typing.Literal['html', 'allure', 'none']] = None) -> dict:
     """Start a call journal. Repeated start keeps the current journal.
     screenshot_mode: off, actions (changes and errors), or all calls; default follows server settings.
-    Saves JSONL, PNG and an HTML report on the MCP server. Images are not added to tool responses."""
+    reports: ["html"], ["allure"], ["html", "allure"], or ["none"] for JSONL only.
+    Omit reports to use the server's configured formats; the response lists the selected reports.
+    Saves files on the server. Allure results are finalized when logging stops."""
     if not LOGGING:
         return {'ok': False, 'code': 'logging_disabled', 'error': 'Call logging is disabled.'}
     if _state.get('client') is None and not _state.get('connection_id'):
@@ -1465,7 +1631,7 @@ def tc_start_logging(screenshot_mode: typing.Literal['off', 'actions', 'all'] = 
         return {**journal.status(), 'already_active': True}
     if journal is not None:
         journal.stop()
-    journal = _journal_store().start(_state.get('connection_id'), screenshot_mode)
+    journal = _journal_store().start(_state.get('connection_id'), screenshot_mode, reports)
     if isinstance(journal, dict):
         return journal
     _state['_call_journal'] = journal
@@ -1474,7 +1640,7 @@ def tc_start_logging(screenshot_mode: typing.Literal['off', 'actions', 'all'] = 
 
 @_action('tc_session')
 def tc_stop_logging() -> dict:
-    """Stop call logging and return the JSONL journal and HTML report paths. Does not stop the client."""
+    """Stop call logging, finalize selected reports and return their paths. Does not stop the client."""
     if not LOGGING:
         return {'ok': False, 'code': 'logging_disabled', 'error': 'Call logging is disabled.'}
     journal = _state.get('_call_journal')
@@ -1763,7 +1929,9 @@ def tc_activate(key: str, handle: str) -> dict:
     tc_form(action="get_current_element") or tc_table(action="get_current_item")."""
     c = _need()
     if _key_class(key) == 'ManagedForm':
-        active = _window(c)
+        # Activating a work form remains possible if the user selected the service tab.
+        with _code_execution.internal(c):
+            active = _window(c)
         if active.get('native'):
             return {'ok': False, 'target': key, 'error': 'close the active preview with close_window before activating a form'}
         if not active.get('key'):
@@ -3194,6 +3362,11 @@ def tc_begin_edit_current_area(key: str, handle: str) -> dict:
     ok = True
     for kind in ('action', 'commit'):
         ok = c.send_cmd(G.BEGIN_EDIT_CURRENT_AREA, key, kind=kind, middle=b'', handle=handle)['ok'] and ok
+    return _area_edit_started(c, key, handle, before, ok)
+
+
+def _area_edit_started(c, key, handle, before, ok):
+    """Keep the same cell-edit state for direct actions and recorded replay."""
     result = {'ok': ok, 'target': key}
     if ok:
         after = _area_action_window(c)
@@ -4126,6 +4299,11 @@ def _synth_dec_int(b):
 def _synth_step(guid, key, middle):
     """(guid, key, middle) -> (tag, attrs, fields) для uilog, либо None (не действие сценария)."""
     m = middle or b''
+    if guid in (G.GOTO_ROW, G.EXPAND_TABLE, G.EXPAND_GROUP, G.COLLAPSE_TABLE,
+                G.COLLAPSE_GROUP, G.GO_ONE_LEVEL_DOWN, G.GO_ONE_LEVEL_UP):
+        rowdesc = _synth_rowdesc(m)
+        if rowdesc is None and b'\x23\x95' + tc1c._GOTOROW_MAPTYPE in m:
+            return None  # An unreadable description must be reported in lost_actions.
     if guid == _DELETE_SELECTED_STEP:
         options = json.loads(m) if m else {'scope': 'selected', 'unmark': False}
         attrs = {'scope': options['scope']}
@@ -4190,8 +4368,8 @@ def _synth_step(guid, key, middle):
     if guid in (G.EXPAND_TABLE, G.EXPAND_GROUP):
         # база e2cb55 = развернуть ВМЕСТЕ С подчинёнными строками (e1cb55 — только узел)
         sub = {'subordinates': 'true'} if (guid == G.EXPAND_TABLE and m[:1] == b'\xe2') else {}
-        return ('expand', sub, _synth_rowdesc(m))
-    if guid in (G.COLLAPSE_TABLE, G.COLLAPSE_GROUP): return ('collapse', {}, _synth_rowdesc(m))
+        return ('expand', sub, rowdesc)
+    if guid in (G.COLLAPSE_TABLE, G.COLLAPSE_GROUP): return ('collapse', {}, rowdesc)
     if guid == G.EXECUTE_COMMAND: return ('executeCommand', {'command': _synth_dec_str(m)}, None)
     if guid == G.INPUT_TEXT: return ('inputText', {'text': _synth_dec_str(after(b'\xe0\x41\x81\x81'))}, None)
     if guid == G.INPUT_HTML:
@@ -4218,9 +4396,9 @@ def _synth_step(guid, key, middle):
         if len(m) >= 4:
             attrs['direction'] = 'up' if m[3] == 0x81 else 'down'
             if m[1] == 0x82: attrs['switchSelection'] = 'true'
-        return ('gotoRow', attrs, _synth_rowdesc(m))
-    if guid == G.GO_ONE_LEVEL_DOWN: return ('goOneLevelDown', {}, _synth_rowdesc(m))
-    if guid == G.GO_ONE_LEVEL_UP:   return ('goOneLevelUp', {}, _synth_rowdesc(m))
+        return ('gotoRow', attrs, rowdesc)
+    if guid == G.GO_ONE_LEVEL_DOWN: return ('goOneLevelDown', {}, rowdesc)
+    if guid == G.GO_ONE_LEVEL_UP:   return ('goOneLevelUp', {}, rowdesc)
     return None
 
 def _synth_rowdesc(m):
@@ -4231,8 +4409,19 @@ def _synth_rowdesc(m):
     if p < 0 or p + len(header) >= len(m):
         return None
     i = p + len(header)
-    count = m[i] - 0xc1
-    i += 1
+    tag = m[i]
+    if 0xc1 <= tag <= 0xca:
+        count, i = tag - 0xc1, i + 1
+    elif tag in (0xcb, 0xcd, 0xcf):
+        width = {0xcb: 1, 0xcd: 2, 0xcf: 4}[tag]
+        if i + 1 + width > len(m):
+            return None
+        count = int.from_bytes(m[i + 1:i + 1 + width], 'little')
+        i += 1 + width
+    else:
+        return None
+    if count > len(m):
+        return None
     out = []
     for index in range(count):
         marker = b'\xc0\x4b\x53' if index == 0 else b'\x20\xe0\x4b\x53'
@@ -4428,7 +4617,7 @@ def _synth_uilog(tracked):
             close_win()
             out.append('\t<ClientApplicationWindow caption="">'); out.append('\t\t<Form title="">')
             st['win'] = True; st['form'] = p['form']
-        if p.get('formlevel') or p['tag'] in ('executeChoiceFromList', 'executeChoiceFromMenu'):
+        if p.get('formlevel') or p['tag'] == 'executeChoiceFromList':
             close_elem()   # действие уровня ФОРМЫ — прямой child <Form>, не внутри элемента
             astr = ''.join(' %s=%s' % (k, quoteattr(str(v))) for k, v in (p['attrs'] or {}).items())
             out.append('\t\t\t<%s%s/>' % (p['tag'], astr)); continue
@@ -4801,7 +4990,7 @@ def _search_objects(c, root_key=None):
         if key and key not in seen:
             seen.add(key)
             out.append(item)
-    return out
+    return _code_execution.filter_objects(c, out)
 
 
 def _find(c, name=None, cls=None, type=None, root_key=None, title=None, seen_classes=None,
@@ -5194,12 +5383,42 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
     from contextlib import contextmanager
     steps = []
     stopped_at = None
+    journal = _state.get('_call_journal') if LOGGING else None
+    logged_attempts = []
+
+    def _begin_logged_step(target, action, arguments=None):
+        if journal is None or not journal.active:
+            return None
+        try:
+            return journal.begin('scenario', action,
+                                 _profiles.redact(dict(arguments or {}, target=target)), {})
+        except Exception:
+            journal.pause('log_write_failed')
+
+    def _finish_logged_step(call):
+        if call is None:
+            return
+        try:
+            result = call.get('result') or dict(ok=False, error='Scenario step interrupted')
+            call['result'] = _profiles.redact(result)
+            capture = None
+            if journal.mode != 'off' and not result.get('skipped'):
+                capture = lambda: _screenshots.capture(c)
+            journal.finish(call, capture)
+        except Exception:
+            journal.pause('log_write_failed')
 
     class _ReplayStopped(Exception):
         pass
 
     @contextmanager
-    def _attempt(target, action):
+    def _attempt(target, action, arguments=None):
+        # Form and nested FormField are containers, not additional replayed actions.
+        leaf = action not in ('Form', 'FormField')
+        call = _begin_logged_step(target, action, arguments) if leaf else None
+        token = _call_logging.CURRENT.set(call) if call is not None else None
+        if leaf:
+            logged_attempts.append(call)
         try:
             yield
         except _ReplayStopped:
@@ -5210,6 +5429,12 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
                 details = _batches.error(exc)
             _step({'target': target, 'action': action, **details,
                    'ok': False, 'error': str(exc), 'exception_type': type(exc).__name__})
+        finally:
+            if leaf:
+                logged_attempts.pop()
+            _finish_logged_step(call)
+            if token is not None:
+                _call_logging.CURRENT.reset(token)
 
     # Статус предполётной проверки последнего отправленного кадра шага. Без него шаг с
     # подтверждённым адресом, шаг без доступной проверки и шаг с выключенной проверкой выглядят
@@ -5240,6 +5465,14 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
         _chk['extra'] = {}
         _obs['v'] = None; _obs['applies'] = False; _obs['args'] = {}
         steps.append(d)
+        if logged_attempts:
+            if logged_attempts[-1] is not None:
+                logged_attempts[-1]['result'] = _profiles.redact(d)
+        else:
+            call = _begin_logged_step(d.get('target'), d.get('action'))
+            if call is not None:
+                call['result'] = _profiles.redact(d)
+                _finish_logged_step(call)
         if not d.get('ok') and not d.get('skipped'):
             raise _ReplayStopped()
 
@@ -5271,6 +5504,8 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
         НЕ шлём — старый клиент не ответит на неизвестный GUID и вызов повиснет до таймаута.
         Здесь же единственная точка проверки цели для воспроизведения: kind='commit' её не
         повторяет, поэтому на пару action+commit приходится одна проверка, как и в MCP-пути."""
+        if logged_attempts and logged_attempts[-1] is not None and key:
+            logged_attempts[-1]['targets'][key] = dict(key=key, handle=handle)
         if not guarded:
             _guard(guid, key, kind, handle)
         single = kind != 'commit' and not _obs['busy'] and guid in _READBACK_GUIDS
@@ -5373,6 +5608,8 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
         if a == 'decreaseValue': return _ac(G.DECREASE_VALUE, key, handle)
         if a == 'openDropList':  return _ac(G.OPEN_DROP_LIST, key, handle)
         if a == 'startChoosing': return _ac(G.START_CHOOSING, key, handle)
+        if a == 'executeChoiceFromMenu':
+            return _ac(G.EXECUTE_CHOICE_FROM_MENU, key, handle, _choice_mid(act))
         if a == 'chooseRow':     return _ac(G.CHOOSE_ROW, key, handle)
         if a == 'gotoValue':     return _ac(G.GOTO_VALUE, key, handle, tc1c.mk_goto_value(int(act.get('presentation', '0'))))
         if a == 'executeChoiceFromChoiceList':
@@ -5388,7 +5625,11 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
             return False
         if a == 'setCurrentArea':
             return _ac(G.SET_CURRENT_AREA, key, handle, tc1c.mk_command(act.get('area') or act.get('address') or act.get('presentation') or ''))
-        if a == 'beginEditingCurrentArea': return _ac(G.BEGIN_EDIT_CURRENT_AREA, key, handle)
+        if a == 'beginEditingCurrentArea':
+            before = _area_action_window(c)
+            ok = _ac(G.BEGIN_EDIT_CURRENT_AREA, key, handle)
+            _area_edit_started(c, key, handle, before, ok)
+            return ok
         if a == 'finishEditingCurrentArea':
             mid = CANCEL_EDIT_MID if act.get('cancel', 'false') == 'true' else RS
             return _ac(G.END_EDIT_CURRENT_AREA, key, handle, mid)
@@ -5425,7 +5666,11 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
                         return True
             return _ac(G.CLOSE_DROP_LIST, key, handle)
         if a == 'FormField':     # вложенное редактирование области табличного документа: begin + ввод в ту же область
+            before = _area_action_window(c)
             ok = _ac(G.BEGIN_EDIT_CURRENT_AREA, key, handle)
+            _area_edit_started(c, key, handle, before, ok)
+            if not ok:
+                return False
             for sub in list(act):
                 r = _replay(key, handle, sub)
                 ok = (r if r is not None else True) and ok
@@ -5471,7 +5716,7 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
                           if 'ciPath' in node.attrib else elems.get(name))
                     for act in list(node):
                         a = act.tag.split('}')[-1]
-                        with _attempt(name, a):
+                        with _attempt(name, a, act.attrib):
                             if not el:
                                 _step({'target': name, 'action': a, 'ok': False, 'error': 'element not found'}); continue
                             try:
@@ -5488,7 +5733,7 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
                     cells = _table_cells(c, tel['key'])
                     for act in list(node):
                         a = act.tag.split('}')[-1]
-                        with _attempt(tname, a):
+                        with _attempt(tname, a, act.attrib):
                             try:
                                 if a == 'addRow':
                                     ok = _ac(G.ACTIVATE, tel['key'], tel['handle']) and _ac(G.ADD_ROW, tel['key'], tel['handle'])
@@ -5603,7 +5848,7 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
                                     cn = act.get('name'); cell = cells.get(cn)
                                     for cact in list(act):
                                         ca = cact.tag.split('}')[-1]
-                                        with _attempt('%s/%s' % (tname, cn), ca):
+                                        with _attempt('%s/%s' % (tname, cn), ca, cact.attrib):
                                             if not cell:
                                                 _step({'target': '%s/%s' % (tname, cn), 'action': ca, 'ok': False, 'error': 'column not found'}); continue
                                             res = _replay(cell['key'], cell['handle'], cact)
@@ -5624,7 +5869,7 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
                                 else:
                                     _step({'target': tname, 'action': a, 'ok': False, 'error': str(e), **e.details})
                 elif tag in FORM_ACTIONS:
-                    with _attempt('<form>', tag):
+                    with _attempt('<form>', tag, node.attrib):
                         try:
                             res = _replay_form(formobj, node)
                             _step({'target': '<form>', 'action': tag, 'ok': bool(res), 'skipped': res is None})
@@ -5695,7 +5940,7 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
             for node in list(w):
                 tag = node.tag.split('}')[-1]
                 try:
-                    with _attempt('<form>' if tag == 'Form' else '<window>', tag):
+                    with _attempt('<form>' if tag == 'Form' else '<window>', tag, node.attrib):
                         _window_action(node, tag)
                 except _VerErr as e:
                     _step({'target': '<window>', 'action': tag, 'ok': False, 'error': str(e), **e.details})
@@ -6544,6 +6789,7 @@ _DERIVED_REF_SOURCES = {
 
 def _ref_live_object(c, key):
     """Re-read the exact object through its native source, including non-tree subobjects."""
+    _code_execution.guard(c, G.GET_CHILD_OBJECTS, key)
     parent = _collection_parent(key)
     if not parent:
         r = c.send_cmd(G.GET_CHILD_OBJECTS, None, kind='read', middle=CHILD_MIDDLE)
@@ -6571,6 +6817,7 @@ _LOG_CHANGING = _VERIFY_ACTIONS | frozenset({
     'execute_command', 'answer_dialog', 'close_user_messages_panel', 'choose_user_message',
     'set_fields', 'set_row_values', 'add_rows', 'set_cell_text', 'set_area_text', 'run_scenario',
     'read_rows', 'find_rows', 'create_snapshot', 'compare_snapshot', 'get_context',
+    'execute_code', 'execute_query', 'execute_custom_bsl_function',
 })
 
 
@@ -6625,7 +6872,7 @@ def _dispatch_connected_action(acts, group, kw, connection_id=None):
                 capture = None
                 released = (action in ('disconnect', 'stop_client') and isinstance(result, dict)
                             and result.get('ok') is True and _state.get('client') is None)
-                if not released and (journal.mode == 'all' or (journal.mode == 'actions' and (action in _LOG_CHANGING or failed))):
+                if action != 'run_scenario' and not released and (journal.mode == 'all' or (journal.mode == 'actions' and (action in _LOG_CHANGING or failed))):
                     def capture():
                         return _screenshots.capture(_state.get('client'))
                 journal.finish(call, capture)
@@ -6683,6 +6930,8 @@ def _dispatch_connected_action_impl(acts, group, kw, connection_id=None):
         res = {'ok': False, 'code': exc.code, 'error': str(exc)}
     except _batches.Failure as exc:
         res = {'ok': False, **_batches.error(exc)}
+    except _code_execution.Failure as exc:
+        res = exc.result
     except tc1c.OperationError as exc:
         res = exc.result()
         if _address_mode() == 'id':
@@ -6700,12 +6949,24 @@ def _dispatch_connected_action_impl(acts, group, kw, connection_id=None):
     return _deliver(res, addrs=('tc_' + name) in _response.ADDR_TOOLS)
 
 
+def _finish_forced_disconnect(connection, pool=None):
+    try:
+        tc_disconnect()
+        journal = _state.get('_call_journal')
+        if journal is not None:
+            try: journal.stop(reason='disconnect')
+            except Exception: journal.pause('log_write_failed')
+    finally:
+        (pool or _connection_pool()).finish(connection)
+
+
 def _dispatch_action(acts, group, kw):
     kw = dict(kw)
     name = kw.get('action')
     connection_id = kw.pop('connection_id', None)
     connection = None
     profile = None
+    helper_epf = None
     password_token = None
     try:
         if name not in acts:
@@ -6718,7 +6979,10 @@ def _dispatch_action(acts, group, kw):
             return _dispatch_connected_action(acts, group, kw)
         if name in ('connect', 'launch_client'):
             args = {k: v for k, v in kw.items() if k != 'action' and v is not None}
+            if 'code_epf' in args and (_execution.get() is None or name != 'launch_client'):
+                raise _profiles.ProfileError('profile_only_setting', 'The processing path is set in the server settings or a launch profile.')
             args, profile = _profiles.resolve(name, args)
+            helper_epf = args.pop('code_epf', None)
             kw = {'action': name, **args}
             if profile is not None:
                 password_token = _profiles.PASSWORD.set(args.get('password'))
@@ -6734,7 +6998,15 @@ def _dispatch_action(acts, group, kw):
             refs = [kw[k] for k in ('ref', 'root_ref') if kw.get(k) is not None]
             refs.extend(_batches.refs(name, kw))
             connection = _connection_pool().select(connection_id, refs, stop=name == 'stop_client')
-        with _connection_pool().use(connection):
+        if name == 'disconnect' and kw.get('force') is True:
+            # Validate before interrupting: a malformed request must have no side effects.
+            inspect.signature(acts[name]).bind(**{k: v for k, v in kw.items() if k != 'action' and v is not None})
+            pool = _connection_pool()
+            result = pool.force_disconnect(connection, functools.partial(_finish_forced_disconnect, connection, pool))
+            return _deliver(result)
+        with _connection_pool().use(connection, action=name):
+            if name == 'launch_client':
+                _state['_code_epf'] = helper_epf
             previous_profile = _state.get('profile')
             previous_client = _state.get('client')
             if profile is not None:
@@ -6752,7 +7024,7 @@ def _dispatch_action(acts, group, kw):
                 if name in ('connect', 'launch_client', 'disconnect', 'stop_client'):
                     _connection_pool().finish(connection)
     except (_connections.ConnectionError, _profiles.ProfileError) as exc:
-        result = {'ok': False, 'code': exc.code, 'error': str(exc)}
+        result = {'ok': False, 'code': exc.code, 'error': str(exc), **getattr(exc, 'details', {})}
         if exc.code in ('connection_required', 'connection_not_found', 'not_connected'):
             result['connections'] = _connection_pool().list()
         return _deliver(_profiles.redact(result))

@@ -30,6 +30,27 @@ def screen_unobstructed(window, windows, desktop):
                    and w['z'] < window['z'] and intersects(w['rect'], r) for w in windows)
 
 
+def _print_window(user32, gui, win32process, window, dc):
+    hwnd = window['hwnd']
+
+    def check_window():
+        if (not gui.IsWindow(hwnd)
+                or tuple(win32process.GetWindowThreadProcessId(hwnd)) != (window['tid'], window['pid'])):
+            raise CaptureError('screenshot_window_changed', 'The 1C window changed during capture. Take another screenshot.')
+
+    check_window()
+    try:
+        return user32.PrintWindow(hwnd, dc, 2)
+    finally:
+        check_window()
+        if gui.GetWindowPlacement(hwnd)[1] == 3:  # SW_SHOWMAXIMIZED
+            # 8.5 can loop in WM_PAINT after PrintWindow leaves the maximized
+            # frame invalid. Finish pending frame/background painting; preserve
+            # client-area updates and leave child windows to their own painting.
+            if not user32.RedrawWindow(hwnd, None, None, 0x0200 | 0x0040):  # RDW_ERASENOW | RDW_NOCHILDREN
+                raise CaptureError('screenshot_redraw_failed', 'Windows could not finish repainting the 1C window after capture.')
+
+
 def capture_windows(request):
     import psutil
     import win32gui as gui
@@ -56,6 +77,8 @@ def capture_windows(request):
     user32.SetProcessDpiAwarenessContext(wintypes.HANDLE(-4))
     user32.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
     user32.PrintWindow.restype = wintypes.BOOL
+    user32.RedrawWindow.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT), wintypes.HANDLE, wintypes.UINT]
+    user32.RedrawWindow.restype = wintypes.BOOL
     user32.GetDC.argtypes = [wintypes.HWND]
     user32.GetDC.restype = wintypes.HDC
     user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
@@ -145,19 +168,25 @@ def capture_windows(request):
             old = gdi.SelectObject(dst, bitmap)
             if not old or old == ctypes.c_void_p(-1).value:
                 return None
+
+            def pixels():
+                img = Image.frombytes('RGB', (rw, rh), ctypes.string_at(bits, rw * rh * 4), 'raw', 'BGRX', 0, 1)
+                return None if all(lo == hi for lo, hi in img.getextrema()) else img
+
             # Prefer actual visible pixels: this also includes GPU-rendered choice lists.
             if not request.get('isolated') and screen_unobstructed(w, windows, desktop):
-                if not gdi.BitBlt(dst, 0, 0, rw, rh, screen, rect[0], rect[1], 0x00CC0020 | 0x40000000):
-                    return None
-                source = 'screen'
-            elif user32.PrintWindow(w['hwnd'], dst, 2):
-                source = 'window'
-            else:
-                return None
-            img = Image.frombytes('RGB', (rw, rh), ctypes.string_at(bits, rw * rh * 4), 'raw', 'BGRX', 0, 1)
-            if all(lo == hi for lo, hi in img.getextrema()):
-                return None
-            return img, source
+                if gdi.BitBlt(dst, 0, 0, rw, rh, screen, rect[0], rect[1], 0x00CC0020 | 0x40000000):
+                    img = pixels()
+                    if img is not None:
+                        return img, 'screen'
+            # An available desktop can still yield empty screen pixels. Capture
+            # this window directly, clearing any partial screen image first.
+            ctypes.memset(bits, 0, rw * rh * 4)
+            if _print_window(user32, gui, win32process, w, dst):
+                img = pixels()
+                if img is not None:
+                    return img, 'window'
+            return None
         finally:
             if old and old != ctypes.c_void_p(-1).value:
                 gdi.SelectObject(dst, old)

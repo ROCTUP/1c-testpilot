@@ -559,6 +559,7 @@ def write(S, entries=None, key=None, handle=None, cells=None):
     action = 'set_row_values' if row else 'set_fields'
     out = {'ok': False, 'results': [], 'completed': 0, 'final_verified': None}
     if row:
+        out['target'] = key
         out['edit_finished'] = None
     mark, current, window = None, None, None
     try:

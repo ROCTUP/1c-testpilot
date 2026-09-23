@@ -312,10 +312,13 @@ def present(payload, action, registry):
     if action == 'set_row_values' and 'results' in payload:
         out['results'] = [{**v, 'page': node(v['page'])} if isinstance(v, dict) and 'page' in v else v
                           for v in payload['results']]
-    if extra_pages or any('failure_context' in v for v in envelopes):
+    if extra_pages or any('failure_context' in v for v in envelopes) or any('target' in v for v in envelopes[1:]):
         import copy
         out = copy.deepcopy(out)
     for envelope in _envelopes(out, action):
+        target = envelope.get('target')
+        if isinstance(target, str) and target in refs:
+            envelope['target'] = refs[target]
         if isinstance(envelope.get('page'), dict):
             envelope['page'] = node(envelope['page'])
         for obj in _failure_objects(envelope.get('failure_context', {})):

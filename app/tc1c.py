@@ -5,6 +5,8 @@
 Кадры собираются программно (build_frame): голова + ключ + хвост, подстановка GUID сессии.
 """
 import socket, re, base64, uuid, struct, time, os
+import select
+import threading
 if os.name == 'nt':
     import sspi, sspicon, win32security
 else:
@@ -16,6 +18,7 @@ _WIRE_ESCAPE = bytes.fromhex('6552b1a5')
 TOK_GUID = b'671507fd-50a9-4b63-b70e-58b3d364f48f'
 SESS_BLOCK = b'3ace6d91-51bb-4344-9388-c8105ad4ad11'
 NETWORK_GREETING = bytes.fromhex('53f5c61a7b')
+KEEPALIVE = bytes.fromhex('214754b3')
 
 # ---------- кодек значений ----------
 def enc_int(n):
@@ -241,16 +244,24 @@ def _enc_bytes(hi, b):
     width, low = (2, 11) if len(b) <= 65535 else (8, 12)
     return bytes([hi | low]) + len(b).to_bytes(width, 'little') + b
 
+def _enc_collection_count(count):
+    """Collection size: compact c1..ca for 0..9, otherwise cb/cd/cf + integer."""
+    if count < 10:
+        return bytes([0xc1 + count])
+    size = enc_int(count)
+    return bytes([size[0] | 0x40]) + size[1:]
+
 def mk_attachments(attachments):
     """Аргумент «Вложения» (Структура {имя: Картинка}):
-    23 95 + type-GUID структуры + <0xc1+число> + пары. Пара: <c0|20 20 20 e0> 4b 53 +
-    имя(9_) + eb 23 95 + type-GUID картинки + c2 c1 + байты картинки (9a/9b по длине)."""
-    out = b'\x23\x95' + _STRUCT_TYPE + bytes([0xc1 + len(attachments)])
+    23 95 + type-GUID структуры + число пар (c1..ca / cb / cd / cf) + пары.
+    Пара: <c0|20 20 20 e0> 4b 53 + имя(9_) + eb 23 95 + type-GUID картинки
+    + c2 c1 + байты картинки (9a/9b/9c по длине)."""
+    out = bytearray(b'\x23\x95' + _STRUCT_TYPE + _enc_collection_count(len(attachments)))
     for i, (name, data) in enumerate(attachments.items()):
         out += (b'\x20\x20\x20\xe0' if i else b'\xc0') + b'\x4b\x53'
         out += _enc_like(0x90, name)
         out += b'\xeb\x23\x95' + _PICTURE_TYPE + b'\xc2\xc1' + _enc_bytes(0x90, bytes(data))
-    return out
+    return bytes(out)
 
 def mk_html(value, attachments=None):
     """Аргумент ВвестиHTML(Документа): значение семейства f_ (fa ASCII / f7 UTF-16) + cb 55.
@@ -267,9 +278,22 @@ def dec_attachments(middle):
     if p < 0:
         return {}
     out = {}
-    i = p + 3 + len(_STRUCT_TYPE) + 1                    # + байт числа элементов
+    i = p + 3 + len(_STRUCT_TYPE)
+    if i >= len(middle):
+        return out
+    tag = middle[i]
+    if 0xc1 <= tag <= 0xca:
+        count, i = tag - 0xc1, i + 1
+    elif tag in (0xcb, 0xcd, 0xcf):
+        width = {0xcb: 1, 0xcd: 2, 0xcf: 4}[tag]
+        if i + 1 + width > len(middle):
+            return out
+        count = int.from_bytes(middle[i + 1:i + 1 + width], 'little')
+        i += 1 + width
+    else:
+        return out
     mark = b'\x4b\x53'
-    while True:
+    for _ in range(count):
         q = middle.find(mark, i)
         if q < 0:
             break
@@ -350,15 +374,15 @@ _GOTOROW_MAPTYPE = uuid.UUID('3d48feae-a9c6-4c5a-a099-9eb6477630c6').bytes_le
 
 def mk_row_map(pairs):
     """ОписаниеСтроки (Соответствие {колонка: значение}) из ЛЮБОГО числа пар:
-    23 95 + type-GUID + <0xc1+число пар> + пары. Пара: <c0 | 20 e0> 4b 53 + колонка(9_)
+    23 95 + type-GUID + число пар (c1..ca / cb / cd / cf) + пары. Пара: <c0 | 20 e0> 4b 53 + колонка(9_)
     + eb 53 + значение (9_ строка либо 8b/8d/8f число). Ставится ВМЕСТО хвостового 55
     в middle метода (e1 cb 55 -> e1 cb <карта>; e0 4b 55 -> e0 4b <карта>)."""
-    out = b'\x23\x95' + _GOTOROW_MAPTYPE + bytes([0xc1 + len(pairs)])
+    out = bytearray(b'\x23\x95' + _GOTOROW_MAPTYPE + _enc_collection_count(len(pairs)))
     for i, (col, val) in enumerate(pairs):
         v = enc_int(val) if isinstance(val, int) else _enc_like(0x90, val)
         out += (b'\x20\xe0' if i else b'\xc0') + b'\x4b\x53'
         out += _enc_like(0x90, col) + b'\xeb\x53' + v
-    return out
+    return bytes(out)
 
 
 def mk_row_desc(column, value):
@@ -448,7 +472,12 @@ def decode_operation_status(raw, method_guid=None):
 
 def empty_current_form_item(raw):
     """Recognize an explicit absent current item, not a failed object scan."""
-    p = _reply_status_offset(raw, 'cf73f146-1108-428c-b89e-9790567846c4')
+    return empty_object_reply(raw, 'cf73f146-1108-428c-b89e-9790567846c4')
+
+
+def empty_object_reply(raw, method_guid):
+    """Recognize the native successful null-object reply for a specific method."""
+    p = _reply_status_offset(raw, method_guid)
     return p is not None and raw[p:] == b'\x81\x81\x81\xe0\x4b\x55\x20\x20\xa1\xa3' + TR
 
 
@@ -471,6 +500,10 @@ class ConnectionFailure(RuntimeError):
         if self.attempts is not None:
             out['attempts'] = self.attempts
         return out
+
+
+class CommandNotSentTimeout(TimeoutError):
+    """The local deadline expired before any bytes of the command were sent."""
 
 
 class OperationError(RuntimeError):
@@ -1348,10 +1381,50 @@ class TestClient:
         self._direct_session = False
         self._first_binary = False
         self._io_deadline = None
+        self._interrupted = False
+        self._send_lock = threading.Lock()
+        self._keepalive_stop = None
+        self._keepalive_thread = None
 
     RECV_TIMEOUT = 30            # базовый таймаут ожидания ответа на команду, с
     CONNECT_TIMEOUT = 10         # ожидание кадров рукопожатия (retries × это время до отказа)
     RESYNC_TIMEOUT = 3           # ожидание запоздавших ответов после таймаута, с
+    KEEPALIVE_INTERVAL = 5       # интервал поддержания соединения, с
+
+    @staticmethod
+    def _keepalive_loop(sock, stop, send_lock, interval):
+        # This is a transport marker, without TR, a counter or a reply. In
+        # particular, never read here: replies belong to the command reader.
+        while not stop.wait(interval):
+            if not send_lock.acquire(blocking=False):
+                continue            # a command is already sending data
+            try:
+                if stop.is_set():
+                    return
+                # Do not change the socket timeout: a command may be receiving
+                # its reply concurrently. Only send the four bytes when writable.
+                if select.select([], [sock], [], 0)[1]:
+                    sock.sendall(KEEPALIVE)
+            except (OSError, ValueError):
+                # Wake the command reader, but leave its buffers, pending replies
+                # and callbacks alone. Never close a replacement connection.
+                stop.set()
+                try: sock.shutdown(socket.SHUT_RDWR)
+                except OSError: pass
+                sock.close()
+                return
+            finally:
+                send_lock.release()
+
+    def _start_keepalive(self):
+        if self._keepalive_thread is not None and self._keepalive_thread.is_alive():
+            return
+        stop = self._keepalive_stop = threading.Event()
+        thread = self._keepalive_thread = threading.Thread(
+            target=self._keepalive_loop,
+            args=(self.s, stop, self._send_lock, self.KEEPALIVE_INTERVAL),
+            name='tc1c-keepalive', daemon=True)
+        thread.start()
 
     def _io_timeout(self, timeout):
         deadline = self._io_deadline
@@ -1363,8 +1436,9 @@ class TestClient:
         return remaining if timeout is None else min(timeout, remaining)
 
     def _handshake_send(self, data):
-        self.s.settimeout(self._io_timeout(self.CONNECT_TIMEOUT))
-        self.s.sendall(data)
+        with self._send_lock:
+            self.s.settimeout(self._io_timeout(self.CONNECT_TIMEOUT))
+            self.s.sendall(data)
 
     def _recv_timeout(self):
         """Таймаут ожидания ответа. По умолчанию RECV_TIMEOUT; если задан max_action_time
@@ -1414,6 +1488,8 @@ class TestClient:
             raise
 
     def _require_socket(self):
+        if self._interrupted:
+            raise ConnectionError('The connection was forcibly disconnected. The outcome of the interrupted action may be unknown.')
         if self.s is None:
             raise ConnectionError('The test-client connection is closed. Reconnect with tc_session(action="connect").')
 
@@ -1430,16 +1506,20 @@ class TestClient:
             raise
 
     def _resync(self):
-        """Выбросить запоздавшие ответы после таймаута. Если они ещё не пришли — отказ:
+        """Прочитать запоздавшие ответы после таймаута. Если они ещё не пришли — отказ:
         слать новую команду в сдвинутый поток нельзя, ответы поедут на одну команду назад."""
         while self._pending:
             try:
-                self._read_frame(self.RESYNC_TIMEOUT)
+                reply = self._read_frame(self.RESYNC_TIMEOUT)
             except socket.timeout:
                 raise RuntimeError('the connection desynchronised after a timeout: %d answer(s) to '
                                    'earlier commands were never received — call tc_disconnect '
                                    'and tc_connect' % self._pending)
             self._pending -= 1
+            # A composite operation may need the late status before sending its next frame.
+            callback = vars(self).pop('_pending_reply_callback', None)
+            if callback is not None:
+                callback(reply)
 
     def _set_tok(self, tpl, tok):
         return re.subn(TOK_GUID+rb',\s*\{[^}]*\}', TOK_GUID+b',\r\n{'+base64.b64encode(tok)+b'}\r\n', tpl)[0]
@@ -1482,7 +1562,7 @@ class TestClient:
         """Reconnect after the peer explicitly requests network negotiation.
 
         A plain SCOM intro sent to this listener produces GREETING + TR and closes
-        that stream. Reconnect and follow the native manager's sequence. Detecting
+        that stream. Reconnect and negotiate the network preamble. Detecting
         the response avoids guessing from host names, IP addresses or short waits.
         """
         self.close()
@@ -1508,6 +1588,8 @@ class TestClient:
         """Рукопожатие строится программно (build_scom/intro_ticket/build_session_frame):
         intro -> при необходимости NTLM -> установка сессии."""
         import os, getpass
+        self.close()
+        self._interrupted = False
         pc = (os.environ.get('COMPUTERNAME') or socket.gethostname()).strip()
         user = getpass.getuser()
         ver = self.platform_version or self.DEFAULT_VER
@@ -1588,11 +1670,15 @@ class TestClient:
                         raise ConnectionError('The test client rejected session initialization.')
                     self._counter += 1
                 self._first_binary = True
+                self._start_keepalive()
                 return reply
             except Exception:
                 self.close()
                 raise
-        self._handshake_send(build_attach(self.sess)); return self._check_handshake_reply(self._recv(), 'attach')
+        self._handshake_send(build_attach(self.sess))
+        reply = self._check_handshake_reply(self._recv(), 'attach')
+        self._start_keepalive()
+        return reply
 
     def send_cmd(self, method_guid, key, kind='read', middle=b'', handle=None, per_call=None, pad=None,
                  timeout=0):
@@ -1601,25 +1687,44 @@ class TestClient:
         (ставится в позицию per-call); pad — переопределение хвостовых 0x20 (GotoRow=7, SFDR=4);
         timeout — ожидание ответа (0 = по умолчанию/max_action_time, см. _recv).
         Возвращает разобранный ответ."""
+        guard = getattr(self, '_command_guard', None)
+        if guard is not None:
+            guard(method_guid, key)
         validate_address(key, handle)
         self._require_socket()
         if self._pending:
             self._resync()          # выбросить запоздавшие ответы, иначе прочитаем чужой кадр
-        self._counter = (self._counter + 1) & 0xffff
-        fr = build_frame(self.sess, self._counter, method_guid, key,
-                         kind=kind, middle=middle, per_call=per_call or handle, pad=pad)
-        if self._first_binary:
-            # The first binary request declares the opcode; later requests reuse it.
-            pos = 20 if self._counter < 256 else 21
-            fr = fr[:pos] + fr[pos+1:]
-            self._first_binary = False
+        # A local deadline before sending is not a broken socket or a partial request.
+        # Check it before consuming the counter and first-frame marker too.
         try:
-            # The previous receive may have left only a fraction of its deadline on the socket.
-            self.s.settimeout(self._io_timeout(self._recv_timeout() if timeout == 0 else timeout))
-            self.s.sendall(_escape_frame(fr))
-        except OSError:
-            self.close()
-            raise
+            send_timeout = self._io_timeout(self._recv_timeout() if timeout == 0 else timeout)
+        except TimeoutError as exc:
+            raise CommandNotSentTimeout(str(exc)) from exc
+        if not self._send_lock.acquire(timeout=-1 if send_timeout is None else send_timeout):
+            raise CommandNotSentTimeout('Timed out waiting to send a test-client command.')
+        try:
+            self._require_socket()
+            try:
+                send_timeout = self._io_timeout(send_timeout)
+            except TimeoutError as exc:
+                raise CommandNotSentTimeout(str(exc)) from exc
+            self._counter = (self._counter + 1) & 0xffff
+            fr = build_frame(self.sess, self._counter, method_guid, key,
+                             kind=kind, middle=middle, per_call=per_call or handle, pad=pad)
+            if self._first_binary:
+                # The first binary request declares the opcode; later requests reuse it.
+                pos = 20 if self._counter < 256 else 21
+                fr = fr[:pos] + fr[pos+1:]
+                self._first_binary = False
+            try:
+                # The previous receive may have left a short deadline on the socket.
+                self.s.settimeout(send_timeout)
+                self.s.sendall(_escape_frame(fr))
+            except OSError:
+                self.close()
+                raise
+        finally:
+            self._send_lock.release()
         r=self._recv(timeout)
         status = decode_operation_status(r, method_guid)
         if status not in (None, 0):
@@ -1629,13 +1734,37 @@ class TestClient:
         return {'opcode': r[0], 'ok': r[0]==0x42, 'raw': r,
                 'values': decode_stream(r[:-4], 21)}
 
+    def interrupt(self):
+        """Wake a blocked socket operation without changing worker-owned protocol state."""
+        self._interrupted = True
+        if self._keepalive_stop is not None:
+            self._keepalive_stop.set()
+        sock = self.s
+        if sock is not None:
+            try: sock.shutdown(socket.SHUT_RDWR)
+            except OSError: pass
+            # On Windows shutdown alone need not wake a blocking recv. Keep self.s
+            # pointing at this (now closed) object until the owning worker unwinds.
+            sock.close()
+
     def close(self):
+        if self._keepalive_stop is not None:
+            self._keepalive_stop.set()
+            if self.s is not None:
+                try: self.s.shutdown(socket.SHUT_RDWR)
+                except OSError: pass
         try: self.s.close()
         except Exception: pass
+        thread = self._keepalive_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1)
+        self._keepalive_thread = None
+        self._keepalive_stop = None
         self.s = None
         self.sess = None
         self._buf = b''
         self._pending = 0
+        vars(self).pop('_pending_reply_callback', None)
         self._direct_session = False
         self._first_binary = False
 

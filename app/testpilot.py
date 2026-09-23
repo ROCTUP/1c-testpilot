@@ -1,5 +1,6 @@
 """Synchronous Python API for 1C Testpilot. No MCP server is created or started."""
 from functools import partial
+from contextlib import contextmanager
 import inspect
 import math
 import sys
@@ -27,6 +28,8 @@ class Client:
 
     Client(profile='demo') starts that profile on entering the context. connect()
     attaches to an existing client; launch_client() starts an owned process.
+    launch_client(code_epf='.../Testpilot.epf') prepares code, queries, metadata and custom BSL functions.
+    The path can come from the profile or TC1C_CODE_EPF; code_epf='' skips the processing.
     close() stops owned processes and only disconnects from externally started ones.
     All actions are also available as call('action', **parameters), returning Python
     dictionaries (or Screenshot for get_screenshot). Failed actions raise ActionError.
@@ -75,7 +78,13 @@ class Client:
 
     def call(self, action, *, check=True, **arguments):
         """Call an existing Testpilot action. check=False returns expected refusals."""
-        with self._lock:
+        control = action == 'list_connections' or (action == 'disconnect' and arguments.get('force') is True)
+        acquired = False if control else self._lock.acquire(timeout=self._runtime.pool.wait_timeout)
+        if not control and not acquired:
+            result = self._busy_result()
+            if check: raise ActionError(action, result)
+            return result
+        try:
             if self._closed:
                 raise ActionError(action, {'code': 'client_closed', 'error': 'Create a new Client after close().'})
             if action not in R._ACTION_GROUP:
@@ -97,9 +106,35 @@ class Client:
             if check and isinstance(result, dict) and result.get('ok') is False:
                 raise ActionError(action, result)
             return result
+        finally:
+            if acquired: self._lock.release()
+
+    def _busy_result(self):
+        entries = self._runtime.pool.list()
+        result = {'ok': False, 'code': 'connection_busy', 'error': 'The previous action is still running.',
+                  'queue_timeout': self._runtime.pool.wait_timeout}
+        if entries:
+            result.update({k: entries[0][k] for k in ('connection_id', 'busy', 'active_action', 'active_seconds')})
+        return result
+
+    @contextmanager
+    def _access(self, action):
+        if not self._lock.acquire(timeout=self._runtime.pool.wait_timeout):
+            raise ActionError(action, self._busy_result())
+        previous, generation = self._connected_object(), self._generation
+        try: yield
+        except R._connections.ConnectionError as exc:
+            raise ActionError(action, dict(ok=False, code=exc.code, error=str(exc), **exc.details)) from exc
+        finally:
+            # Element verification can finish deferred disconnect cleanup before
+            # reaching Client.call. Invalidate its elements on that path as well.
+            if self._generation == generation and self._connected_object() is not previous:
+                self._generation += 1
+            self._lock.release()
 
     def _connected_object(self):
-        return next((entry.state.get('client') for entry in self._runtime.pool.entries.values()), None)
+        with self._runtime.pool.lock:
+            return next((entry.state.get('client') for entry in self._runtime.pool.entries.values()), None)
 
     def wait_until(self, description, probe, *, condition, timeout=120, interval=1):
         """Poll a read until condition(result) is true; return that result.
@@ -115,7 +150,7 @@ class Client:
             if (isinstance(value, bool) or not isinstance(value, (int, float))
                     or not math.isfinite(value) or value < 0 or (name == 'interval' and value == 0)):
                 raise ValueError(f'{name} must be finite and ' + ('positive' if name == 'interval' else 'nonnegative'))
-        with self._lock:
+        with self._access('wait_until'):
             if self._closed:
                 raise ActionError('wait_until', dict(ok=False, code='client_closed'))
             if R._call_logging.WAIT.get() is not None:
@@ -167,6 +202,8 @@ class Client:
         for name, value in arguments.items():
             if name == 'profile' and action in ('connect', 'launch_client'):
                 annotation = str
+            elif name == 'code_epf' and action == 'launch_client':
+                annotation = str
             elif name in params:
                 annotation = params[name].annotation
             else:
@@ -184,7 +221,7 @@ class Client:
         raise AttributeError(name)
 
     def find_objects(self, **criteria):
-        with self._lock:
+        with self._access('find_objects'):
             return [Element(self, obj) for obj in self.call('find_objects', **criteria)['objects']]
 
     def find_object(self, **criteria):
@@ -198,14 +235,14 @@ class Client:
         return objects[0]
 
     def read_fields(self, targets, properties=None):
-        with self._lock:
+        with self._access('read_fields'):
             return self.call('read_fields', targets=[self._address(o) for o in targets], properties=properties)
 
     def set_fields(self, values: Mapping):
         """Fill {Element: text_or_boolean}; the existing batch handles completion."""
         if not isinstance(values, Mapping):
             raise TypeError('set_fields expects a mapping of Element to text or boolean.')
-        with self._lock:
+        with self._access('set_fields'):
             entries = [{**self._address(element), 'checked' if type(value) is bool else 'text': value}
                        for element, value in values.items()]
             return self.call('set_fields', entries=entries)
@@ -217,7 +254,7 @@ class Client:
 
     def close(self):
         """Release this session; a failed stop retains ownership so close can be retried."""
-        with self._lock:
+        with self._access('close'):
             if self._closed:
                 return
             entries = self._runtime.pool.list()
@@ -244,8 +281,15 @@ class Element:
 
     def _live_object(self, action, address):
         # The caller holds the client lock through verification and the operation.
-        with self.client._runtime.pool.use(next(iter(self.client._runtime.pool.entries.values()))):
+        pool = self.client._runtime.pool
+        with pool.lock:
+            connection = next(iter(pool.entries.values()), None)
+        if connection is None:
+            raise ActionError(action, dict(ok=False, code='not_connected', error='No connected test client.'))
+        with pool.use(connection, action=action):
             c = R._state.get('client')
+            if c is None:
+                raise ActionError(action, dict(ok=False, code='not_connected', error='No connected test client.'))
             track = getattr(c, '_track', None)
             try:
                 c._track = None
@@ -256,6 +300,8 @@ class Element:
                     result.update(code='element_unavailable',
                                   error='The element is no longer available. Find it again.')
                 raise ActionError(action, result) from exc
+            except R._code_execution.Failure as exc:
+                raise ActionError(action, exc.result) from exc
             except (OSError, RuntimeError) as exc:
                 raise ActionError(action, {'ok': False, 'code': 'operation_failed',
                                           'error': str(exc)}) from exc
@@ -267,7 +313,7 @@ class Element:
         return found
 
     def call(self, action, **arguments):
-        with self.client._lock:
+        with self.client._access(action):
             address = self.address
             if any(k in arguments for k in ('key', 'handle', 'root_key', 'ref', 'root_ref')):
                 raise TypeError('The Element selects its own target.')
@@ -293,13 +339,13 @@ class Element:
         raise AttributeError(name)
 
     def find_objects(self, **criteria):
-        with self.client._lock:
+        with self.client._access('find_objects'):
             address = self.address
             self._live_object('find_objects', address)
             return self.client.find_objects(root_key=address['key'], **criteria)
 
     def find_object(self, **criteria):
-        with self.client._lock:
+        with self.client._access('find_object'):
             address = self.address
             self._live_object('find_object', address)
             return self.client.find_object(root_key=address['key'], **criteria)

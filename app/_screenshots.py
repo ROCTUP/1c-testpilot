@@ -84,6 +84,11 @@ def resolve_process(client):
 
 def capture(client, scale=100, grid=False, region=None):
     validate_options(scale, grid, region)
+    import _code_execution
+    try:
+        _code_execution.check_screenshot(client)
+    except _code_execution.Failure as exc:
+        raise CaptureError(exc.result['code'], str(exc)) from exc
     if sys.platform not in ('win32', 'linux'):
         raise CaptureError('screenshot_platform_unsupported', 'Screenshot capture is available on Windows and Linux with X11/XWayland.')
     pid, created = resolve_process(client)

@@ -10,7 +10,7 @@ import yaml
 PASSWORD = ContextVar('testpilot_profile_password', default=None)
 MAX_BYTES = 1024 * 1024
 LAUNCH = {'base', 'port', 'server', 'user', 'password', 'password_env', 'version',
-          'exe', 'extra_args', 'wait', 'connect', 'desktop'}
+          'exe', 'extra_args', 'wait', 'connect', 'desktop', 'code_epf'}
 CONNECT = {'host', 'port', 'version'}
 
 
@@ -109,7 +109,7 @@ def load():
 
 def paths(config, directory, explicit=()):
     result = dict(config)
-    for key in ('base', 'exe'):
+    for key in ('base', 'exe', 'code_epf'):
         if key not in result or key in explicit or (key == 'base' and result.get('server', False)):
             continue
         path = Path(result[key]).expanduser()

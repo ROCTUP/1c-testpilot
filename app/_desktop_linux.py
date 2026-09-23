@@ -51,7 +51,7 @@ def _authority(path, number, cookie):
 
 
 class IsolatedProcess:
-    def __init__(self, args):
+    def __init__(self, args, *, deadline=None):
         xvfb = shutil.which('Xvfb')
         if xvfb is None:
             raise OSError('Isolated launch requires Xvfb. Install xvfb (Debian/Ubuntu: sudo apt install xvfb).')
@@ -64,7 +64,10 @@ class IsolatedProcess:
                 pass_fds=(child.fileno(),), start_new_session=True, stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             child.close()
-            result = self._request(dict(action='start', args=args, xvfb=xvfb), 20)
+            remaining = 20 if deadline is None else min(20, deadline - time.monotonic())
+            if remaining <= 0:
+                raise TimeoutError('Test-client startup deadline expired.')
+            result = self._request(dict(action='start', args=args, xvfb=xvfb), remaining)
             if not result.get('ok'):
                 raise OSError(result.get('error', 'The isolated display could not be started.'))
             self.pid, self.created = result['pid'], result['created']
