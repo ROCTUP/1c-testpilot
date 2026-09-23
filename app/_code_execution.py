@@ -21,7 +21,8 @@ DEFAULT_FORBIDDEN = '''Удалить Delete Записать Write
 COMОбъект COMObject УстановитьМонопольныйРежим SetExclusiveMode
 УдалитьФайлы DeleteFiles КопироватьФайл CopyFile ПереместитьФайл MoveFile
 СоздатьКаталог CreateDirectory'''.split()
-ALWAYS_FORBIDDEN = {'выполнить', 'execute', 'вычислить', 'eval'}
+ALWAYS_FORBIDDEN = {'выполнить', 'execute', 'вычислить', 'eval',
+                    'командасистемы', 'system', 'запуститьприложение', 'runapp'}
 _internal = ContextVar('testpilot_service_access', default=None)
 
 
@@ -71,10 +72,26 @@ def settings():
 SETTINGS = settings()
 
 
-def tokens(text):
+# A BSL string may continue on the next lines only through lines that start with "|".
+# Blank lines and whole-line "//" comments between the parts belong to the code, not to the
+# string, so a quote inside such a comment must not close the literal. 1C ends a line at CR
+# as well as at LF; line breaks are normalised first, keeping every position unchanged.
+_BSL_STRING_PART = r'(?:""|[^"\n])*'
+_BSL_STRING_GAP = r'(?:[ \t\f\v]*(?://[^\n]*)?\n)*[ \t\f\v]*'
+_BSL_STRING = rf'"{_BSL_STRING_PART}(?:\n{_BSL_STRING_GAP}\|{_BSL_STRING_PART})*"'
+_BSL_TOKENS = re.compile(r'//[^\n]*|/\*[\s\S]*?\*/|' + _BSL_STRING + r'|[\w]+|[^\s]', re.UNICODE)
+_QUERY_TOKENS = re.compile(r'//[^\n]*|/\*[\s\S]*?\*/|"(?:""|[^"])*"|[\w]+|[^\s]', re.UNICODE)
+
+
+def bsl_lines(text):
+    """The same text with CRLF and lone CR turned into LF, at the same positions."""
+    return text.replace('\r\n', ' \n').replace('\r', '\n')
+
+
+def tokens(text, *, bsl=True):
     """Yield identifiers/punctuation with positions; strings and comments are opaque."""
-    pattern = re.compile(r'//[^\n]*|/\*[\s\S]*?\*/|"(?:""|[^"])*"|[\w]+|[^\s]', re.UNICODE)
-    for match in pattern.finditer(text):
+    pattern = _BSL_TOKENS if bsl else _QUERY_TOKENS
+    for match in pattern.finditer(bsl_lines(text) if bsl else text):
         word = match.group()
         if word.startswith(('//', '/*', '"')):
             if word == '"':
@@ -89,14 +106,14 @@ def validate_code(code):
     for word, start, end in tokens(code):
         if word in SETTINGS.forbidden:
             raise Failure('forbidden_code', 'This identifier is forbidden by the execution policy.',
-                          identifier=code[start:end], line=code.count('\n', 0, start) + 1)
+                          identifier=code[start:end], line=bsl_lines(code).count('\n', 0, start) + 1)
 
 
 def prepare_query(query):
     if not isinstance(query, str) or not query.strip():
         raise Failure('invalid_query', 'query must be nonempty query text.')
     try:
-        parsed = list(tokens(query))
+        parsed = list(tokens(query, bsl=False))
     except Failure as exc:
         raise Failure('invalid_query', str(exc)) from None
     if not parsed:
