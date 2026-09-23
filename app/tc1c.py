@@ -1335,7 +1335,12 @@ def _binary_frame_end(raw, start=1):
         tag = raw[i]
         low, high = tag & 15, tag & 0xf0
         size = 1
-        if high in (0x90, 0xb0, 0xd0, 0xf0):
+        if tag in (0xc0, 0xe0):         # type descriptor: c0/e0 55 + 16-byte GUID
+            if i + 1 >= len(raw):
+                return None, i
+            if raw[i + 1] == 0x55:
+                size = 18
+        elif high in (0x90, 0xb0, 0xd0, 0xf0):
             if low == 5:                 # binary GUID
                 size = 17
             elif low == 1:               # date

@@ -285,6 +285,9 @@ def ensure_area_pending(S, c, active_form):
 def ensure_pending(S, c, allowed):
     pending = getattr(c, '_pending_text_input', None)
     if pending and pending != allowed:
+        failure = S._check_pending_text_input(c)
+        if failure:
+            raise Failure(failure['code'], failure['error'], details=failure)
         # A user can resolve the dialog raised by input and explicitly move on.
         # The remembered input alone must not keep blocking the same form forever.
         form_key = owner(S, pending)

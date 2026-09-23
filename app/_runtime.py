@@ -1023,6 +1023,12 @@ def _verified(fn, action):
         state, visible = _verify_target(c, key, b.arguments.get('handle'))
         if state == 'absent':
             return _absent_error(key)
+        if not (key == getattr(c, '_pending_text_input', None) and action in
+                ('input_text', 'clear', 'cancel_edit', 'choose_from_drop_list',
+                 'execute_choice_from_choice_list', 'activate')):
+            error = _check_pending_text_input(c)
+            if error:
+                return error
         if action in ('goto_first_row', 'goto_last_row', 'goto_next_row', 'goto_previous_row',
                       'go_one_level_up', 'go_one_level_down') and b.arguments.get('column'):
             error = _column_error(c, key, b.arguments['column'])
@@ -1121,7 +1127,15 @@ def _window(c):
     metadata = next((it for it in tc1c.decode_collection(r['raw'])
                      if keys and it.get('key') == keys[0]), {}) if r.get('ok') else {}
     if keys:
-        _code_execution.guard(c, G.GET_ACTIVE_WINDOW, keys[0])
+        try:
+            _code_execution.guard(c, G.GET_ACTIVE_WINDOW, keys[0])
+        except _code_execution.Failure as exc:
+            if exc.result['code'] != 'service_form_protected':
+                raise
+            _state['window_key'] = None
+            return {'ok': True, 'key': None, 'class': None, 'title': None, 'addressable': False,
+                    'code': 'no_active_work_window', 'suggested_action': 'execute_command',
+                    'message': 'No work window is active. Open a form with execute_command.'}
     title = metadata.get('title')
     cls = keys[0].split('[')[0] if keys else None
     _state['window_key'] = keys[0] if keys else None
@@ -1684,7 +1698,8 @@ def tc_get_active_window() -> dict:
     actions unavailable on it are refused with available_since. addressable=false means the
     window has no element address; this alone does not identify its type. When local recovery
     is unavailable, code=active_window_unavailable explains how to continue. A local print preview may report native=true and
-    recovery="close_window": close it to return to the form before addressing form elements."""
+    recovery="close_window": close it to return to the form before addressing form elements.
+    no_active_work_window means no work window is active; use execute_command to open a form."""
     c = _need()
     w = _window(c)
     # заголовок берём у дочерней формы: в ответе самого окна его либо нет, либо он неотличим от
@@ -1779,6 +1794,10 @@ def _finish_input_text(c, key, text, handle):
         if _input_current(c, form) != key:
             result['message'] = 'The input field did not remain current. Inspect the form before continuing.'
             return result
+        error = _check_pending_text_input(c, current=key, form=form)
+        if error:
+            result.update(error)
+            return result
         c._track = track
         ok = True
         for kind in ('action', 'commit'):
@@ -1819,6 +1838,7 @@ def tc_input_text(key: str, text: str, handle: str, finish: bool = True) -> dict
     """Enter text. Ordinary form input fields finish automatically: the owning form moves
     focus once to its next element, then the accepted value is checked. finish=false leaves
     the editing buffer active, for example before choosing a reference suggestion or cancelling.
+    If pending text changes, subsequent actions report pending_input_changed; re-enter or cancel it.
     Empty text clears the value directly. Reference input can still need a matching value.
     committed=true confirms the accepted text; false means pending; null means unverified.
     edit_finished reports whether focus left the ordinary field. Numeric formatting can produce
@@ -1860,7 +1880,7 @@ def tc_input_text(key: str, text: str, handle: str, finish: bool = True) -> dict
                     message='Text input was refused. If this field selects an object, use start_choosing to select a value.')
     result = {'ok': ok, 'target': key, 'text': text}
     # Input has already succeeded; completion and its diagnostic reads may raise.
-    _remember_text_input(c, key, text, ok)
+    _remember_text_input(c, key, text, ok, handle=handle)
     if ok and finish and text and _key_class(key) == 'EditField' and '.Table[' not in key:
         if _kind_of(c, key) == 'InputField':
             result.update(_finish_input_text(c, key, text, handle))
@@ -1868,7 +1888,7 @@ def tc_input_text(key: str, text: str, handle: str, finish: bool = True) -> dict
     return result
 
 
-def _remember_text_input(c, key, text, input_ok, result=None):
+def _remember_text_input(c, key, text, input_ok, result=None, handle=None):
     """Share pending-input bookkeeping between direct input and scenario replay."""
     # A failed completion does not undo the preceding successful text input.
     result = result or {}
@@ -1876,6 +1896,73 @@ def _remember_text_input(c, key, text, input_ok, result=None):
         # Only one field can own the input focus; keep this per connection, bounded.
         c._pending_text_input = (key if text and result.get('edit_finished') is not True
                                 and result.get('committed') is not True else None)
+        if c._pending_text_input is None:
+            c._pending_text_value = None
+        elif handle is not None:
+            c._pending_text_value = None
+            if _kind_of(c, key) != 'InputField' or not _guid_available(c, G.GET_EDIT_TEXT):
+                return
+            track = getattr(c, '_track', None)
+            try:
+                c._track = None
+                actual = _pending_input_value(c, key, handle, G.GET_EDIT_TEXT)
+                if actual is not None:
+                    c._pending_text_value = dict(key=key, handle=handle, text=actual)
+            finally:
+                c._track = track
+
+
+def _pending_input_value(c, key, handle, guid):
+    try:
+        r = c.send_cmd(guid, key, kind='read', middle=RS if guid == G.GET_EDIT_TEXT else RC,
+                       handle=handle)
+        return _field_scalar_text(c, key, r, guid) if r.get('ok') else None
+    except tc1c.OperationError as exc:
+        if exc.status not in (10, 11, 17):
+            raise
+        return None
+
+
+def _check_pending_text_input(c, current=None, form=None):
+    """Check an observed editing buffer before an action can accept it."""
+    pending = getattr(c, '_pending_text_input', None)
+    saved = getattr(c, '_pending_text_value', None)
+    if not pending or not saved or saved['key'] != pending:
+        return None
+    track = getattr(c, '_track', None)
+    try:
+        c._track = None
+        owner = _batches.owner(sys.modules[__name__], pending)
+        if not owner or (form is None and _window(c).get('key') != _collection_parent(owner)):
+            return None  # A validation/choice dialog must remain operable.
+        form = form or _ref_live_object(c, owner)
+        if not form:
+            return None
+        current = _input_current(c, form) if current is None else current
+        if current != pending:
+            if current is not None:
+                c._pending_text_input = None
+                c._pending_text_value = None
+            return None
+        obj = _ref_live_object(c, pending)
+        if not obj or obj.get('handle') != saved['handle']:
+            c._pending_text_input = None
+            c._pending_text_value = None
+            return None
+        text = _pending_input_value(c, pending, saved['handle'], G.GET_EDIT_TEXT)
+        accepted = _pending_input_value(c, pending, saved['handle'], G.GET_PROPERTY)
+        expected = saved['text']
+        if any(value is not None and (value == expected or _numeric_equivalent(expected, value))
+               for value in (text, accepted)):
+            return None
+        if text is None or accepted is None:
+            return {'ok': False, 'code': 'input_state_unavailable', 'target': pending,
+                    'error': 'Pending text could not be verified. Inspect the field, retry or cancel input.'}
+        return {'ok': False, 'code': 'pending_input_changed', 'target': pending,
+                'expected_text': expected, 'edit_text': text, 'data_presentation': accepted,
+                'error': 'The entered text changed before input was completed. Enter it again or cancel input.'}
+    finally:
+        c._track = track
 
 @_action('tc_doc')
 def tc_input_html(key: str, html: str, handle: str, attachments: dict = None) -> dict:
@@ -2387,6 +2474,9 @@ def tc_read_rows(key: str, handle: str, max_rows: int = 500) -> dict:
         return {'ok': False, 'code': 'invalid_table', 'error': 'Read rows requires a table.'}
     if type(max_rows) is not int or not 0 <= max_rows <= 10000:
         return {'ok': False, 'code': 'invalid_row_limit', 'error': 'max_rows must be an integer from 0 to 10000.'}
+    error = _check_pending_text_input(c)
+    if error:
+        return dict(error, selection_changed=False)
     result = {'ok': False, 'target': key, 'rows': [], 'row_count': None,
               'selection_cleared': None, 'scope': 'selectable_rows'}
     attempted = False
@@ -2686,6 +2776,9 @@ def _select_delete_current(c, key, handle):
 
 def _table_activate(c, key, handle, window):
     """Prepare a table without committing another element's pending input."""
+    error = _check_pending_text_input(c)
+    if error:
+        raise _CellEditFailure(error['error'], error)
     form = _form_object(c)
     if not form or not key.startswith(form['key'] + '.'):
         raise _CellEditFailure('The table is not on the active form.', {'code': 'target_not_interactive'})
@@ -2960,7 +3053,15 @@ def tc_get_command_bar(key: str, handle: str) -> dict:
 
 # ===================== окно: навигация / команды / сообщения ================
 def _winkey(c):
-    k = _window(c)['key']
+    window = _window(c)
+    k = window['key']
+    if window.get('code') == 'no_active_work_window':
+        # Application navigation belongs to the main window when only the helper is active.
+        mains = [w for w in _read_open_windows(c) if w.get('class') == 'MainFrame'
+                 and not _code_execution.protected(c, w.get('key'))]
+        if len(mains) == 1:
+            k = mains[0]['key']
+            _code_execution.guard(c, G.GET_ACTIVE_WINDOW, k)
     if not k:
         raise RuntimeError('no active window')
     return k
@@ -2996,20 +3097,49 @@ def tc_goto_start_page() -> dict:
     return {'ok': ok, 'action': 'start_page'}
 
 @_action('tc_window')
-def tc_close_window() -> dict:
-    """Close the current active window. ok only says the close was accepted: the configuration may
-    answer with a modal question ('Send the invitations?', 'Save the changes?') and leave the
-    window open. Check with get_active_window afterwards. Also closes an active local print
-    preview identified by get_active_window, returning to the underlying form. If the active
-    window cannot be identified and local recovery is unavailable, returns
-    code=active_window_unavailable without closing another window."""
-    return _close_active_window(_need())
+def tc_close_window(key: str = None) -> dict:
+    """Close the window at ref, or the active window if omitted.
+    Returns closed only after verifying that the window disappeared. If it remains open,
+    returns window_not_closed and target; inspect the form or answer its dialog before retrying.
+    Also closes an active local print preview when ref is omitted."""
+    return _close_active_window(_need(), key=key)
 
 
-def _close_active_window(c, send=None, native_only=False):
+def _read_open_windows(c):
+    r = c.send_cmd(G.GET_CHILD_OBJECTS, None, kind='read', middle=CHILD_MIDDLE)
+    if not r.get('ok'):
+        raise RuntimeError('Could not read application windows.')
+    return tc1c.decode_collection(r['raw'], None)
+
+
+def _recorded_close_key(c, node):
+    """Resolve a recorded explicit window without substituting the active window."""
+    names = {'targetTitle': 'title', 'targetClass': 'class', 'targetUrl': 'url'}
+    matches = [w for w in _read_open_windows(c)
+               if all((w.get(field) or '') == node.get(attr, '') for attr, field in names.items())]
+    if len(matches) != 1:
+        raise _CellEditFailure('The recorded window is missing or ambiguous.',
+                               {'code': 'window_unavailable'})
+    return matches[0]['key']
+
+
+def _close_active_window(c, send=None, native_only=False, key=None, confirm=None):
     send = send or c.send_cmd
-    active = _window(c)
-    wk = active['key']; ok = True
+    if key is not None:
+        if not _WINDOW_KEY_RE.fullmatch(key):
+            return {'ok': False, 'code': 'invalid_window',
+                    'error': 'Pass a window reference, not a form or field reference.'}
+        _code_execution.guard(c, G.CLOSE, key)
+        active = next((w for w in _read_open_windows(c) if w.get('key') == key), None)
+        if active is None:
+            return {'ok': False, 'code': 'window_unavailable', 'target': key,
+                    'error': 'The window is no longer available.'}
+    else:
+        active = _window(c)
+        if active.get('code') == 'no_active_work_window':
+            raise _code_execution.Failure('service_form_protected',
+                'Use the dedicated Testpilot processing tools to access this form.')
+    wk = active['key']
     if native_only and not active.get('native'):
         return {'ok': False, 'error': 'the expected preview is not active; no window was closed'}
     if not wk:
@@ -3031,10 +3161,40 @@ def _close_active_window(c, send=None, native_only=False):
                     **({} if closed else {'error': 'the preview did not close; check the active window'})}
         info = _unavailable_window()
         return {'ok': False, 'closed': None, 'error': info.pop('message'), **info}
-    for kind in ('action', 'commit'):
-        ok = send(G.CLOSE, wk, kind=kind, middle=b'')['ok'] and ok
-    _state['window_key'] = None
-    return {'ok': ok, 'closed': wk}
+    try:
+        for kind in ('action', 'commit'):
+            track = getattr(c, '_track', None)
+            start = len(track) if track is not None else 0
+            r = send(G.CLOSE, wk, kind=kind, middle=b'')
+            if key is not None and kind == 'action' and track is not None:
+                # Recording metadata only; the wire command still has an empty middle.
+                attrs = {attr: active.get(field) or '' for attr, field in
+                         (('targetTitle', 'title'), ('targetClass', 'class'), ('targetUrl', 'url'))}
+                for i in range(start, len(track)):
+                    if track[i][0] == G.CLOSE and track[i][3] == 'action':
+                        track[i] = (G.CLOSE, wk, b'window:' + json.dumps(attrs).encode('utf-8'), 'action')
+            if not r.get('ok'):
+                return {'ok': False, 'code': r.get('code', 'close_refused'), 'target': wk, 'closed': None,
+                        'error': r.get('error', 'The client refused to close the window.')}
+    finally:
+        _state['window_key'] = None
+    # Replay may contain an explicitly recorded answer to the close question.
+    if confirm is not None:
+        _answer_confirm_dialog(c, confirm=confirm)
+    try:
+        deadline = time.monotonic() + 1.0
+        while True:
+            if not any(w.get('key') == wk for w in _read_open_windows(c)):
+                return {'ok': True, 'closed': wk}
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+    except (RuntimeError, OSError) as exc:
+        return {'ok': False, 'code': 'close_unverified', 'target': wk, 'closed': None,
+                'error': 'The close command was accepted, but its result could not be verified.',
+                'verification_error': str(exc)}
+    return {'ok': False, 'code': 'window_not_closed', 'target': wk, 'closed': None,
+            'error': 'The window is still open. Inspect the form or answer its dialog before retrying.'}
 
 @_action('tc_window')
 def tc_execute_command(command: str) -> dict:
@@ -4013,7 +4173,9 @@ def tc_current_opened(key: str, handle: str) -> dict:
     """Whether a form group is currently open."""
     c = _need()
     r = c.send_cmd(G.CURRENT_OPENED, key, kind='read', middle=RS, handle=handle)
-    return {'ok': r['ok'], 'opened': _scalar(r, _bool_from_resp)}
+    # CurrentOpened reports the collapsed state on the tested 8.3.27/8.5.1 builds.
+    collapsed = _scalar(r, _bool_from_resp)
+    return {'ok': r['ok'], 'opened': None if collapsed is None else not collapsed}
 
 @_action('tc_field')
 def tc_title_is_shown(key: str, handle: str) -> dict:
@@ -4534,11 +4696,19 @@ def _synth_confirms(tracked):
     for i, (guid, key, mid, kind) in enumerate(tracked):
         if kind == 'commit':
             continue
+        if guid == G.CLOSE:
+            pending = i
+            continue
         m = _DLG_BUTTON_RE.search(key or '') if guid == G.CLICK else None
         if m and pending is not None:
+            if tracked[pending][0] == G.CLOSE and m.group(1) not in ('0', '1'):
+                pending = None
+                continue
             conf[pending] = 'true' if m.group(1) == '0' else 'false'   # Button0=Да, Button1=Нет
             drop.add(i); pending = None
             continue
+        if pending is not None and tracked[pending][0] == G.CLOSE and _synth_is_mutator(guid):
+            pending = None
         if _synth_step(guid, key, mid) is not None:      # чтения (обход дерева) шаг не сбрасывают
             if guid in _CONFIRM_ACTIONS:
                 pending = i; conf[i] = 'none'            # перепишется, если ответ последует
@@ -4562,8 +4732,13 @@ def _synth_uilog(tracked):
             parsed.append({'winnav': 'chooseUserMessage', 'attrs': {'text': _synth_dec_str(mid)}})
             continue
         if guid in _SYNTH_WINLEVEL:
+            attrs = {'native': 'true'} if guid == G.CLOSE and mid == b'\xe2' else {}
+            if guid == G.CLOSE and (mid or b'').startswith(b'window:'):
+                attrs = json.loads(mid[7:].decode('utf-8'))
+            if guid == G.CLOSE and i in confirms:
+                attrs['confirm'] = confirms[i]
             parsed.append({'winnav': _SYNTH_WINLEVEL[guid],
-                           'attrs': {'native': 'true'} if guid == G.CLOSE and mid == b'\xe2' else {}}); continue
+                           'attrs': attrs}); continue
         if guid == G.ACTIVATE and _WINDOW_KEY_RE.match(key or ''):
             # активизация ОКНА: элемента с именем-UUID окна на форме нет, шаг оконный
             parsed.append({'winnav': 'activateWindow', 'attrs': {}}); continue
@@ -5495,6 +5670,12 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
         if minv and _vt(_conn_ver(c)) and _vt(_conn_ver(c)) < _vt(minv):
             raise _VerErr('метод требует платформу 1С %s+, подключено %s' % (minv, _conn_ver(c)))
         if kind != 'commit' and guid in _VERIFY_GUIDS:
+            if not (key == getattr(c, '_pending_text_input', None) and guid in
+                    (G.INPUT_TEXT, G.CLEAR, G.CANCEL_EDIT, G.CHOOSE_FROM_DROP_LIST,
+                     G.EXECUTE_CHOICE_FROM_CHOICE_LIST, G.ACTIVATE)):
+                error = _check_pending_text_input(c)
+                if error:
+                    raise _CellEditFailure(error['error'], error)
             _chk['v'], _chk['hidden'] = _verify_target(c, key, handle)
             if _chk['v'] == 'absent':
                 raise _TgtErr('объект по адресу не найден: %s' % key)
@@ -5582,7 +5763,7 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
             guid, middle = _input_text_command(text, c, key)
             ok = _ac(guid, key, handle, middle)
             if a == 'inputText':
-                _remember_text_input(c, key, text, ok)
+                _remember_text_input(c, key, text, ok, handle=handle)
             else:
                 _resolved_text_input(c, key, ok)
             return ok
@@ -5721,6 +5902,8 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
                                 _step({'target': name, 'action': a, 'ok': False, 'error': 'element not found'}); continue
                             try:
                                 res = _replay(el['key'], el['handle'], act)
+                            except _CellEditFailure as e:
+                                _step({'action': a, **e.details, 'ok': False, 'error': str(e)}); continue
                             except _VerErr as e:
                                 _step({'target': name, 'action': a, 'ok': False, 'error': str(e), **e.details}); continue
                             _step({'target': name, 'action': a, 'ok': bool(res), 'skipped': res is None})
@@ -5873,6 +6056,8 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
                         try:
                             res = _replay_form(formobj, node)
                             _step({'target': '<form>', 'action': tag, 'ok': bool(res), 'skipped': res is None})
+                        except _CellEditFailure as e:
+                            _step({'action': tag, **e.details, 'ok': False, 'error': str(e)})
                         except _VerErr as e:
                             _step({'target': '<form>', 'action': tag, 'ok': False, 'error': str(e), **e.details})
                     _t.sleep(0.4)
@@ -5889,7 +6074,10 @@ def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
             if len(node):
                 _process_form(node); _t.sleep(0.4)
         elif tag == 'close':
-            result = _close_active_window(c, send=_send, native_only=node.get('native') == 'true')
+            key = _recorded_close_key(c, node) if 'targetTitle' in node.attrib else None
+            confirm = node.get('confirm') == 'true' if node.get('confirm') in ('true', 'false') else None
+            result = _close_active_window(c, send=_send, native_only=node.get('native') == 'true',
+                                          key=key, confirm=confirm)
             _step({'target': '<window>', 'action': 'close', **result})
             _t.sleep(0.8)
         elif tag in ('gotoNextWindow', 'gotoPreviousWindow', 'gotoStartPage'):

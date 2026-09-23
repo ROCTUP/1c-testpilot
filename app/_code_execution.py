@@ -14,15 +14,18 @@ import guids as G
 import tc1c
 
 FORM_NAME = 'ВнешняяОбработка.Testpilot.Форма.Helper'
+FORM_NAMES = frozenset({FORM_NAME, 'ExternalDataProcessor.Testpilot.Form.Helper'})
 PROTOCOL = 1
 DEFAULT_FORBIDDEN = '''Удалить Delete Записать Write
 УстановитьПривилегированныйРежим SetPrivilegedMode
 ПодключитьВнешнююКомпоненту AttachAddIn УстановитьВнешнююКомпоненту InstallAddIn
 COMОбъект COMObject УстановитьМонопольныйРежим SetExclusiveMode
 УдалитьФайлы DeleteFiles КопироватьФайл CopyFile ПереместитьФайл MoveFile
-СоздатьКаталог CreateDirectory'''.split()
-ALWAYS_FORBIDDEN = {'выполнить', 'execute', 'вычислить', 'eval',
-                    'командасистемы', 'system', 'запуститьприложение', 'runapp'}
+СоздатьКаталог CreateDirectory
+КомандаСистемы System ЗапуститьПриложение RunApp
+НачатьЗапускПриложения BeginRunningApplication
+ЗапуститьПриложениеАсинх RunAppAsync'''.split()
+ALWAYS_FORBIDDEN = {'выполнить', 'execute', 'вычислить', 'eval'}
 _internal = ContextVar('testpilot_service_access', default=None)
 
 
@@ -72,26 +75,24 @@ def settings():
 SETTINGS = settings()
 
 
-# A BSL string may continue on the next lines only through lines that start with "|".
-# Blank lines and whole-line "//" comments between the parts belong to the code, not to the
-# string, so a quote inside such a comment must not close the literal. 1C ends a line at CR
-# as well as at LF; line breaks are normalised first, keeping every position unchanged.
+# BSL strings continue through lines starting with |. Blank/comment lines between
+# their parts are not string content; quotes in those comments cannot end a string.
 _BSL_STRING_PART = r'(?:""|[^"\n])*'
 _BSL_STRING_GAP = r'(?:[ \t\f\v]*(?://[^\n]*)?\n)*[ \t\f\v]*'
 _BSL_STRING = rf'"{_BSL_STRING_PART}(?:\n{_BSL_STRING_GAP}\|{_BSL_STRING_PART})*"'
 _BSL_TOKENS = re.compile(r'//[^\n]*|/\*[\s\S]*?\*/|' + _BSL_STRING + r'|[\w]+|[^\s]', re.UNICODE)
-_QUERY_TOKENS = re.compile(r'//[^\n]*|/\*[\s\S]*?\*/|"(?:""|[^"])*"|[\w]+|[^\s]', re.UNICODE)
+_QUERY_TOKENS = re.compile(r'//[^\r\n]*|/\*[\s\S]*?\*/|"(?:""|[^"])*"|[\w]+|[^\s]', re.UNICODE)
 
 
-def bsl_lines(text):
-    """The same text with CRLF and lone CR turned into LF, at the same positions."""
+def _bsl_lines(text):
+    """Normalize CRLF/lone CR without shifting offsets in the original code."""
     return text.replace('\r\n', ' \n').replace('\r', '\n')
 
 
 def tokens(text, *, bsl=True):
     """Yield identifiers/punctuation with positions; strings and comments are opaque."""
     pattern = _BSL_TOKENS if bsl else _QUERY_TOKENS
-    for match in pattern.finditer(bsl_lines(text) if bsl else text):
+    for match in pattern.finditer(_bsl_lines(text) if bsl else text):
         word = match.group()
         if word.startswith(('//', '/*', '"')):
             if word == '"':
@@ -106,7 +107,7 @@ def validate_code(code):
     for word, start, end in tokens(code):
         if word in SETTINGS.forbidden:
             raise Failure('forbidden_code', 'This identifier is forbidden by the execution policy.',
-                          identifier=code[start:end], line=bsl_lines(code).count('\n', 0, start) + 1)
+                          identifier=code[start:end], line=_bsl_lines(code).count('\n', 0, start) + 1)
 
 
 def prepare_query(query):
@@ -189,7 +190,7 @@ def filter_objects(client, objects):
     for obj in objects:
         if obj.get('class') == 'ManagedForm' and obj.get('form_name') and obj.get('key'):
             vars(client).setdefault('_service_checked_windows', set()).add(obj['key'].split('.ManagedForm[', 1)[0])
-        if obj.get('form_name') == FORM_NAME:
+        if obj.get('form_name') in FORM_NAMES:
             roots.add(obj['key'].split('.ManagedForm[', 1)[0])
     if _internal.get() is client:
         return objects
@@ -230,7 +231,9 @@ def launch_path(override=None, *, python_api=False):
 def _configured_warning(message, path):
     if not isinstance(message, str):
         return False
-    question = ('Разрешить открывать данный файл?' in message or 'Allow opening this file?' in message)
+    question = any(text in message for text in (
+        'Разрешить открывать данный файл?', 'Allow opening this file?',
+        'Do you want to open the file?'))
     filename = re.search(r'(?:из файла|from (?:the )?file)\s+"([^"]+)"', message, re.IGNORECASE)
     normal = lambda value: os.path.normcase(os.path.normpath(value))
     return bool(question and filename and normal(filename.group(1)) == normal(path))
@@ -259,12 +262,24 @@ def _read(R, obj):
     return result
 
 
-def discover(R, client):
+def discover(R, client, *, startup=False):
     with internal(client):
         objects = R._search_objects(client, R._APPLICATION_ROOT)
         # Register all protected roots, including when the processing is not configured.
         filter_objects(client, objects)
-        forms = [o for o in objects if o.get('form_name') == FORM_NAME]
+        if startup:
+            active = R._window(client)
+            active_forms = [o for o in objects if o.get('class') == 'ManagedForm'
+                            and o.get('key', '').startswith((active.get('key') or '\0') + '.')]
+            for form in active_forms:
+                if form.get('form_name') in ('ОбщаяФорма.ПодключениеИнтернетПоддержки',
+                                             'CommonForm.ПодключениеИнтернетПоддержки'):
+                    _checked(R.tc_close_window(key=active['key']))
+                    return None, []
+                if form.get('form_name') == 'MessageBox':
+                    # Read the startup question before trying fields behind its modal window.
+                    return None, objects
+        forms = [o for o in objects if o.get('form_name') in FORM_NAMES]
         if not forms:
             return None, objects
         if len(forms) != 1:
@@ -295,17 +310,20 @@ def prepare(R, client, path, deadline):
     """Only startup may approve the exact configured file; never an arbitrary dialog."""
     old_deadline = getattr(client, '_io_deadline', None)
     client._io_deadline = deadline
+    last_error = None
     try:
         while time.monotonic() < deadline:
             with internal(client):
                 try:
-                    service, objects = discover(R, client)
+                    service, objects = discover(R, client, startup=True)
                 except Failure as exc:
                     if exc.result['code'] not in ('target_not_interactive', 'invalid_element_state', 'client_busy', 'target_unavailable'):
                         raise
+                    last_error = exc.result
                     time.sleep(min(.2, max(0, deadline - time.monotonic())))
                     continue
-                except RuntimeError:
+                except (RuntimeError, TimeoutError) as exc:
+                    last_error = {'error': str(exc)}
                     time.sleep(min(.2, max(0, deadline - time.monotonic())))
                     continue
                 if service:
@@ -314,6 +332,8 @@ def prepare(R, client, path, deadline):
                         return
                     work = [o for o in objects if o.get('class') in ('ManagedForm', 'MainFrame')
                             and not protected(client, o.get('key'))]
+                    if not work:
+                        raise Failure('helper_startup_blocked', 'No application window is available outside the service form.')
                     if work:
                         target = next((o for o in work if o.get('class') == 'ManagedForm'), work[0])
                         try:
@@ -325,6 +345,15 @@ def prepare(R, client, path, deadline):
                                 raise
                             time.sleep(min(.2, max(0, deadline - time.monotonic())))
                             continue
+                        active = R._window(client)
+                        if not active.get('key'):
+                            time.sleep(min(.2, max(0, deadline - time.monotonic())))
+                            continue
+                        if active.get('key') and protected(client, active['key']):
+                            # An empty main window can accept navigation without becoming active.
+                            # Ordinary navigation resolves it separately; the helper stays protected.
+                            if not any(o.get('class') == 'MainFrame' for o in work):
+                                raise Failure('helper_startup_blocked', 'Could not activate a work window.')
                     return
                 for form in [o for o in objects if o.get('form_name') == 'MessageBox']:
                     children = [o for o in objects if o.get('key', '').startswith(form['key'] + '.')]
@@ -337,7 +366,8 @@ def prepare(R, client, path, deadline):
                     if message:
                         raise Failure('helper_startup_blocked', 'A startup dialog requires attention.', dialog=message)
             time.sleep(min(.2, max(0, deadline - time.monotonic())))
-        raise Failure('helper_not_ready', 'Testpilot.epf did not become ready before the startup deadline. Check external-processing permissions and startup dialogs.')
+        raise Failure('helper_not_ready', 'Testpilot.epf did not become ready before the startup deadline. Check external-processing permissions and startup dialogs.',
+                      **({'last_error': last_error} if last_error else {}))
     finally:
         client._io_deadline = old_deadline
 

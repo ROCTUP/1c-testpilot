@@ -27,6 +27,7 @@ def _exit_button(objects):
         return ' '.join((value or '').replace('&', '').split()).casefold()
     known = {
         ('завершить работу с приложением?', 'да', 'нет'),
+        ('завершить работу с приложением?', 'завершить работу', 'продолжить работу'),
         ('работа в данном окне не завершена', 'завершить работу', 'продолжить работу'),
         ('exit the application?', 'yes', 'no'),
         ('do you want to exit the application?', 'yes', 'no'),
@@ -96,7 +97,7 @@ def graceful_exit(client, process, timeout):
                     action(G.CLICK, button)
             time.sleep(min(.1, max(0, deadline - time.monotonic())))
     except (OSError, RuntimeError, ValueError) as exc:
-        failure = {'shutdown_reason': 'graceful_shutdown_timeout' if time.monotonic() >= deadline
+        failure = {'shutdown_reason': 'graceful_shutdown_timeout' if isinstance(exc, TimeoutError) or time.monotonic() >= deadline
                    else 'close_request_failed', 'shutdown_error': str(exc)}
         # EOF can precede process exit. Give an already requested exit its remaining time.
         if requested:

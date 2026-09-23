@@ -54,7 +54,8 @@ def select_windows(windows, focus=None):
 
 def signature(windows):
     return [(w['id'], tuple(w['rect']), w['hidden'], w['mapped'], w['transient'], w['override'],
-             w.get('visual'), w.get('depth'), w.get('title')) for w in windows]
+             w.get('visual'), w.get('depth'), w.get('title'), w.get('border', 0),
+             w.get('parents', [])) for w in windows]
 
 
 def almost_same(previous, current):
@@ -90,11 +91,19 @@ class Desktop:
         p = window.get_full_property(atom, self.X.AnyPropertyType)
         return None if p is None else p.value
 
+    def window_info(self, window, attributes=None):
+        a = attributes if attributes is not None else window.get_attributes()
+        g = window.get_geometry()
+        xy = self.root.translate_coords(window, 0, 0)
+        return dict(id=window.id, rect=[xy.x, xy.y, g.width, g.height],
+                    border=g.border_width, depth=g.depth, visual=a.visual,
+                    mapped=a.map_state == self.X.IsViewable)
+
     def snapshot(self):
         from Xlib.error import BadWindow
         found, scanned = [], 0
         # Recurse through window-manager frames, but not through a 1C window's controls.
-        def walk(parent, depth=0):
+        def walk(parent, depth=0, parents=()):
             nonlocal scanned
             if depth > 16:
                 raise CaptureError('screenshot_window_unavailable', 'The desktop window hierarchy is too deep to inspect.')
@@ -108,7 +117,7 @@ class Desktop:
                     a = w.get_attributes()
                     if not ours:
                         if a.map_state == self.X.IsViewable:
-                            walk(w, depth + 1)
+                            walk(w, depth + 1, (self.window_info(w, a),) + parents)
                         continue
                     g = w.get_geometry()
                     if g.width < 16 or g.height < 16 or g.depth == 0:
@@ -127,7 +136,7 @@ class Desktop:
                         hidden=bool((wm is not None and len(wm) and wm[0] == 3)
                                     or (states is not None and hidden_atom in states)),
                         transient=int(transient[0]) if transient is not None and len(transient) else None,
-                        title=str(title)))
+                        title=str(title), border=g.border_width, parents=list(parents)))
                 except BadWindow:
                     continue
         walk(self.root)
@@ -145,30 +154,73 @@ class Desktop:
         return select_windows(found, focus_id)
 
     def pixels(self, item):
+        # A compositor may redirect only the outer window-manager frame. Capture
+        # that ancestor's buffer, but read only the pixels belonging to our client.
+        chain = self.capture_chain(item)
+        for source in chain:
+            x, y, width, height = item['rect']
+            sx, sy, sw, sh = source['rect']
+            if x < sx or y < sy or x + width > sx + sw or y + height > sy + sh:
+                continue
+            image = self.window_pixels(source, (x - sx, y - sy, width, height))
+            if image is not None:
+                self.capture_chain(item)
+                return image
+        raise CaptureError('screenshot_window_unavailable',
+                           'The X11 server exposes no image buffer for the client window or its window-manager frames. '
+                           'Check the desktop compositor or use desktop="isolated".')
+
+    def capture_chain(self, item):
+        window = self.d.create_resource_object('window', item['id'])
+        ids = self.d.res_query_client_ids([dict(client=window.id, mask=self.res.LocalClientPIDMask)]).ids
+        if not any(list(i.value) == [self.pid] for i in ids):
+            raise CaptureError('screenshot_client_changed', 'The captured window no longer belongs to the connected client.')
+        expected = [{k: item[k] for k in ('id', 'rect', 'border', 'depth', 'visual', 'mapped')},
+                    *item['parents']]
+        for entry in expected:
+            if window.id == self.root.id or self.window_info(window) != entry or not entry['mapped']:
+                raise CaptureError('screenshot_window_changed', 'The client window or its window-manager frame changed during capture. Retry the screenshot.')
+            window = window.query_tree().parent
+        if window.id != self.root.id:
+            raise CaptureError('screenshot_window_changed', 'The client window changed parents during capture. Retry the screenshot.')
+        return expected
+
+    def window_pixels(self, item, region):
         from PIL import Image
         visual = self.visuals.get(item['visual'])
         if visual is None or (visual.red_mask, visual.green_mask, visual.blue_mask) != (0xff0000, 0xff00, 0xff):
             raise CaptureError('screenshot_pixel_format_unsupported', 'The client display pixel format is unsupported.')
         w = self.d.create_resource_object('window', item['id'])
-        pixmap = w.composite_name_window_pixmap()
+        errors = []
+        def unavailable(error, request):
+            errors.append(error)
+            return True
+        pixmap = w.composite_name_window_pixmap(onerror=unavailable)
+        self.d.sync()
+        if errors:
+            # NameWindowPixmap is asynchronous; no server pixmap exists on failure.
+            pixmap.display.free_resource_id(pixmap.id)
+            return None
         try:
             g = pixmap.get_geometry()
-            if [g.width, g.height] != item['rect'][2:]:
+            border = item.get('border', 0)
+            if [g.width, g.height] != [n + 2 * border for n in item['rect'][2:]]:
                 raise CaptureError('screenshot_window_changed', 'The client window changed size during capture. Retry the screenshot.')
-            if g.width * g.height > MAX_PIXELS:
+            x, y, width, height = region
+            if width * height > MAX_PIXELS:
                 raise CaptureError('screenshot_too_large', 'The client window is too large to capture.')
             fmt = next(f for f in self.d.display.info.pixmap_formats if f.depth == g.depth)
             if g.depth not in (24, 32) or fmt.bits_per_pixel not in (24, 32):
                 raise CaptureError('screenshot_pixel_format_unsupported', 'The client display pixel format is unsupported.')
-            r = pixmap.get_image(0, 0, g.width, g.height, self.X.ZPixmap, 0xffffffff)
-            stride = ((g.width * fmt.bits_per_pixel + fmt.scanline_pad - 1) // fmt.scanline_pad) * fmt.scanline_pad // 8
+            r = pixmap.get_image(x + border, y + border, width, height, self.X.ZPixmap, 0xffffffff)
+            stride = ((width * fmt.bits_per_pixel + fmt.scanline_pad - 1) // fmt.scanline_pad) * fmt.scanline_pad // 8
             little = self.d.display.info.image_byte_order == self.X.LSBFirst
             if g.depth == 32:
-                im = Image.frombytes('RGBA', (g.width, g.height), r.data, 'raw', 'BGRA' if little else 'ARGB', stride)
+                im = Image.frombytes('RGBA', (width, height), r.data, 'raw', 'BGRA' if little else 'ARGB', stride)
                 # XRender buffers contain premultiplied alpha.
                 return Image.frombytes('RGBa', im.size, im.tobytes()).convert('RGBA')
             mode = ('BGRX' if little else 'XRGB') if fmt.bits_per_pixel == 32 else ('BGR' if little else 'RGB')
-            return Image.frombytes('RGB', (g.width, g.height), r.data, 'raw', mode, stride)
+            return Image.frombytes('RGB', (width, height), r.data, 'raw', mode, stride)
         finally:
             pixmap.free()
 
@@ -188,7 +240,7 @@ class Desktop:
             except Exception as exc:
                 if i == 0:
                     if isinstance(exc, CaptureError): raise
-                    raise CaptureError('screenshot_window_unavailable', 'The window image is unavailable. Keep the client window open and retry.') from exc
+                    raise CaptureError('screenshot_window_unavailable', 'X11 could not read the client window image. The window or its window-manager frame may have changed during capture.') from exc
                 missing.append(w['id'])
                 continue
             canvas.paste(im, (w['rect'][0] - left, w['rect'][1] - top), im if im.mode == 'RGBA' else None)
