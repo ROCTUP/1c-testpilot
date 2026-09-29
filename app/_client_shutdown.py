@@ -30,6 +30,7 @@ def _exit_button(objects):
         ('завершить работу с приложением?', 'завершить работу', 'продолжить работу'),
         ('работа в данном окне не завершена', 'завершить работу', 'продолжить работу'),
         ('exit the application?', 'yes', 'no'),
+        ('exit the app?', 'yes', 'no'),
         ('do you want to exit the application?', 'yes', 'no'),
     }
     if yes and no and (label(question), label(yes.get('title')), label(no.get('title'))) in known:
