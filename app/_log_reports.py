@@ -23,6 +23,8 @@ def identity(event):
 
 
 def title(event):
+    if event.get('tool') == 'compatible_scenario' and event.get('action') == 'test':
+        return f"test — {event.get('arguments', {}).get('path', '<unknown>')}"
     if event.get('tool') == 'scenario':
         return f"{event['action']} — {event.get('arguments', {}).get('target') or '<unknown>'}"
     return event.get('description') or f"{event['tool']} / {event['action']}"

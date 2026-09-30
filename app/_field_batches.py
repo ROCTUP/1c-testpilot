@@ -3,10 +3,12 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictStr, StrictBool
+from pydantic import (BaseModel, ConfigDict, Field, StrictStr, StrictBool, StrictInt,
+                      StrictFloat, ValidationError, model_validator)
 
 LIMIT = 100
 _ROW_COLUMNS = ContextVar('testpilot_row_columns', default=None)
+_NATIVE_RECORD_OWNER = ContextVar('testpilot_batch_record_owner', default=None)
 FIELD_ACTIONS = {'read_fields': 'targets', 'set_fields': 'entries'}
 PROPERTIES = ('text', 'presentation', 'edit_text', 'visible', 'enabled', 'readonly')
 SCALAR_KINDS = {'InputField', 'CheckBoxField', 'RadioButtonField', 'LabelField',
@@ -40,6 +42,34 @@ class AddressCheckEntry(AddressTarget):
     checked: StrictBool
 
 
+class Selection(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    value: StrictStr | None = None
+    match: dict[StrictStr, StrictStr] | None = None
+    choice_table: StrictStr | None = None
+    choice_column: StrictStr | None = None
+    data_type: StrictStr | None = None
+    expected: StrictStr | None = None
+    max_rows: StrictInt = 500
+    timeout: StrictInt | StrictFloat = 180
+
+    @model_validator(mode='after')
+    def valid_selection(self):
+        from _value_selection import validate_options
+        failure = validate_options(**self.model_dump())
+        if failure:
+            raise ValueError(failure['error'])
+        return self
+
+
+class RefSelectEntry(RefTarget):
+    select: Selection
+
+
+class AddressSelectEntry(AddressTarget):
+    select: Selection
+
+
 class CellEntry(BaseModel):
     model_config = ConfigDict(extra='forbid')
     column: StrictStr
@@ -66,8 +96,8 @@ PropertyList = Annotated[list[Property], Field(min_length=1, max_length=len(PROP
 
 
 def public_type(name, mode):
-    model = ({'targets': RefTarget, 'entries': RefEntry | RefCheckEntry} if mode == 'id' else
-             {'targets': AddressTarget, 'entries': AddressEntry | AddressCheckEntry})[name]
+    model = ({'targets': RefTarget, 'entries': RefEntry | RefCheckEntry | RefSelectEntry} if mode == 'id' else
+             {'targets': AddressTarget, 'entries': AddressEntry | AddressCheckEntry | AddressSelectEntry})[name]
     return Annotated[list[model], Field(min_length=1, max_length=LIMIT)]
 
 
@@ -83,20 +113,31 @@ def refs(action, kw):
     return [item['ref'] for value in items if isinstance(item := plain(value), dict) and 'ref' in item]
 
 
-def bounded(items, fields):
+def bounded(items, fields, allow_select=False):
     if not isinstance(items, list) or not 1 <= len(items) <= LIMIT:
         raise Failure('invalid_batch', f'Supply between 1 and {LIMIT} entries.')
     out = [plain(v) for v in items]
     for i, item in enumerate(out):
+        if 'text' in fields and isinstance(item, dict) and len({'text', 'checked', 'select'} & item.keys()) != 1:
+            raise Failure('invalid_batch', 'Each entry must supply exactly one value.', i)
         expected = set(fields)
         if isinstance(item, dict) and 'text' in expected and 'checked' in item:
             expected = (expected - {'text'}) | {'checked'}
+        if allow_select and isinstance(item, dict) and 'select' in item:
+            expected = (expected - {'text'}) | {'select'}
         if (not isinstance(item, dict) or set(item) != expected
-                or any(type(item[k]) is not (bool if k == 'checked' else str) for k in expected)):
+                or any(type(item[k]) is not (bool if k == 'checked' else str) for k in expected if k != 'select')):
             message = ('Each entry must contain ' + ', '.join(k for k in fields if k != 'text') +
-                       ' and exactly one value: text (string) or checked (boolean).') if 'text' in fields else (
+                       ' and exactly one value: text (string), checked (boolean)' +
+                       (', or select (selection options).' if allow_select else '.')) if 'text' in fields else (
                        'Each entry must contain exactly: ' + ', '.join(fields) + '.')
             raise Failure('invalid_batch', message, i)
+        if 'select' in expected:
+            try:
+                selection = Selection.model_validate(item['select'])
+            except ValidationError as exc:
+                raise Failure('invalid_batch', 'Invalid select options: ' + str(exc), i) from exc
+            out[i] = {**item, 'select': selection.model_dump(exclude_none=True)}
     return out
 
 
@@ -107,14 +148,14 @@ def resolve_arguments(S, action, kw):
     id_mode = S._address_mode() == 'id'
     names = ['ref'] if id_mode else ['key', 'handle']
     if action == 'set_fields': names.append('text')
-    entries = bounded(kw[slot], names)
+    entries = bounded(kw[slot], names, allow_select=action == 'set_fields')
     registry = S._refs.for_client(S._need()) if id_mode else None
     resolved = []
     # Resolve every reference before live enumeration can evict entries in a small registry.
     for entry in entries:
         if id_mode:
             key, handle = registry.resolve(entry['ref'])
-            entry = {'key': key, 'handle': handle, **{k: entry[k] for k in ('text', 'checked') if k in entry}}
+            entry = {'key': key, 'handle': handle, **{k: entry[k] for k in ('text', 'checked', 'select') if k in entry}}
         else:
             S._response.check_ref_args(entry)
         resolved.append(entry)
@@ -137,7 +178,9 @@ def error(exc):
     if isinstance(exc, (TimeoutError, OSError, ConnectionError)):
         return {'code': 'batch_interrupted', 'error': 'The client response was interrupted. Inspect the connection before continuing.'}
     if hasattr(exc, 'details'):
-        return {'code': exc.details.get('code', 'batch_stopped'), 'error': str(exc)}
+        return {'code': exc.details.get('code', 'batch_stopped'), 'error': str(exc),
+                **{k: exc.details[k] for k in ('property', 'readonly', 'visible', 'enabled',
+                                              'column', 'suggested_columns') if k in exc.details}}
     return {'code': 'batch_stopped', 'error': str(exc)}
 
 
@@ -156,7 +199,7 @@ def live(S, c, entry):
 
 
 def targets(S, c, entries, writing=False):
-    entries = bounded(entries, ['key', 'handle', 'text'] if writing else ['key', 'handle'])
+    entries = bounded(entries, ['key', 'handle', 'text'] if writing else ['key', 'handle'], allow_select=writing)
     seen, forms, objects = set(), set(), []
     for i, item in enumerate(entries):
         S.tc1c.validate_address(item['key'], item['handle'])
@@ -169,7 +212,7 @@ def targets(S, c, entries, writing=False):
             raise Failure('unsupported_element_type', 'This action requires form fields.', i)
         expected_kind = 'CheckBoxField' if 'checked' in item else 'InputField'
         if writing and (obj.get('type') != expected_kind or S._table_owner(item['key'])):
-            raise Failure('unsupported_element_type', 'Use text for input fields or checked for checkboxes; table cells use set_row_values.', i)
+            raise Failure('unsupported_element_type', 'Use text or select for input fields, checked for checkboxes; table cells use set_row_values.', i)
         form = owner(S, item['key'])
         if not form:
             raise Failure('form_unavailable', 'The owning managed form could not be identified.', i)
@@ -317,7 +360,13 @@ def check_value(S, requested, text, presentation=None):
 
 
 def field_value(S, c, obj):
-    return read_property(S, c, obj, 'text'), read_property(S, c, obj, 'presentation')
+    try:
+        actual = read_property(S, c, obj, 'text')
+    except Failure as exc:
+        if 'select' not in obj or exc.code not in ('unsupported_receiver', 'unsupported_element_type'):
+            raise
+        actual = read_property(S, c, obj, 'presentation')
+    return actual, read_property(S, c, obj, 'presentation')
 
 
 def finish_known_field(S, c, obj, other, window):
@@ -344,6 +393,15 @@ def finish_known_field(S, c, obj, other, window):
 
 
 def checked(S, item, obj, actual, presentation=None):
+    if 'select' in obj:
+        selected = item['selection']
+        verified = (selected.get('verified') is True and actual == selected.get('value_after')
+                    and presentation == selected.get('presentation'))
+        item.update(value_after=actual, presentation=presentation, verified=verified,
+                    verification='selected_value_unchanged')
+        if not verified:
+            raise Failure('value_not_confirmed', 'The field no longer has the accepted selection.', item['index'])
+        return
     if 'checked' in obj:
         state = checkbox_state(actual)
         item.update(value_after=actual, checked_after=state, verified=state == obj['checked'], verification='exact')
@@ -454,8 +512,17 @@ def row_objects(S, c, key, cells, columns=None, verify_live=True):
         seen.add(value['column'])
         found = [o for o in cols if o.get('name') == value['column']]
         expected_kind = 'CheckBoxField' if 'checked' in value else 'InputField'
-        if len(found) != 1 or found[0].get('type') != expected_kind:
-            raise Failure('invalid_column', 'Use a unique column name: text for input columns, checked for checkbox columns.', i)
+        if len(found) != 1:
+            detail = {'column': value['column']}
+            suggestions = [o['name'] for o in cols if o.get('title') == value['column'] and o.get('name')]
+            if suggestions:
+                detail['suggested_columns'] = suggestions
+            raise Failure('invalid_column', 'Use a unique column element name returned for this table.', i,
+                          details=detail)
+        if found[0].get('type') != expected_kind:
+            raise Failure('invalid_column', 'Use text for input columns and checked for checkbox columns.', i,
+                          details={'column': value['column'], 'type': found[0].get('type'),
+                                   'expected_type': expected_kind})
         obj = {**found[0], **{k: value[k] for k in ('text', 'checked') if k in value}}
         if verify_live:
             live(S, c, obj)
@@ -565,6 +632,7 @@ def write(S, entries=None, key=None, handle=None, cells=None):
         out['target'] = key
         out['edit_finished'] = None
     mark, current, window = None, None, None
+    record_token = None
     try:
         with observations(c):
             if row:
@@ -590,6 +658,8 @@ def write(S, entries=None, key=None, handle=None, cells=None):
                     raise Failure('edit_state_unavailable', 'The row edit mode could not be read.')
                 out['edit_finished'] = not mode
         mark = begin_record(S, c, action)
+        if mark is not None:
+            record_token = _NATIVE_RECORD_OWNER.set(c)
         for obj, current in zip(objects, out['results']):
             current['status'] = 'checking'
             with observations(c):
@@ -621,8 +691,12 @@ def write(S, entries=None, key=None, handle=None, cells=None):
                 if mode is not True:
                     raise Failure('row_edit_interrupted', 'Row editing did not start or was interrupted. Inspect the table.')
             current['status'] = 'attempted'
-            result = (apply_checkbox(S, c, obj) if 'checked' in obj else
-                      S.tc_input_text(obj['key'], obj['text'], obj['handle']))
+            if 'select' in obj:
+                result = S.tc_select_value(obj['key'], obj['handle'], **obj['select'])
+                current['selection'] = result
+            else:
+                result = (apply_checkbox(S, c, obj) if 'checked' in obj else
+                          S.tc_input_text(obj['key'], obj['text'], obj['handle']))
             require_result(result)
             if not row and obj.get('text') and result.get('edit_finished') is False and len(objects) > 1:
                 index = current['index']
@@ -692,5 +766,9 @@ def write(S, entries=None, key=None, handle=None, cells=None):
         out['ok'] = False
         out['final_verified'] = None
     finally:
-        finish_record(S, c, mark, action, out)
+        try:
+            finish_record(S, c, mark, action, out)
+        finally:
+            if record_token is not None:
+                _NATIVE_RECORD_OWNER.reset(record_token)
     return out

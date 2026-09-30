@@ -16,6 +16,11 @@ import _snapshots
 import _form_context
 import _action_diagnostics
 import _row_search
+import _table_reading
+import _find_pages
+import _list_search
+import _list_settings
+import _value_selection
 import _call_logging
 import _profiles
 import _code_execution
@@ -92,7 +97,8 @@ class Runtime:
 
     def call(self, action, arguments):
         group = _ACTION_GROUP[action]
-        if action not in ('connect', 'launch_client', 'list_connections', 'list_profiles') and not self.pool.entries:
+        offline_check = action == 'run_compatible_scenario' and arguments.get('check_only') is True
+        if action not in ('connect', 'launch_client', 'list_connections', 'list_profiles') and not offline_check and not self.pool.entries:
             return {'ok': False, 'code': 'not_connected', 'error': 'Connect to or launch a test client first.'}
         token = _execution.set(self)
         try:
@@ -412,7 +418,7 @@ def _scalar_text(r, cmd):
     return _tail_char(r['raw'], cmd) if r.get('ok') else None
 
 def _field_scalar_text(c, key, r, cmd):
-    """Пустая строка поля: подтверждённый вид и полный известный ответ.
+    """Пустой текст поля ввода или надписи: подтверждённый вид и полный известный ответ.
 
     Такой же скалярный хвост бывает у неподдерживаемых элементов. Одного маркера
     недостаточно: у колонки дополнительно проверяем открытый редактор этой ячейки.
@@ -430,7 +436,9 @@ def _field_scalar_text(c, key, r, cmd):
     tail = tails.get(cmd)
     if tail and r['raw'].startswith(b'\x42') and r['raw'].endswith(tail + tc1c.TR):
         cls = _key_class(key)
-        if cls == 'EditField' and _kind_of(c, key) == 'InputField':
+        kind = _kind_of(c, key) if cls == 'EditField' else None
+        if cls == 'EditField' and (kind == 'InputField' or
+                (kind == 'LabelField' and cmd in (G.GET_PROPERTY, G.GET_DISPLAYED_TEXT))):
             if '.Table[' not in key:
                 return ''
             p = tc1c._reply_status_offset(r['raw'], cmd)
@@ -1202,13 +1210,10 @@ def _form_title(c, window_key):
 # ================================ соединение =================================
 @_action('tc_session')
 def tc_connect(port: int, host: str = '127.0.0.1', version: str = None) -> str:
-    """Connect to a running 1C test client (started with /TESTCLIENT -TPort <port>).
-    Supply port, or profile from list_profiles. Explicit parameters override profile settings.
-    `version` is the platform version
-    (e.g. '8.5.1.1343') and MUST match the running platform, else the handshake fails; if
-    omitted a built-in default is used. Call this before any other tc_* tool.
-    A different host/port creates another connection. The same host/port reconnects that client;
-    its connection_id is retained, but find elements again before using them."""
+    """Connect to a running /TESTCLIENT -TPort client using port or a list_profiles profile; explicit
+    parameters override the profile. version must match the full running version (omitted: built-in
+    default). Connect before UI actions. A new host/port creates a connection; the same host/port
+    reconnects that client: connection_id is retained, but find elements again."""
     host, port = _connections.endpoint(host, port)
     c = tc1c.TestClient(host, port)
     c._io_deadline = _state.get('_launch_deadline')
@@ -1227,6 +1232,7 @@ def tc_connect(port: int, host: str = '127.0.0.1', version: str = None) -> str:
     old = _state.get('client')
     if old is not None:
         old.close()
+    _snapshot_storage().drop_contexts(_state.get('_snapshot_owner'))
     _state['client'] = c
     _code_execution.install(c)
     isolated = _state.get('_isolated_process')
@@ -1284,22 +1290,15 @@ def tc_launch_client(base: str, port: int = None, server: bool = False, user: st
                      password: str = None, version: str = None, exe: str = None,
                      extra_args: list = None, wait: int = 120, connect: bool = True,
                      desktop: typing.Literal['default', 'isolated'] = 'default') -> dict:
-    """Launch a 1C test client and wait until it accepts connections on `port`, then optionally
-    connect to it. `base` is a file infobase path (default), or 'server\\infobase' when `server=True`.
-    Supply base, or profile from list_profiles. Explicit parameters override profile settings.
-    `user`/`password` — infobase credentials (optional; the password is passed on the command line
-    and is visible in the OS process list). `exe` — full path to 1cv8.exe or 1cv8c.exe on Windows,
-    or 1cv8/1cv8c on Linux or macOS (else env
-    TC1C_PLATFORM_EXE or standard install path). Only the 1C platform executable is launched.
-    Omit port to allocate a free local port. Each launch creates a separate connection_id.
-    wait is the total startup deadline in seconds, including connection readiness (default 120).
-    Increase it for slow-loading bases. A version prefix selects the newest matching installation;
-    use a full version or exe to choose a specific build.
-    On Linux, default requires DISPLAY/XAUTHORITY for a graphical session; isolated requires Xvfb.
-    desktop: default = normal launch; isolated = a separate desktop on Windows 10+ or Linux,
-    keeping client windows away from the user's desktop. Isolated clients stop with the server.
-    With connect=false ok means only that the port answers — the client can be up and showing an
-    error, so check it before relying on it."""
+    """Launch and optionally connect. base is a file infobase path, or 'server\\infobase' with
+    server=true; alternatively use a list_profiles profile. Explicit parameters override the
+    profile. user/password are infobase credentials; the password is visible in the process command
+    line. exe is the full path to 1cv8/1cv8c (with .exe on Windows); omitted: configured or auto-detected
+    installation. A version prefix selects the latest matching build; use a full version or exe for
+    an exact build. Omitted port allocates a free local port; each launch creates a connection_id.
+    wait covers total startup including readiness; increase for slow bases. Linux default needs
+    DISPLAY/XAUTHORITY; isolated needs Xvfb. isolated uses a separate desktop (Windows 10+/Linux)
+    and stops with the server. connect=false confirms only an answering port, not a usable client."""
     if desktop not in ('default', 'isolated'):
         return {'ok': False, 'code': 'invalid_desktop', 'error': 'desktop must be default or isolated.'}
     if desktop == 'isolated' and os.name != 'nt' and sys.platform != 'linux':
@@ -1511,6 +1510,7 @@ def tc_stop_client(graceful_timeout: float = 15) -> dict:
 def tc_disconnect(force: bool = False) -> str:
     """Close the connection to the test client. force=true interrupts a pending network call;
     its result may be unknown. The 1C application remains running."""
+    _snapshot_storage().drop_contexts(_state.get('_snapshot_owner'))
     c = _state['client']
     if c: c.close(); _state['client'] = None; _state['window_key'] = None
     _rec_reset()          # с отключением накопленное недостижимо: «запись идёт» стало бы ложью
@@ -1535,54 +1535,61 @@ def tc_list_profiles() -> dict:
 @_action('tc_execute_code')
 def tc_execute_code(code: str, context: typing.Literal['client', 'server'],
                     parameters: dict = None, timeout: float = 180) -> dict:
-    """Execute BSL code in the test client's service form or its server context.
-    Pass named input values in the optional parameters object. The BSL code receives
-    them in a variable named Параметры. For example, parameters={"amount": 100}
-    and code='Результат = Параметры["amount"] * 2;' returns 200.
-    Assign the value you want to return to the BSL variable Результат.
-    Each entry in parameters is a name and its value. For a 1C date, reference or enum,
-    put a typed object under that name; it is converted to the corresponding 1C value.
-    Examples of the complete parameters argument:
-    parameters={"amount": 100}
-    parameters={"text": "Example"}
-    parameters={"numbers": [10, 20, 30]}
-    parameters={"date": {"$type":"date","value":"2026-09-21T12:00:00"}}
-    parameters={"item": {"$type":"ref","metadata":"Справочник.Номенклатура","uuid":"..."}}
-    parameters={"vat": {"$type":"enum","metadata":"Перечисление.СтавкиНДС","value":"НДС20"}}
-    Read a value by its name, e.g. Параметры["amount"] is a number and
-    Параметры["numbers"] is a 1C Array. Multiple entries can be passed together.
-    Returned reference objects can be reused unchanged as parameter values.
-    timeout is the maximum wait in seconds (default 180); must be greater than 0 and at most 3600.
-    A timeout does not cancel execution; the next call reads the pending
-    result before accepting new code. Dates and references are returned with type information."""
+    """Execute BSL code in client service-form or server context. Read named inputs via Параметры;
+    assign output to Результат. Example returning 200:
+    parameters={"amount":100}, code='Результат = Параметры["amount"] * 2;'
+    parameters accepts named values, including strings/numbers/booleans/arrays. Examples (entries
+    can be combined):
+    {"amount":100,"text":"Example","numbers":[10,20,30]}
+    {"date":{"$type":"date","value":"2026-09-21T12:00:00"}}
+    {"item":{"$type":"ref","metadata":"Справочник.Номенклатура","uuid":"..."}}
+    {"vat":{"$type":"enum","metadata":"Перечисление.СтавкиНДС","value":"НДС20"}}
+    Typed values and arrays become corresponding 1C values; returned references can be reused
+    unchanged.
+    0<timeout<=3600 seconds (default 180). Timeout does not cancel execution; the next call
+    retrieves the pending result before accepting new code. Returned dates/references carry type
+    information."""
     return _code_execution.execute(sys.modules[__name__], _need(), mode='code', context=context,
                                    code=code, parameters=parameters, timeout=timeout,
                                    check_permissions=_execution.get() is None)
 
 
+@_action('tc_run_compatible_scenario')
+def tc_run_compatible_scenario(path: str | list[str], framework: typing.Literal['tester'] = 'tester', parameters: dict | list | str | int | float | bool = None,
+                               roots: list[str] = None, timeout: float = 1800,
+                               check_only: bool = False, application_name: str = '', stop_on_failure: bool = False,
+                               applications: dict[str, list[str]] = None, metadata_path: str = None,
+                               environments_path: str = None,
+                               result_mode: typing.Literal['summary', 'full'] = 'summary') -> dict:
+    """Run compatible scenarios from a file, directory or ordered file list; framework selects format,
+    parameters supplies inputs. check_only validates without execution; timeout limits execution in
+    seconds; stop_on_failure stops a suite on first failure. roots lists scenario/library
+    directories; applications maps application names to them. application_name identifies the tested
+    application; metadata_path supplies metadata; environments_path persists test-environment data.
+    Returns summary/values, file/line on failure; result_mode=full adds steps. Logs retain full
+    details."""
+    import compatible_scenarios
+    return compatible_scenarios.run(sys.modules[__name__], path=path, framework=framework,
+        parameters=parameters, roots=roots, timeout=timeout, check_only=check_only, application_name=application_name,
+        stop_on_failure=stop_on_failure, applications=applications, metadata_path=metadata_path, environments_path=environments_path)
+
+
 @_action('tc_execute_query')
 def tc_execute_query(query: str, parameters: dict = None, limit: int = 100, timeout: float = 180) -> dict:
-    """Execute a 1C query or batch with the current user's permissions.
-    Batches can create and drop temporary tables; returns the final selection result.
-    Pass query parameter names without & in parameters:
-    a query using &amount receives its value from parameters={"amount": 100}.
-    For a 1C date, reference or enum, put a typed object under the parameter name;
-    it is converted to the corresponding 1C value before executing the query.
-    Examples of the complete parameters argument:
-    parameters={"amount": 100}
-    parameters={"text": "Example"}
-    parameters={"numbers": [10, 20, 30]}
-    parameters={"date": {"$type":"date","value":"2026-09-21T12:00:00"}}
-    parameters={"item": {"$type":"ref","metadata":"Справочник.Номенклатура","uuid":"..."}}
-    parameters={"vat": {"$type":"enum","metadata":"Перечисление.СтавкиНДС","value":"НДС20"}}
-    Use the matching name in the query, e.g. &amount or В (&numbers).
-    Arrays become 1C Arrays. Multiple entries can be passed together.
-    Returned reference objects can be reused unchanged as parameter values.
-    РАЗРЕШЕННЫЕ is added if absent to the first ВЫБРАТЬ of each batch statement.
-    limit is 1..500 returned rows (default 100).
-    Returns columns, rows, returned_rows and truncated. Access restrictions affect the result.
-    timeout is the maximum wait in seconds (default 180); must be greater than 0 and at most 3600.
-    A timeout does not cancel a running query."""
+    """Execute a 1C query/batch with current user permissions; batches may create/drop temporary
+    tables, returning the final selection. Supply query parameters without &: &amount reads
+    parameters={"amount":100}; В (&numbers) uses the numbers array below.
+    parameters accepts named values, including strings/numbers/booleans/arrays. Examples (entries
+    can be combined):
+    {"amount":100,"text":"Example","numbers":[10,20,30]}
+    {"date":{"$type":"date","value":"2026-09-21T12:00:00"}}
+    {"item":{"$type":"ref","metadata":"Справочник.Номенклатура","uuid":"..."}}
+    {"vat":{"$type":"enum","metadata":"Перечисление.СтавкиНДС","value":"НДС20"}}
+    Typed values and arrays become corresponding 1C values; returned references can be reused
+    unchanged.
+    РАЗРЕШЕННЫЕ is added if absent to the first ВЫБРАТЬ of each batch statement. limit=1..500 rows
+    (default 100). Returns columns/rows/returned_rows/truncated; permissions affect results.
+    0<timeout<=3600 seconds (default 180); timeout does not cancel the query."""
     return _code_execution.execute(sys.modules[__name__], _need(), mode='query', context='server',
                                    query=query, parameters=parameters, limit=limit, timeout=timeout,
                                    check_permissions=_execution.get() is None)
@@ -1687,19 +1694,16 @@ def tc_get_screenshot(scale: int = 100, grid: bool = False, region: list[int] = 
 
 @_action('tc_app')
 def tc_get_active_window() -> dict:
-    """Return the application's active window: {key, class, title, platform_version} and sometimes
-    form_name. url is the navigation link (empty if none); home_page and is_main identify the
-    start page and main window when provided by the platform. title is the caption of the window's managed form — null only when the window has
-    no form or the caption could not be read. form_name is the form's name in the configuration
-    metadata ('Справочник.Контрагенты.Форма.ФормаСписка'), unrelated to name, which for a form
-    is a GUID. form_name is read only when the window itself gave no caption and may be absent
-    even then: its absence says nothing about the form. To read it explicitly call
-    tc_get_child_objects on the window key. platform_version is the version of this connection;
-    actions unavailable on it are refused with available_since. addressable=false means the
-    window has no element address; this alone does not identify its type. When local recovery
-    is unavailable, code=active_window_unavailable explains how to continue. A local print preview may report native=true and
-    recovery="close_window": close it to return to the form before addressing form elements.
-    no_active_work_window means no work window is active; use execute_command to open a form."""
+    """Read the active window: key/class/title/platform_version, optional
+    form_name/url/home_page/is_main. title is the form caption (null: no form or unreadable); url is
+    empty without a link. form_name is a metadata name, not the form's GUID name; it is only
+    attempted when the window supplies no caption and may remain absent; absence says nothing
+    about the form. Read it explicitly with
+    tc_get_child_objects on the window key. platform_version identifies this connection; unsupported
+    actions report available_since. addressable=false means no element address, not a window type.
+    native=true with recovery=close_window indicates a local preview to close before addressing form
+    elements. active_window_unavailable gives recovery guidance; no_active_work_window requires
+    opening a form with tc_execute_command."""
     c = _need()
     w = _window(c)
     # заголовок берём у дочерней формы: в ответе самого окна его либо нет, либо он неотличим от
@@ -1726,17 +1730,11 @@ def tc_activate_window() -> dict:
 
 @_action('tc_app')
 def tc_get_child_objects(key: str = None, scope: typing.Literal['window', 'application'] = 'window') -> dict:
-    """List one level of child UI objects under the addressed parent. If its address is omitted,
-    use the last observed active window, querying the client if no window has been observed.
-    For a whole subtree in one call use tc_find(action="find_objects").
-    Returns an object with parent and children: [...]. Child metadata includes class and title;
-    name and type may also be present. type names a recognized platform element kind
-    (e.g. CheckBoxField or Pages), and may be null when no kind is known for that object.
-    A ManagedForm row can also carry form_name, its name in configuration metadata
-    (e.g. 'Справочник.Контрагенты.Форма.ФормаСписка'), useful when the title is empty.
-    scope=application with no parent lists all application windows. Window and command-button
-    metadata may include url; window metadata may also include home_page and is_main.
-    Always obtain object addresses from tool results."""
+    """Read one level: parent and children: [...], with class/title and optional name/type/form_name.
+    type is the platform element kind (null if unknown); ManagedForm.form_name is its metadata name.
+    Omitted parent uses the last observed active window, querying it if none was observed.
+    scope=application without a parent lists application windows. Windows/command buttons may
+    include url; windows may include home_page/is_main."""
     c = _need()
     if scope not in ('window', 'application') or (scope == 'application' and key):
         return {'ok': False, 'code': 'invalid_argument',
@@ -1835,17 +1833,14 @@ def _finish_input_text(c, key, text, handle):
 
 @_action('tc_field')
 def tc_input_text(key: str, text: str, handle: str, finish: bool = True) -> dict:
-    """Enter text. Ordinary form input fields finish automatically: the owning form moves
-    focus once to its next element, then the accepted value is checked. finish=false leaves
-    the editing buffer active, for example before choosing a reference suggestion or cancelling.
-    If pending text changes, subsequent actions report pending_input_changed; re-enter or cancel it.
-    Empty text clears the value directly. Reference input can still need a matching value.
-    committed=true confirms the accepted text; false means pending; null means unverified.
-    edit_finished reports whether focus left the ordinary field. Numeric formatting can produce
-    verification=numeric_equivalent with committed=null. changed compares displayed text.
-    These flags do not mean the record was saved. Table cells use tc_table(action="set_cell_text").
-    Text documents finish by activating another element with tc_field(action="activate");
-    spreadsheet cells use tc_doc(action="end_edit_current_area")."""
+    """Enter text; text="" clears. finish=true moves the owning form's focus once and verifies ordinary
+    input; false keeps the edit buffer (e.g. for reference choice/cancel). Reference input may still
+    require selection. Changed pending text causes pending_input_changed: re-enter or cancel.
+    committed=true/false/null means accepted/pending/unverified; edit_finished means focus left;
+    changed compares displayed text. Numeric formatting may yield verification=numeric_equivalent
+    and committed=null. These flags do not confirm saving. For table cells use tc_set_cell_text;
+    finish text documents with activate on another element, spreadsheet cells with tc_doc
+    end_edit_current_area."""
     c = _need()
     guid, middle = _input_text_command(text, c, key)
     ok = True
@@ -1894,6 +1889,7 @@ def _remember_text_input(c, key, text, input_ok, result=None, handle=None):
     result = result or {}
     if input_ok and _key_class(key) == 'EditField' and '.Table[' not in key:
         # Only one field can own the input focus; keep this per connection, bounded.
+        c._pending_text_choice = None
         c._pending_text_input = (key if text and result.get('edit_finished') is not True
                                 and result.get('committed') is not True else None)
         if c._pending_text_input is None:
@@ -1935,6 +1931,11 @@ def _check_pending_text_input(c, current=None, form=None):
         owner = _batches.owner(sys.modules[__name__], pending)
         if not owner or (form is None and _window(c).get('key') != _collection_parent(owner)):
             return None  # A validation/choice dialog must remain operable.
+        if _complete_pending_choice(c):
+            return None
+        if getattr(c, '_pending', 0):
+            return {'ok': False, 'code': 'input_state_unavailable', 'target': pending,
+                    'error': 'The choice result could not be checked while a client reply is pending.'}
         form = form or _ref_live_object(c, owner)
         if not form:
             return None
@@ -2007,13 +2008,10 @@ def _page_activation_result(c, key, handle):
 
 @_action('tc_field')
 def tc_activate(key: str, handle: str) -> dict:
-    """Give a form element the focus — this is how you switch to a page or make a table column
-    the current cell; a click does neither. It also commits text left uncommitted by tc_field(action="input_text"),
-    but only when you activate a DIFFERENT focusable element: the field you typed into already has the focus.
-    To let the form choose the next focus target, use tc_form(action="goto_next_element") on the form.
-    Pages report visibility after activation; a page that remains hidden returns target_hidden.
-    Reports no `changed` — verify with tc_field(action="get_text"), tc_field(action="get_current_page"),
-    tc_form(action="get_current_element") or tc_table(action="get_current_item")."""
+    """Focus an element, switch a page or make a table column current; click does not do this. Commits
+    pending input_text only by focusing a DIFFERENT focusable element; tc_goto_next_element lets the
+    form choose. Reports page visibility; still hidden returns target_hidden. No changed flag:
+    verify via get_text/get_current_page, tc_get_current_element or tc_get_current_item."""
     c = _need()
     if _key_class(key) == 'ManagedForm':
         # Activating a work form remains possible if the user selected the service tab.
@@ -2037,14 +2035,14 @@ def _click_guid(key):
 
 @_action('tc_field')
 def tc_click(key: str, handle: str, diagnostics: bool = False, diagnostics_wait: float = 2.0) -> dict:
-    """Click a button, field, form group, decoration or command-interface button. The element must support
-    clicking. To focus an input, table cell or page, use activate.
-    When present, window describes the active window after the click.
-    diagnostics=True requests the active window and its messages, which may include earlier actions.
-    diagnostics_wait (0..60 s) is the polling period while
-    messages are unavailable/empty; 0 reads once. Individual requests use set_max_action_time.
-    diagnostics.status distinguishes read/unavailable/failed; messages=null is not an empty list.
-    Neither ok nor missing messages confirms a business operation succeeded."""
+    """Click a button, field, group, decoration or command-interface button.
+    Use activate to focus inputs/cells/pages. window, when present, is the active window afterwards.
+    window_changed=false means the previous window description still applies.
+    diagnostics=true also reads messages, possibly from earlier actions.
+    diagnostics_wait=0..60 seconds polls while messages are unavailable/empty; 0 reads
+    once. Individual requests use set_max_action_time. diagnostics.status is
+    read/unavailable/failed; null messages are not an empty list. ok or absent messages do not prove
+    business success."""
     error = _action_diagnostics.validate(diagnostics, diagnostics_wait)
     if error:
         return dict(ok=False, code='invalid_argument', error=error)
@@ -2084,7 +2082,7 @@ def tc_set_check(key: str, handle: str) -> dict:
 # ============================== чтения ======================================
 @_action('tc_field')
 def tc_get_text(key: str, handle: str) -> dict:
-    """Read displayed text (checkbox text follows the client language). An empty input field
+    """Read displayed text (checkbox text follows the client language). An empty input or label field
     returns "". For an edit buffer use get_edit_text.
     If text is unavailable, the answer explains the limitation and suggests another reading
     action where applicable. null does not confirm an empty field."""
@@ -2295,14 +2293,19 @@ def tc_choose_from_drop_list(key: str, value: str | int, handle: str) -> dict:
     """Pick a value from a field's open drop-down list by its display text (e.g. a colour name)
     or by its 0-based index in the list. The value is written at once — no focus change is needed.
     changed may come back null here even when the value did change: with the list open the
-    value cannot be read. Read the field with tc_get_text to confirm."""
+    value cannot be read. A changed window is returned when readback is enabled;
+    inspect it before continuing. window_changed=false reuses the previous window description.
+    Read the field with tc_get_text to confirm."""
     c = _need()
     ok = True
     for kind in ('action', 'commit'):
         r = c.send_cmd(G.CHOOSE_FROM_DROP_LIST, key, kind=kind, middle=tc1c.mk_choice(value), handle=handle)
         ok = ok and r['ok']
     _resolved_text_input(c, key, ok)
-    return {'ok': ok, 'target': key, 'value': value}
+    result = {'ok': ok, 'target': key, 'value': value}
+    if ok and READBACK:
+        result.update(_action_diagnostics.choice_window(sys.modules[__name__], c, key))
+    return result
 
 @_action('tc_field')
 def tc_increase_value(key: str, handle: str) -> dict:
@@ -2461,12 +2464,15 @@ def tc_deselect_all_rows(key: str, handle: str) -> dict:
 
 
 @_action('tc_table')
-def tc_read_rows(key: str, handle: str, max_rows: int = 500) -> dict:
-    """Read all selectable rows of the current table, respecting its filters and collapsed groups.
-    Returns row_count and up to max_rows rows (0 for count only); row order is not guaranteed.
-    Temporarily selects rows, then clears selection. Keeps a usable current row; on older
-    platforms an unavailable current row requires the first row, reported as cursor_repositioned=true.
-    Previous selection is cleared. Refuses unfinished row edits. Column keys are titles."""
+def tc_read_rows(key: str, handle: str, max_rows: int = 500,
+                 columns: _row_search.Columns = None,
+                 text_format: typing.Literal['plain', 'raw'] = 'plain') -> dict:
+    """Read selectable rows within current filters/collapsed groups: row_count and at most max_rows (0:
+    count only), unordered. columns selects returned titles; plain strips known search highlighting,
+    raw retains it. Temporarily selects rows, then clears ALL previous selection. Keeps a usable
+    current row; older platforms may move an unavailable cursor to first (cursor_repositioned=true).
+    Single-selection tables are read sequentially (10000-row, 180-second scan limits), restoring
+    the current row. Refuses unfinished row edits and inactive containing pages."""
     c, error = _need_ver('8.3.6')
     if error:
         return error
@@ -2474,6 +2480,10 @@ def tc_read_rows(key: str, handle: str, max_rows: int = 500) -> dict:
         return {'ok': False, 'code': 'invalid_table', 'error': 'Read rows requires a table.'}
     if type(max_rows) is not int or not 0 <= max_rows <= 10000:
         return {'ok': False, 'code': 'invalid_row_limit', 'error': 'max_rows must be an integer from 0 to 10000.'}
+    try:
+        columns = _row_search.output_options(columns, text_format)
+    except _row_search.OutputError as exc:
+        return dict(ok=False, code=exc.code, error=str(exc), selection_changed=False)
     error = _check_pending_text_input(c)
     if error:
         return dict(error, selection_changed=False)
@@ -2482,7 +2492,13 @@ def tc_read_rows(key: str, handle: str, max_rows: int = 500) -> dict:
     attempted = False
     window = None
     record_mark = None
+    old_deadline = vars(c).get('_io_deadline')
+    c._io_deadline = min(old_deadline or float('inf'), time.monotonic() + 180)
     try:
+        error = _table_page_error(c, key)
+        if error:
+            return dict(result, **error, selection_changed=False)
+        titles = _row_search.output_titles(sys.modules[__name__], c, key, columns)
         window = _cell_window(c)
         state, visible = _verify_target(c, key, handle)
         if state == 'absent':
@@ -2496,26 +2512,38 @@ def tc_read_rows(key: str, handle: str, max_rows: int = 500) -> dict:
             return dict(result, code='row_edit_pending' if mode is True else 'edit_state_unavailable',
                         error='Finish or explicitly cancel row editing before reading the table.',
                         edit_mode=mode, selection_changed=False)
+        selection_state = _table_reading.helper_state(sys.modules[__name__], c, key)
+        if selection_state is not None:
+            _cell_window(c, window)
+            mode = _cell_flag(c, G.CURRENT_MODE_IS_EDIT, key, handle)
+            if mode is not False:
+                return dict(result, code='row_edit_pending' if mode is True else 'edit_state_unavailable', selection_changed=False,
+                            error='Finish row editing before reading the table.')
         record_mark = _native_composite_begin(c)
         if not _guid_available(c, G.DESELECT_ALL_ROWS):
             _table_activate(c, key, handle, window)
         attempted = True
-        _cell_step(tc_select_all_rows(key, handle), 'The table rows could not be selected.')
-        rows = _cell_step(tc_get_selected_rows(key, handle), 'The selected rows could not be read.')['rows']
-        result.update(ok=True, rows=rows[:max_rows], row_count=len(rows),
+        rows = _table_reading.Reader(sys.modules[__name__], c, key, handle, window, result).read(selection_state)
+        result.update(row_count=len(rows))
+        selected = _row_search.project(rows[:max_rows], columns, text_format, titles) if max_rows else []
+        result.update(ok=True, rows=selected, row_count=len(rows),
                       returned_rows=min(len(rows), max_rows), truncated=len(rows) > max_rows)
     except Exception as exc:
         details = exc.result() if isinstance(exc, tc1c.OperationError) else getattr(exc, 'details', {})
+        if isinstance(exc, _row_search.OutputError):
+            details = {'code': exc.code}
         result.update(details, ok=False, error=str(exc))
     finally:
         if attempted:
             try:
+                if vars(c).get('_pending') or time.monotonic() >= c._io_deadline:
+                    raise RuntimeError('No safe opportunity remains for selection cleanup.')
                 _cell_window(c, window)
                 if _cell_flag(c, G.CURRENT_MODE_IS_EDIT, key, handle) is not False:
                     raise RuntimeError('Row editing started or could not be checked; it was left untouched.')
                 if _guid_available(c, G.DESELECT_ALL_ROWS):
                     _cell_step(tc_deselect_all_rows(key, handle), 'Selection could not be cleared.')
-                elif result.get('row_count') != 0:
+                elif _cell_step(tc_get_selected_rows(key, handle), 'Selection could not be checked.')['rows']:
                     # No search condition: the cursor stays on the same row, even for duplicate rows.
                     reduced = tc_goto_row(key, handle=handle)
                     if (not reduced.get('ok') and reduced.get('status_code') == 13
@@ -2556,27 +2584,42 @@ def tc_read_rows(key: str, handle: str, max_rows: int = 500) -> dict:
                     result['operation_error'] = result['error']
                 result.update(ok=False, code='recording_incomplete',
                               error='Scenario recording could not continue after this action: ' + str(exc))
+        c._io_deadline = old_deadline
     return result
+
+@_action('tc_table')
+def tc_search(key: str, handle: str, text: str, max_rows: int = 500,
+              timeout: float = 180, settle_time: float = 2,
+              columns: _row_search.Columns = None,
+              text_format: typing.Literal['plain', 'raw'] = 'plain') -> dict:
+    """Set the list's standard search string (empty clears), preserving filters. Returns rows after
+    input readback and two equal row reads settle_time seconds apart; stability is not a platform
+    completion signal. max_rows=1..10000; truncated means more rows. 0<settle_time<timeout<=3600;
+    timeout covers the action. columns selects titles; raw retains search highlighting. Reading
+    clears selection; unfinished edits refuse."""
+    c = _need()
+    return _list_search.run(sys.modules[__name__], c, key, handle, text, max_rows, timeout, settle_time,
+                            columns, text_format)
+
 
 @_action('tc_table')
 def tc_find_rows(key: str, handle: str, conditions: _row_search.Conditions,
                  columns: _row_search.Columns = None, case_sensitive: bool = False,
-                 max_rows: int = 500, max_matches: int = 50) -> dict:
-    """Find matching selectable rows of the current table, respecting filters and collapsed groups;
-    never a database-wide search. conditions is an AND-list of {column, text, match}; column is a
-    displayed column TITLE. match is exact (default), contains, starts_with or ends_with; literal
-    displayed text is compared without case by default. Known search highlighting is ignored
-    during comparison; returned values are unchanged.
-    Optional columns lists titles to return. Empty text matches displayed emptiness only.
-    max_rows limits checked rows (not the client response); max_matches limits returned matches.
-    complete refers only to this table; matches_truncated reports omitted matches. No stable order
-    or row identifiers. Uses read_rows: temporarily selects rows, clears previous selection and
-    may reposition an unavailable cursor on older platforms. Refuses unfinished row edits."""
+                 max_rows: int = 500, max_matches: int = 50,
+                 text_format: typing.Literal['plain', 'raw'] = 'plain') -> dict:
+    """Search selectable rows of the CURRENT table, respecting filters/collapsed groups;
+    never a database-wide search. conditions is an AND-list of {column: displayed TITLE, text, match:
+    exact/contains/starts_with/ends_with}; literal, case-insensitive by default. Ignore search
+    highlighting for comparison; plain removes it in results, raw retains it. Empty text matches
+    displayed emptiness. columns selects returned titles. max_rows bounds checked rows, not client
+    response; max_matches bounds matches. complete covers this table; matches_truncated marks
+    omitted matches. No stable order/row IDs. Uses read_rows: clears selection, may reposition an
+    unavailable cursor on older platforms; refuses unfinished row edits."""
     c, error = _need_ver('8.3.6')
     if error:
         return error
     return _row_search.search(sys.modules[__name__], c, key, handle, conditions, columns,
-                              case_sensitive, max_rows, max_matches)
+                              case_sensitive, max_rows, max_matches, text_format)
 
 
 @_action('tc_table')
@@ -2602,13 +2645,10 @@ def tc_delete_row(key: str, handle: str, confirm: bool = None) -> dict:
 @_action('tc_table')
 def tc_delete_rows(key: str, handle: str, confirm: bool = None,
                    scope: typing.Literal['current', 'selected'] = 'current', unmark: bool = False) -> dict:
-    """Delete the current row (default), or the selected rows with scope="selected" (8.3.6+).
-    Selected uses the table's standard context-menu Delete or Mark for deletion command,
-    preserving selection.
-    confirm=True/False answers a confirmation; None leaves it open.
-    ok means the command was accepted; deleted=null means the effect was not verified.
-    Lists may mark records instead of removing rows. unmark=True explicitly requests removal of
-    deletion marks (8.3.6+), only for lists with a standard marking command; ordinary tables refuse it."""
+    """Delete current or selected rows (selected: 8.3.6+, standard context-menu Delete/Mark, preserving
+    selection). confirm=true/false answers; null leaves confirmation open. Lists may mark instead of
+    remove. deleted=null means unverified. unmark=true removes marks (8.3.6+), only in lists with a
+    standard marking command, not ordinary tables."""
     c = _need()
     return _delete_rows(c, key, handle, confirm, scope, unmark=unmark)
 
@@ -2962,12 +3002,10 @@ def tc_change_row(key: str, handle: str) -> dict:
 
 @_action('tc_table')
 def tc_switch_row_delete_mark(key: str, handle: str, confirm: bool = True) -> dict:
-    """Toggle the deletion mark of the current row. Raises a modal 'mark for deletion?' dialog that is auto-answered: confirm=True → Yes
-    (default), False → No. dialog_answered only reports that a modal question was answered — it is
-    NOT evidence that the mark changed, and changed is always null here because the platform
-    exposes no readable deletion-mark flag. To check the result, click the row's mark command and
-    read the question text: 'mark for deletion?' means it is not marked, 'remove the mark?' means
-    it is."""
+    """Toggle the current row's deletion mark; confirm=true answers Yes, false No. dialog_answered
+    proves only a response; changed is always null (no readable mark flag). To verify, invoke the
+    mark command again and read its question: mark means currently unmarked, remove mark means
+    marked."""
     c = _need()
     ok = True
     for kind in ('action', 'commit'):
@@ -2989,14 +3027,11 @@ def tc_end_edit_row(key: str, handle: str, cancel: bool = False) -> dict:
 
 @_action('tc_table')
 def tc_expand(key: str, handle: str, row_column: str = None, row_value=None, subordinates: bool = False) -> dict:
-    """Expand a form group (Group[...]) or a table node. For a table, pass row_column+row_value to
-    target a row by a column name or title; omit them for the current row. Set subordinates to also
-    expand the child rows. Nothing to expand is not an error: ok only reports that the client
-    accepted the command. changed is false only when value_before and value_after were both read
-    and came back equal, which happens for a TABLE node, and null when they could not be read —
-    a FORM GROUP (the platform's Expanded applies to tables only), a failed read, or
-    readback='off'. can_be_expanded checks a table row, not a form group, and its true is not a
-    promise: judge by value_before/value_after."""
+    """Expand a form group or table node; subordinates also expands child rows. For tables,
+    row_column+row_value targets a row by column name/title; omitted: current row. No expandable
+    node is not an error. changed=false only for equal successfully read value_before/value_after;
+    null for form groups, read failures or readback=off. can_be_expanded applies only to table rows
+    and does not guarantee an effect; verify before/after."""
     c = _need()
     is_group = _key_class(key) == 'Group'
     if is_group:
@@ -3013,13 +3048,11 @@ def tc_expand(key: str, handle: str, row_column: str = None, row_value=None, sub
 
 @_action('tc_table')
 def tc_collapse(key: str, handle: str, row_column: str = None, row_value=None) -> dict:
-    """Collapse a form group (Group[...]) or a table node. For a table, pass row_column+row_value to
-    target a row by a column name or title; omit them for the current row. Nothing to collapse is not an
-    error: ok only reports that the client accepted the command. changed is false only when
-    value_before and value_after were both read and came back equal, which happens for a TABLE
-    node, and null when they could not be read — a FORM GROUP (the platform's Expanded applies
-    to tables only), a failed read, or readback='off'. can_be_expanded checks a table row, not a
-    form group, and its true is not a promise: judge by value_before/value_after."""
+    """Collapse a form group or table node. For tables, row_column+row_value targets a row by column
+    name/title; omitted: current row. No collapsible node is not an error. changed=false only for
+    equal successfully read value_before/value_after; null for form groups, read failures or
+    readback=off. can_be_expanded applies only to table rows and does not guarantee an effect;
+    verify before/after."""
     c = _need()
     is_group = _key_class(key) == 'Group'
     if is_group:
@@ -3098,10 +3131,10 @@ def tc_goto_start_page() -> dict:
 
 @_action('tc_window')
 def tc_close_window(key: str = None) -> dict:
-    """Close the window at ref, or the active window if omitted.
+    """Close the window at key, or the active window if omitted.
     Returns closed only after verifying that the window disappeared. If it remains open,
     returns window_not_closed and target; inspect the form or answer its dialog before retrying.
-    Also closes an active local print preview when ref is omitted."""
+    Also closes an active local print preview when key is omitted."""
     return _close_active_window(_need(), key=key)
 
 
@@ -3185,6 +3218,7 @@ def _close_active_window(c, send=None, native_only=False, key=None, confirm=None
         deadline = time.monotonic() + 1.0
         while True:
             if not any(w.get('key') == wk for w in _read_open_windows(c)):
+                _snapshot_storage().drop_contexts(_state.get('_snapshot_owner'), wk)
                 return {'ok': True, 'closed': wk}
             if time.monotonic() >= deadline:
                 break
@@ -3200,7 +3234,8 @@ def _close_active_window(c, send=None, native_only=False, key=None, confirm=None
 def tc_execute_command(command: str) -> dict:
     """Open a navigation link, e.g. 'e1cib/list/Справочник.Контрагенты', 'e1cib/app/Обработка.Имя'
     or a URL returned by the command interface. For a button name or title, find it and use click.
-    Returns the resulting window; an opened error window is a failure."""
+    Returns the resulting window; window_changed=false reuses the previous window description.
+    An opened error window is a failure."""
     c = _need()
     if not isinstance(command, str) or not re.fullmatch(
             r'(?:e1cib/\S.*|(?:e1c|https?)://\S.*)', command.strip(), re.IGNORECASE) or any(
@@ -3292,13 +3327,10 @@ def tc_choose_user_message(text: str) -> dict:
 
 @_action('tc_window')
 def tc_answer_dialog(confirm: bool = True, timeout: int = 5) -> dict:
-    """Answer a modal Yes/No question raised by the configuration. The question is an ordinary window
-    and its buttons are picked by NAME: Button0 answers yes, Button1 answers no. A dialog may
-    offer a THIRD choice (Button2 is often 'Отмена') which this action never presses — read
-    `question` and inspect the window with tc_find_objects when the answer you need is a
-    different button. Waits up to timeout seconds for such a dialog to appear. Returns
-    answered='Да'/'Нет' and `question`, or both null when no dialog showed up; `question` alone
-    is null when the dialog carried no readable message."""
+    """Wait up to timeout seconds and answer a modal question: confirm=true presses Button0, false
+    Button1. Never presses Button2; inspect the question/window for other choices. Returns
+    answered='Да'/'Нет' and question; both null means no dialog, question alone null means
+    unreadable text."""
     c = _need()
     ans, question = _answer_confirm_dialog(c, confirm, max_wait=max(timeout, 0))
     return {'ok': True, 'answered': ans, 'question': question}
@@ -3389,10 +3421,8 @@ def tc_execute_choice_from_menu(key: str, index: int | str, handle: str) -> dict
 # ===================== гиперссылки / порядок / варианты =====================
 @_action('tc_doc')
 def tc_click_html_hyperlink(key: str, index: int | str, handle: str) -> dict:
-    """Click a hyperlink in an HTML-document field. The platform clicks the FIRST link whatever
-    you pass: measured with three links and an index of 0, 1 and 2, and the same encoding the
-    platform's own test manager sends. An index beyond the number of links is refused, so the
-    argument is read — it just does not choose. Addressing by text does nothing at all here."""
+    """Click an HTML link. The platform may open the FIRST link regardless of an in-range index;
+    out-of-range indexes fail. text has no effect. Verify the resulting navigation."""
     c = _need()
     ok = True
     for kind in ('action', 'commit'):
@@ -3806,6 +3836,23 @@ def tc_delete_view_status_item(key: str, index: int | str, handle: str) -> dict:
 
 # ============ ссылочное поле: выбор / открытие / очистка / создание =========
 @_action('tc_field')
+def tc_select_value(key: str, handle: str, value: str = None, match: _value_selection.Match = None,
+                    choice_table: str = None, choice_column: str = None, data_type: str = None,
+                    expected: str = None, max_rows: int = 500, timeout: float = 180) -> dict:
+    """Select exact value text (drop-down first) or match={column title: exact text} in a choice form.
+    Ambiguous/incomplete searches refuse selection. choice_table is an exact table name;
+    choice_column limits value to a column title; data_type chooses a displayed type in the standard
+    type dialog. expected checks accepted field text. Returns accepted value and verification.
+    max_rows=1..10000; timeout is in seconds, 0<timeout<=3600, and covers the action.
+    Failure leaves the UI and does not undo sent choices. Table cells use the current row and
+    leave row editing open."""
+    c = _need()
+    return _value_selection.run(sys.modules[__name__], c, key, handle, value=value, match=match,
+        choice_table=choice_table, choice_column=choice_column, data_type=data_type,
+        expected=expected, max_rows=max_rows, timeout=timeout)
+
+
+@_action('tc_field')
 def tc_start_choosing(key: str, handle: str) -> dict:
     """Open a reference field's choice form. Handles focus and table-cell editing.
     For CalendarField, selects the current date like a double-click; use goto_date first.
@@ -3855,12 +3902,17 @@ def tc_start_choosing(key: str, handle: str) -> dict:
         if calendar:
             return {'ok': True, 'target': key, 'opened': opened, 'window': window}
         result = {'ok': opened, 'target': key, 'opened': opened, 'window': window}
+        baseline = getattr(c, '_pending_text_value', None)
+        if opened and getattr(c, '_pending_text_input', None) == key and baseline:
+            c._pending_text_choice = dict(key=key, handle=handle, window=window['key'],
+                                          origin=before, baseline=baseline, selected=False)
         if not opened:
             result.update(code='choice_not_opened', error='No separate choice window opened. Inspect the field or its choice list.')
         return result
     except _CellEditFailure as exc:
         # Never cancel here: another cell or a newly added row may contain pending input.
-        return {'ok': False, 'target': key, 'opened': False, 'stage': stage, 'error': str(exc)}
+        return {'ok': False, 'target': key, 'opened': False, 'stage': stage,
+                'error': str(exc), **exc.details}
 
 @_action('tc_field')
 def tc_start_choosing_from_choice_list(key: str, handle: str) -> dict:
@@ -3876,14 +3928,18 @@ def tc_start_choosing_from_choice_list(key: str, handle: str) -> dict:
 def tc_execute_choice_from_choice_list(key: str, value: str | int, handle: str) -> dict:
     """Pick from a field's choice list by its display text or by its 0-based index. Reports
     changed/value_before/value_after — the field's value read before and after, same as
-    tc_field(action="choose_from_drop_list")."""
+    tc_field(action="choose_from_drop_list"). A changed window is returned with readback enabled.
+    window_changed=false reuses the previous window description."""
     c = _need()
     ok = True
     for kind in ('action', 'commit'):
         ok = c.send_cmd(G.EXECUTE_CHOICE_FROM_CHOICE_LIST, key, kind=kind, middle=tc1c.mk_choice(value), handle=handle)['ok'] and ok
     _state['window_key'] = None          # список выбора закрылся — активное окно другое
     _resolved_text_input(c, key, ok)
-    return {'ok': ok, 'target': key, 'value': value}
+    result = {'ok': ok, 'target': key, 'value': value}
+    if ok and READBACK:
+        result.update(_action_diagnostics.choice_window(sys.modules[__name__], c, key))
+    return result
 
 @_action('tc_field')
 def tc_open_field(key: str, handle: str) -> dict:
@@ -3940,8 +3996,46 @@ def _resolved_text_input(c, key, ok):
         form = _batches.owner(sys.modules[__name__], key)
         if form and _window(c).get('key') == _collection_parent(form):
             c._pending_text_input = None
+            c._pending_text_value = None
+            c._pending_text_choice = None
     finally:
         c._track = track
+
+def _complete_pending_choice(c):
+    """Release only the input whose own choice window accepted a row and closed."""
+    choice = getattr(c, '_pending_text_choice', None)
+    if not choice:
+        return False
+    if (getattr(c, '_pending_text_input', None) != choice['key'] or
+            getattr(c, '_pending_text_value', None) is not choice['baseline']):
+        c._pending_text_choice = None
+        return False
+    if not choice['selected']:
+        return False
+    track = getattr(c, '_track', None)
+    try:
+        c._track = None
+        if _window(c).get('key') != choice['origin']:
+            return False
+        if any(w.get('key') == choice['window'] for w in _read_open_windows(c)):
+            return False
+        obj = _ref_live_object(c, choice['key'])
+        if not obj or obj.get('handle') != choice['handle']:
+            return False
+        text = _pending_input_value(c, choice['key'], choice['handle'], G.GET_EDIT_TEXT)
+        accepted = _pending_input_value(c, choice['key'], choice['handle'], G.GET_PROPERTY)
+        if not accepted or text != accepted:
+            return False
+        c._pending_text_input = None
+        c._pending_text_value = None
+        c._pending_text_choice = None
+        return True
+    except Exception:
+        # An unreadable return value is not evidence that pending input was resolved.
+        return False
+    finally:
+        c._track = track
+
 
 @_action('tc_field')
 def tc_drop_list_is_open(key: str, handle: str) -> dict:
@@ -3992,17 +4086,19 @@ def tc_calendar_previous_year(key: str, handle: str) -> dict:
 # ============ таблица/группа: состояние и элементы ==========================
 @_action('tc_table')
 def tc_choose_row(key: str, handle: str) -> dict:
-    """Choose (select / double-click) the current table row. In a choice form this picks the row and
-    closes the form; in a list form the same action OPENS the row's item — on a hierarchical
-    list, the folder own card rather than stepping into the folder. `changed` reports whether
-    the ACTIVE WINDOW changed: true means a window opened or closed, which is what a completed
-    choice looks like; false means the window stayed — the choice did not go through, or the row
-    was picked without closing anything, so read the field you were filling to tell those apart."""
+    """Choose/double-click the current row: selects and closes a choice form, opens an item's card in a
+    list (a folder's own card, not its contents). changed tracks ACTIVE WINDOW change only. If
+    false, read the destination field: selection may have succeeded without closing a window."""
     c = _need()
     ok = True
     for kind in ('action', 'commit'):
         ok = c.send_cmd(G.CHOOSE_ROW, key, kind=kind, middle=b'', handle=handle)['ok'] and ok
     _state['window_key'] = None          # выбор строки списка открывает форму элемента
+    choice = getattr(c, '_pending_text_choice', None)
+    form = _batches.owner(sys.modules[__name__], key)
+    if ok and choice and form and _collection_parent(form) == choice['window']:
+        choice['selected'] = True
+        _complete_pending_choice(c)
     return {'ok': ok, 'target': key, 'action': 'choose_row'}
 
 @_action('tc_table')
@@ -4045,14 +4141,11 @@ def tc_get_current_item(key: str, handle: str) -> dict:
 
 @_action('tc_table')
 def tc_get_cell_text(key: str, column: str | int, handle: str) -> dict:
-    """Read a cell in the current row. Text may include search-highlight markup.
-    column is the column element NAME, or its 0-based index as a number or
-    a string of digits ('0' is index 0, not a name — an element name cannot start with a digit).
-    Unknown or ambiguous column names are refused; a matching title suggests the element name.
-    Only displayed columns can be read. null does not establish that the cell is empty.
-    A column inside a COLUMN GROUP that the table shows as one column may answer with
-    the GROUP's text — a neighbouring column's value — and that answer cannot be told from a
-    correct one; members of other kinds in the same group answer null instead."""
+    """Read the current row's displayed cell (may contain search markup). column is an element NAME or
+    0-based index; digit strings are indexes. Unknown/ambiguous names refuse; a matching title
+    suggests the name. null does not prove emptiness. A COLUMN GROUP displayed as one column may
+    return neighbouring/group text indistinguishable from the intended value; other-kind members may
+    return null. A nonexistent table can also return text=null."""
     c = _need()
     column = _as_index(column)          # '0' — это индекс, а не имя: имя не начинается с цифры
     resolved = []
@@ -4187,20 +4280,14 @@ def tc_title_is_shown(key: str, handle: str) -> dict:
 @_action('tc_table')
 def tc_goto_row(key: str, column: str | int = None, value=None, handle: str = None,
                 direction: str = 'down', toggle_selection: bool = False, fields: dict = None) -> dict:
-    """Go to the table row where column equals value (int or string; the wildcards * and ? work).
-    column is the column TITLE; an index is not accepted here. Pass fields ({column: value}) to
-    match several columns at once; do not combine fields with column/value. Seeks directly,
-    so there is no need to walk rows. Matching is
-    CASE-SENSITIVE and compares the value as SHOWN ("Встреча агента (Совещание)"), so a wildcard
-    is often what you want. The search starts at the CURRENT row, runs in direction (down by
-    default, or up) to the end of the list and does NOT wrap; the current row is itself a
-    candidate, so searching for the value the cursor already sits on reports found=true without
-    moving — step off the row first to find the NEXT match. A search that finds nothing still
-    MOVES the cursor, to the last row going down, the first going up. Set toggle_selection to
-    toggle the row it lands on; with no column and no fields it just toggles the current row.
-    found is null when there was nothing to search for or the search result could not be determined — null
-    never means "not found". In the answer `criteria` repeats the TITLE you searched by and
-    `observed.column` gives that same column NAME."""
+    """Seek by column (displayed TITLE, not index) and value, or fields={title:value} for multiple
+    columns; do not combine them. Values accept int/string and * ? wildcards; matching is
+    case-sensitive displayed text. Searches FROM AND INCLUDING current row towards down/up, without
+    wrapping. Step away first for the next match. A miss moves to the last row going down,
+    or the first going up.
+    toggle_selection toggles the destination; without criteria, the current row. found=null means no
+    criteria or undetermined, never not-found. criteria uses titles; observed.column uses the
+    element name. Refuses inactive containing pages."""
     c = _need()
     # тип общий на всю группу, поэтому число доходит и сюда; платформа ищет по ЗАГОЛОВКУ и
     # индекса в критерии не принимает — отказываем внятно, а не питоновской ошибкой
@@ -4211,6 +4298,9 @@ def tc_goto_row(key: str, column: str | int = None, value=None, handle: str = No
                 'error': 'Use either fields or column/value. Put all search conditions in fields.'}
     pairs = list(fields.items()) if fields else ([(column, value)] if column is not None else [])
     error = _row_criteria_error(c, key, pairs)
+    if error:
+        return dict(error, target=key)
+    error = _table_page_error(c, key)
     if error:
         return dict(error, target=key)
     mid = tc1c.mk_gotorow(fields=pairs, toggle_selection=toggle_selection, direction=direction)
@@ -4235,19 +4325,15 @@ _SHEET_FORMATS = {'mxl': 0, 'html': 1, 'pdf': 2, 'xls': 6, 'xlsx': 7, 'ods': 8, 
 def tc_write_content_to_file(key: str, handle: str, filename: str = None,
                             file_format: str = None, filter_index: int = None,
                             save_as: bool = None) -> dict:
-    """Save an HTML, formatted, spreadsheet or text document field. PDF fields do not support
-    this action. With filename, Save As is used even for a previously saved document; this call
-    replaces pending file-dialog answers and clears its answer afterwards on 8.3.25+.
-    Older platforms cannot clear unused answers; prepare only the next dialog.
-    For spreadsheets choose file_format: mxl, html, pdf, xls, xlsx, ods or docx. Example:
-    filename="C:/exports/report.xlsx", file_format="xlsx". The extension alone does not select
-    a format. Alternatively filter_index selects a dialog's file type (0-based); do not combine
-    it with file_format. Without either option the dialog's first file type is selected.
-    Without filename, saves under the current name unless save_as=true. If a dialog can appear,
-    prepare it before EACH call using tc_app(action="set_file_dialog_result").
-    ok confirms that the save request was accepted, not that a file has finished writing.
-    A final cleanup failure is reported separately in cleanup_error with dialog_answer_cleared=false.
-    The next call with filename retries cleanup before saving."""
+    """Save HTML/formatted/spreadsheet/text fields (not PDF fields). filename forces Save As, replacing
+    and finally clearing pending dialog answers on 8.3.25+; older versions cannot clear unused
+    answers, so prepare only the next dialog. Spreadsheet file_format:
+    mxl/html/pdf/xls/xlsx/ods/docx; extension alone does not select it. Alternatively use 0-based
+    filter_index; mutually exclusive with file_format, omitted: first type. Without filename, use
+    current name unless save_as=true; predefine possible dialogs before EACH call with
+    tc_set_file_dialog_result. ok confirms accepted requests, not completed disk writing. Final
+    cleanup failure separately returns cleanup_error and dialog_answer_cleared=false; the next
+    filename call retries cleanup before saving."""
     c = _need()
     kind = _kind_of(c, key)
     if kind not in _WRITE_KINDS:
@@ -4318,12 +4404,9 @@ def tc_write_content_to_file(key: str, handle: str, filename: str = None,
 
 @_action('tc_field')
 def tc_wait_for_drop_list_generation(key: str, handle: str, timeout: int = 60) -> dict:
-    """Wait up to timeout seconds for a drop-down list to be generated.
-    timeout must be an integer from 0 to 65535.
-    Returns generated=True if a list appeared within the timeout, else False. The answer is not
-    tied to the element you addressed — it can come back true before this field's list is open at
-    all, the same way get_choice_list describes. Open the list on the field you care about first
-    (tc_field(action="open_drop_list")) and read it right after."""
+    """Wait timeout seconds (integer 0..65535) for a generated drop-down; returns generated. The result
+    is not tied to key and may be true before this field's list opens. Open this field's list first,
+    then read it immediately."""
     try:
         middle = tc1c.mk_wait(timeout)
     except ValueError as exc:
@@ -4345,7 +4428,7 @@ def tc_get_doc_area_vertical_size(key: str, handle: str) -> dict:
 @_action('tc_field')
 def tc_get_data_presentation(key: str, handle: str) -> dict:
     """Get an element's data presentation. Form fields only — not form decorations, and on a table
-    the answer is always null. An empty input field returns "". presentation is null when no
+    the answer is always null. An empty input or label field returns "". presentation is null when no
     value was available; that is not proof
     that the field has no presentation."""
     c = _need()
@@ -4395,13 +4478,11 @@ def tc_set_max_action_time(seconds: int) -> dict:
 @_action('tc_app')
 def tc_set_file_dialog_result(result: bool = True, filename: str | list = None,
                               filter_index: int = 0) -> dict:
-    """Predefine the next file dialog's result: result=True + filename to simulate picking a
-    file, result=False to cancel. Pass a list of names to simulate a multi-file selection.
-    filter_index selects which dialog filter is active (0-based).
-    On 8.3.25+, replaces pending answers; clear_file_dialog_result cancels an unused answer.
-    Older platforms cannot clear unused answers; prepare only the next dialog.
-    Each answer is consumed once. Call BEFORE opening the dialog;
-    this cannot answer a file dialog that is already open."""
+    """Predefine the NEXT file dialog: result=true with filename (or a list for multiple files)
+    selects; false cancels. filter_index is 0-based. Call BEFORE opening; cannot answer an open
+    dialog. Each answer is consumed once. On 8.3.25+, replaces pending answers;
+    clear_file_dialog_result clears unused ones. Older platforms cannot clear them: prepare only the
+    next dialog."""
     c = _need()
     middle = tc1c.mk_set_file_dialog_result(result, filename, filter_index)
     can_clear = _guid_available(c, G.CLEAR_FILE_DIALOG_RESULT)
@@ -4846,6 +4927,9 @@ def _native_composite_begin(c, action='read_rows'):
             and c._track is not None):
         return None
     if _state.get('rec_native_stopped'):
+        if _batches._NATIVE_RECORD_OWNER.get() is c:
+            # The active batch captures nested commands in its own fragment.
+            return None
         raise _CellEditFailure('Finish or cancel the interrupted recording before continuing.',
                                {'code': 'recording_incomplete'})
     try:
@@ -4905,16 +4989,13 @@ def tc_record_start() -> dict:
 
 @_action('tc_scenario')
 def tc_record_finish(path: str = None) -> dict:
-    """Stop recording and return the scenario XML in 'uilog', or write it to `path`, resolved against
-    the SERVER working directory and echoed back absolute. If the file cannot be written the
-    answer carries ok=false, the path, the reason AND the scenario in 'uilog' — recording is
-    already stopped, so a second call will not give it back. In synth mode, a failed completion
-    returns finish_not_confirmed with the preserved XML in uilog. lost_actions: actions that could
-    not be captured, so the scenario is incomplete for replay. no_effect: calls whose value came
-    back unchanged — a hint to check, not a verdict, and it numbers CALLS, not steps of the XML.
-    observed/not_observed count the calls whose result could and could not be read back;
-    readback/scope say whether reading back was on at all and how wide it reached. An empty
-    no_effect with zero observed means nothing was checked."""
+    """Stop recording; return XML in uilog or save path (relative to SERVER working directory; returns
+    absolute). Write failure returns ok=false/error/path AND uilog; recording already stopped, so
+    retry cannot recover it. Synth completion failure returns finish_not_confirmed with preserved
+    XML. lost_actions means incomplete replay. no_effect lists unchanged readbacks by CALL index,
+    not XML step; not proof of no effect. observed/not_observed count successful/unavailable
+    readbacks; readback/scope describe coverage. Empty no_effect with observed=0 means nothing
+    checked."""
     c = _need()
     # завершение необратимо: повторный вызов послал бы его заново и вернул пустой сценарий как
     # успех. Пауза признак не снимает — она приостанавливает пополнение, а не заканчивает запись
@@ -5214,17 +5295,23 @@ def _find_wait(c, name=None, cls=None, type=None, root_key=None, title=None, tim
 @_action('tc_find')
 def tc_find_objects(name: str = None, cls: str = None, type: str = None, root_key: str = None,
                     title: str = None, timeout: int = 0,
-                    scope: typing.Literal['window', 'application'] = 'window') -> dict:
-    """Find all objects in the UI tree matching the criteria. name and title take the wildcards * and
-    ?; cls is the class and type is the platform's element kind (both as reported by
-    tc_get_child_objects, e.g. CheckBoxField or Popup); root_key is where to start (default: the
-    active window); timeout keeps retrying for that many seconds while nothing matches (0 = a
-    single pass). An empty result is not an error, so ok stays true. When nothing matched and a
-    cls or type was given, the answer also says whether the server knows that filter and what
-    was actually present, so a misspelling is distinguishable from an object that never
-    appeared. scope=application searches across application windows; omit root_key in this scope.
-    Window and command-button results include url when available."""
+                    scope: typing.Literal['window', 'application'] = 'window',
+                    limit: int = None, cursor: str = None) -> dict:
+    """Search UI objects: name/title support * ?; cls/type use discovered class/platform kind
+    (tc_get_child_objects). root_key defaults to active window; scope=application requires omitting
+    it. timeout retries while no matches (0: once). Empty results are ok; cls/type diagnostics
+    identify unknown filters and list observed kinds. Windows/command buttons include url when
+    available. No limit returns all; limit=1..1000 pages with total/has_more/next_cursor. Continue
+    with cursor alone (plus connection_id if needed), no filters. Pages retain the original result
+    for 5 minutes; elements may become stale."""
     c = _need()
+    try:
+        _find_pages.validate(limit, cursor, (name, cls, type, root_key, title,
+                                           timeout if timeout else None, scope if scope != 'window' else None))
+        if cursor is not None:
+            return _find_pages.for_client(c).resume(cursor)
+    except _find_pages.Failure as exc:
+        return dict(ok=False, code=exc.code, error=str(exc))
     if scope not in ('window', 'application') or (scope == 'application' and root_key):
         return {'ok': False, 'code': 'invalid_argument',
                 'error': 'Use scope=application without a search root, or scope=window with an optional root.'}
@@ -5243,6 +5330,11 @@ def tc_find_objects(name: str = None, cls: str = None, type: str = None, root_ke
         if detail:
             out['note'] = 'nothing matched: ' + detail
         out.update(diag)
+    if limit is not None:
+        try:
+            return _find_pages.for_client(c).start(out, limit)
+        except _find_pages.Failure as exc:
+            return dict(ok=False, code=exc.code, error=str(exc))
     return out
 
 @_action('tc_find')
@@ -5393,43 +5485,53 @@ def tc_wait_for_closing(window_title: str = None, timeout: int = 60) -> dict:
 
 @_action('tc_form')
 def tc_get_context(key: str = None, save_as_snapshot: bool = False,
-                   include_tables: bool = False, max_rows: int = 500) -> dict:
-    """Inspect the active ManagedForm: all elements (including hidden ones), states, field values
-    and current input context. Includes find_objects results for this form; no separate search
-    is needed. For element lookup only, use find_objects. May take several seconds.
-    save_as_snapshot returns snapshot_id for compare_snapshot without reading the form again.
-    include_tables adds table_rows (up to max_rows per table) without expanding trees; rows stay
-    selected. On 8.3 preparation may activate rows. Document contents are excluded.
-    Flags: '-' was not read, 'unknown' failed; null is unavailable, not an empty string.
-    complete/errors report read gaps; snapshot_error reports a failed save. Reads are sequential."""
-    return _form_context.run(sys.modules[__name__], key, save_as_snapshot, include_tables, max_rows)
+                   include_tables: bool = False, max_rows: int = 500,
+                   root_key: str = None, visible_only: bool = False,
+                   include_commands: bool = True,
+                   result_mode: typing.Literal['changes', 'full'] = 'changes') -> dict:
+    """Inspect ManagedForm elements (including hidden), state, values and input context; includes
+    discovery, so no separate search is needed. Use tc_find_objects alone for element lookup. May
+    take seconds. result_mode=changes returns a full first read, then only new/changed elements and
+    removed objects since the previous complete read of this form; changed=false means no changes.
+    Other interaction fields describe the current state. full returns everything. result_mode and
+    full_reason identify the actual response; context_id/compared_to identify automatic baselines.
+    Filter changes or lost baselines return full. Incomplete reads return full and keep the prior
+    baseline. save_as_snapshot creates a separate fixed
+    snapshot for compare_snapshot without another read. include_tables adds up
+    to max_rows per table without expanding trees; rows stay selected, 8.3 may activate rows.
+    Excludes document contents. Flags: '-' unread, 'unknown' failed, null unavailable (not empty).
+    form_details reports optional hints/type restrictions/choices availability. root_key limits
+    output to a subtree; include_commands=false omits buttons/command groups; visible_only excludes
+    known hidden/inactive pages, retains unknown visibility. Output filters do not narrow reading or
+    fixed snapshot scope. complete/errors mark read gaps; snapshot_error marks failed saving.
+    Sequential reads."""
+    return _form_context.run(sys.modules[__name__], key, save_as_snapshot, include_tables, max_rows,
+                             root_key, visible_only, include_commands, result_mode)
 
 
 @_action('tc_form')
 def tc_create_snapshot(key: str = None, include_tables: bool = False, max_rows: int = 500) -> dict:
-    """Save a baseline of a ManagedForm (default: the active form). Returns snapshot_id and a
-    summary. May take several seconds; use when you need to compare form state later.
-    Reads element visibility, availability, read-only flags and ordinary field values;
-    include_tables saves table rows in display order, up to max_rows per table, without expanding
-    trees. Rows stay selected; on 8.3 preparation may activate rows or establish a current row.
-    Including rows requires the active form and finished input (platform 8.3.6+).
-    All preparation precedes the final state read. Document contents are excluded. Hidden branches skip further state reads;
-    disabled elements skip read-only. Reads are sequential, not an atomic view of the form."""
+    """Save ManagedForm state (default active) for later compare_snapshot; returns snapshot_id/summary.
+    Reads visibility/availability/read-only and ordinary values; hidden branches skip further reads,
+    disabled elements skip read-only. include_tables adds display-ordered rows up to max_rows each
+    without expanding trees; requires active form/finished input (8.3.6+). Tables requiring sequential
+    navigation report table_requires_sequential_read and complete=false; use read_rows separately.
+    Rows stay selected; 8.3
+    may activate/establish current rows. Preparation precedes final reading. Excludes document
+    contents; sequential, not atomic; may take seconds."""
     return _snapshots.run(sys.modules[__name__], 'create_snapshot', key=key,
                           include_tables=include_tables, max_rows=max_rows)
 
 
 @_action('tc_form')
 def tc_compare_snapshot(snapshot_id: str, key: str = None) -> dict:
-    """Compare a saved baseline with the current state of its original form; no new snapshot is
-    stored. Optional key must identify that same form instance. Returns changes, added and removed
-    elements; observed lists properties read now whose earlier values were not read. Skipped
-    readings are not changes. complete/baseline_complete and errors identify gaps in reading.
-    Uses the baseline's table settings. table_changes compares rows by position (1-based), with
-    column titles and before/after values; *_present distinguishes missing cells from empty text.
-    Table preparation precedes reading; rows stay selected. Truncated tables are not compared.
-    For flags in added, '-' means not read and 'unknown' means reading failed.
-    Closed forms and reconnected clients require a new baseline."""
+    """Compare the original form instance with its baseline; optional key must identify the same
+    instance. Returns changes/added/removed; observed means previously unread properties, not
+    changes. complete/baseline_complete/errors mark read gaps. Uses baseline table settings;
+    table_changes matches 1-based row positions and column titles, *_present distinguishes
+    missing/empty cells. Tables are prepared before reading and stay selected; truncated tables are
+    not compared. Added flags: '-' unread, 'unknown' failed. Stores no new snapshot;
+    closed/reconnected forms need a new baseline."""
     return _snapshots.run(sys.modules[__name__], 'compare_snapshot', key=key, snapshot_id=snapshot_id)
 
 
@@ -5521,14 +5623,13 @@ def _table_cells(c, table_key):
             for o in _table_columns(c, table_key) if o.get('name') and o.get('handle')}
 
 @_action('tc_scenario')
-def tc_run_scenario(uilog: str = None, path: str = None) -> dict:
-    """Replay a recorded uilog scenario on the current form. Give the XML in `uilog` or a `path` to a
-    file with it. Steps that could not be replayed are listed in `unsupported`. `total` counts
-    reported steps; replay stops at the first failed step and returns its 0-based stopped_at;
-    unsupported steps are skipped. `played` counts the ones actually attempted, REGARDLESS of how
-    they went, so a failed step is still counted. Neither is a count of effects: `ok` says every
-    attempted step was accepted, and the effect of a step is in `steps[].changed`, the same
-    contract as when you call the action directly."""
+def tc_run_scenario(uilog: str = None, path: str = None,
+                    result_mode: typing.Literal['summary', 'full'] = 'summary') -> dict:
+    """Replay uilog XML or path on the current form. Unsupported steps are skipped/listed; first
+    failure stops at 0-based stopped_at. total counts reported steps, played counts attempted steps
+    including failures. ok means all attempted commands accepted, not all effects verified; full
+    steps[].changed follows each action's contract. Default summary; result_mode=full adds steps.
+    Logs retain full details in both modes."""
     import xml.etree.ElementTree as ET
     c = _need()
     if not uilog and path:
@@ -6163,42 +6264,57 @@ def _cell_flag(c, guid, key, handle):
 
 def _cell_ready(c, key, handle):
     # Composite edits require positive evidence even when optional target checks are off.
-    for guid, expected, message in (
-            (G.CURRENT_VISIBLE, True, 'the target is not visibly available'),
-            (G.CURRENT_ENABLE, True, 'the target is not enabled'),
-            (G.CURRENT_READONLY, False, 'the target is read-only or its editability is unknown')):
+    for guid, expected, prop, code, message in (
+            (G.CURRENT_VISIBLE, True, 'visible', 'target_hidden', 'the target is not visibly available'),
+            (G.CURRENT_ENABLE, True, 'enabled', 'target_disabled', 'the target is not enabled'),
+            (G.CURRENT_READONLY, False, 'readonly', 'readonly', 'the target is read-only')):
         if not _guid_available(c, guid):
             raise _CellEditFailure('this platform cannot verify whether the target can be edited')
-        if _cell_flag(c, guid, key, handle) is not expected:
-            raise _CellEditFailure(message)
+        value = _cell_flag(c, guid, key, handle)
+        if type(value) is not bool:
+            raise _CellEditFailure('The target property could not be read: ' + prop,
+                                   {'code': 'edit_state_unavailable', 'property': prop, prop: None})
+        if value is not expected:
+            raise _CellEditFailure(message, {'code': code, 'property': prop, prop: value})
+
+
+def _table_page_error(c, key):
+    """Check containing pages before table navigation or selection changes."""
+    if not _guid_available(c, G.GET_CURRENT_PAGE):
+        return None
+    ancestors = []
+    parent = _collection_parent(key)
+    while parent and _key_class(parent) != 'ManagedForm':
+        ancestors.append(parent)
+        parent = _collection_parent(parent)
+    for parent in reversed(ancestors):
+        if _key_class(parent) != 'Group':
+            continue
+        page = _ref_live_object(c, parent)
+        if not page or page.get('type') != 'Page':
+            continue
+        group_key = _collection_parent(parent)
+        group = _ref_live_object(c, group_key)
+        if not group or group.get('type') != 'Pages' or not group.get('handle'):
+            continue
+        r = c.send_cmd(G.GET_CURRENT_PAGE, group_key, kind='read', middle=RC, handle=group['handle'])
+        current = _coll(r, group_key, remember=False)
+        if not r.get('ok') or len(current) != 1 or not current[0].get('key'):
+            return dict(ok=False, code='page_state_unavailable',
+                        error='The current page could not be determined. Inspect the form before retrying.')
+        if current[0]['key'] != parent:
+            return dict(ok=False, code='inactive_page', page=page,
+                        suggested_action='activate',
+                        error='The table is on an inactive page. Activate the returned page, then retry.')
+    return None
 
 
 def _table_edit_diagnostic(c, key, detail):
     """Explain a refused edit only when a page group's current page proves why."""
-    if not _guid_available(c, G.GET_CURRENT_PAGE):
-        return detail
     try:
-        ancestors = []
-        parent = _collection_parent(key)
-        while parent and _key_class(parent) != 'ManagedForm':
-            ancestors.append(parent)
-            parent = _collection_parent(parent)
-        for parent in reversed(ancestors):
-            if _key_class(parent) != 'Group':
-                continue
-            page = _ref_live_object(c, parent)
-            if not page or page.get('type') != 'Page':
-                continue
-            group_key = _collection_parent(parent)
-            group = _ref_live_object(c, group_key)
-            if not group or group.get('type') != 'Pages' or not group.get('handle'):
-                continue
-            r = c.send_cmd(G.GET_CURRENT_PAGE, group_key, kind='read', middle=RC, handle=group['handle'])
-            current = _coll(r, group_key)
-            if len(current) == 1 and current[0].get('key') and current[0]['key'] != parent:
-                return dict(detail, code='inactive_page', page=page,
-                            suggested_action='activate',
-                            error='The table is on an inactive page. Activate the returned page, then retry.')
+        error = _table_page_error(c, key)
+        if error and error['code'] == 'inactive_page':
+            return dict(detail, **error)
     except Exception as exc:
         # Diagnostics must retain the original refused operation and its status.
         return dict(detail, diagnostic_error=str(exc))
@@ -6323,15 +6439,13 @@ def _verify_empty_cell(c, key, handle, col, window):
 
 @_action('tc_table')
 def tc_set_cell_text(key: str, column: str, text: str, handle: str) -> dict:
-    """Set text in the current row's column (element name). Handles focus and row editing,
-    then reads the result. Empty text clears the cell. Returns verified, changed and
-    value_before/value_after (displayed text). verification=empty_value confirms an empty
-    value behind display formatting. Numeric formatting can return verified=null with
-    verification=numeric_equivalent. Continues an existing row edit, including a newly added row,
-    and finishes it without discarding other cells' edits. If validation or reference selection
-    keeps the row in edit mode, returns row_edit_pending with the current editor; continue
-    there or cancel explicitly with end_edit_row(cancel=true). Rounded output can instead return
-    value_verification_inconclusive: editing finished, but the exact value is not verified."""
+    """Set current-row column by element NAME; manages focus, continues existing row edits, finishes
+    without discarding other cells, then reads back. Empty text clears. Returns verified/changed and
+    displayed value_before/value_after; empty_value confirms emptiness despite formatting;
+    numeric_equivalent may give verified=null. row_edit_pending means validation/reference choice
+    kept editing: continue at the returned editor or end_edit_row(cancel=true).
+    value_verification_inconclusive means editing finished but rounded output prevents exact
+    verification."""
     c = _need()
     stage, before, after, editing, window = 'check_target', None, None, False, None
     existing_edit = False
@@ -6354,7 +6468,11 @@ def tc_set_cell_text(key: str, column: str, text: str, handle: str) -> dict:
         columns = _table_columns(c, key)
         cols = [o for o in columns if o.get('name') == column]
         if len(cols) != 1:
-            raise _CellEditFailure('column is missing or ambiguous; use its element name')
+            details = {'code': 'ambiguous_column' if cols else 'column_not_found', 'column': column}
+            suggestions = [o['name'] for o in columns if o.get('title') == column and o.get('name')]
+            if suggestions:
+                details['suggested_columns'] = suggestions
+            raise _CellEditFailure('column is missing or ambiguous; use its element name', details)
         col = cols[0]
         if col.get('type') != 'InputField':
             raise _CellEditFailure('the column does not support text input')
@@ -6409,7 +6527,8 @@ def tc_set_cell_text(key: str, column: str, text: str, handle: str) -> dict:
         return _cell_result(key, before, after, text, 'done')
     except _CellEditFailure as exc:
         result = _cell_result(key, before, after, text, stage, str(exc))
-        for name in ('code', 'status_code', 'suggested_action', 'message', 'recovery', 'edit_mode'):
+        for name in ('code', 'status_code', 'suggested_action', 'message', 'recovery', 'edit_mode',
+                     'property', 'readonly', 'visible', 'enabled', 'column', 'suggested_columns'):
             if name in exc.details:
                 result[name] = exc.details[name]
     except Exception as exc:
@@ -6717,12 +6836,11 @@ def tc_read_document(key: str, handle: str, start_address: str = None, max_cells
 def tc_find_text(key: str, handle: str, text: str, match: typing.Literal['contains', 'exact'] = 'contains',
                  case_sensitive: bool = False, area: str = None, start_address: str = None,
                  max_cells: int = 1000) -> dict:
-    """Find literal text in a spreadsheet document; return matching cell addresses and text.
-    match=contains finds substrings, exact matches a whole cell. Case is ignored by default.
-    Optional area limits the search to a cell or rectangle (8.3.25+). Does not move the current area.
-    max_cells limits scanned positions (1–10000), not matches. complete=false means more positions
-    remain: pass next_address as start_address with the same text, match, case_sensitive and area.
-    An empty matches list establishes absence only in the successfully scanned part."""
+    """Find literal spreadsheet text (match=contains/exact, case-insensitive by default); return cell
+    addresses/text without moving the current area. area restricts a cell/rectangle (8.3.25+).
+    max_cells=1..10000 limits scanned positions, not matches. If complete=false, resume with
+    start_address=next_address and unchanged text/match/case_sensitive/area. Empty matches proves
+    absence only in the successfully scanned part."""
     if not isinstance(text, str) or not text or match not in ('contains', 'exact') or type(case_sensitive) is not bool:
         return {'ok': False, 'code': 'invalid_search', 'error': 'Supply nonempty text, match=contains or exact, and a boolean case_sensitive.',
                 'matches': [], 'complete': False}
@@ -6755,12 +6873,14 @@ def tc_read_fields(targets: list[dict], properties: _batches.PropertyList = None
 
 @_action('tc_field')
 def tc_set_fields(entries: list[dict]) -> dict:
-    """Fill 1–100 input fields or checkboxes of one active form in order. Each entry has exactly
-    one value: text for an input field, checked=true/false for a checkbox. Already matching checkboxes
-    are not toggled. Unknown checkbox states stop the batch; Yes/No presentations in Russian and English are supported.
-    Empty text clears. Stops on refusal, unfinished selection, a changed window or unconfirmed value;
-    previous changes remain. Results use 0-based input indexes. Rechecks all values at the end;
-    final_verified=null can mean equivalent numeric formatting. Does not save the document."""
+    """Fill 1..100 input fields or checkboxes in one active form, in order.
+    Each entry has exactly one of text, checked (boolean), or select={value: exact text}
+    / select={match: {column title: exact text}}; select
+    accepts tc_select_value options. Empty text clears; matching checkboxes are not toggled, unknown
+    states stop (Russian/English Yes/No supported). Stops on refusal, pending choice, window change
+    or unconfirmed value; earlier changes remain. Rechecks all values at the end;
+    final_verified=null may mean equivalent numeric formatting. Results use 0-based input indexes.
+    Does not save the document."""
     c, error = _need_ver('8.3.12')
     if error: return error
     return _batches.write(sys.modules[__name__], entries=entries)
@@ -6780,16 +6900,51 @@ def tc_add_rows(key: str, handle: str, rows: _batches.RowEntries) -> dict:
 
 @_action('tc_table')
 def tc_set_row_values(key: str, handle: str, cells: _batches.CellEntries) -> dict:
-    """Fill 1–100 input or checkbox columns in the current row: each cell has column (element name)
-    and exactly one of text (input column) or checked=true/false (checkbox). Matching checkboxes are not toggled.
-    Finishes row editing once after entering all cells, then reads the values back. Continues an
-    existing row edit. Stops on refusal or an unexpected editor; preserves earlier edits for explicit
-    completion or cancellation. completed counts entered cells; edit_finished confirms row completion.
-    Results follow input order (0-based index). final_verified=null can
-    mean equivalent numeric formatting. Does not add rows, change selection or save the document."""
+    """Fill 1..100 cells of the current row: {column: element NAME, text} or {column, checked}.
+    Matching checkboxes are not toggled. Continues editing, finishes once after all entries, then
+    reads back. Refusal/unexpected editor stops with earlier edits preserved for completion/cancel.
+    completed counts entries; edit_finished confirms row completion; final_verified=null may mean
+    numeric equivalence. Results use 0-based input order. Does not add rows, alter selection or
+    save."""
     c, error = _need_ver('8.3.12')
     if error: return error
     return _batches.write(sys.modules[__name__], key=key, handle=handle, cells=cells)
+
+
+@_action('tc_table')
+def tc_get_list_settings(key: str, handle: str, max_rows: int = 500, timeout: float = 180) -> dict:
+    """Read filters and sorting through the list's standard settings form. Closes settings opened by this call.
+    filters contains expanded tree rows, including the root and groups; orders follows sort priority.
+    Values are displayed text. max_rows limits each settings table (1–10000).
+    timeout bounds the operation in seconds (greater than 0, at most 3600)."""
+    c, error = _need_ver('8.3.12')
+    if error: return error
+    return _list_settings.run(sys.modules[__name__], c, key, handle, 'get', max_rows=max_rows, timeout=timeout)
+
+
+@_action('tc_table')
+def tc_get_list_settings_fields(key: str, handle: str, section: _list_settings.Section = 'filters',
+                                max_rows: int = 500, timeout: float = 180) -> dict:
+    """List available field captions for filters or orders through the standard list settings.
+    Returns visible fields; collapsed branches are not traversed. Closes settings opened by this call.
+    timeout limits the operation in seconds (0 < timeout <= 3600)."""
+    c, error = _need_ver('8.3.12')
+    if error: return error
+    return _list_settings.run(sys.modules[__name__], c, key, handle, 'fields', section=section, max_rows=max_rows, timeout=timeout)
+
+
+@_action('tc_table')
+def tc_set_list_settings(key: str, handle: str, filters: _list_settings.Filters = None,
+                        orders: _list_settings.Orders = None, replace: bool = False,
+                        max_rows: int = 500, timeout: float = 180) -> dict:
+    """Apply standard list filters/sorting; field is an exact available caption, value is displayed
+    text. filters/orders follow their schemas. Adds by default; replace=true replaces only supplied
+    sections ([] clears one). Success applies and closes settings; failure leaves them open and
+    earlier edits may remain. 0<timeout<=3600 seconds covers the operation."""
+    c, error = _need_ver('8.3.12')
+    if error: return error
+    return _list_settings.run(sys.modules[__name__], c, key, handle, 'set', filters=filters, orders=orders,
+                              replace=replace, max_rows=max_rows, timeout=timeout)
 
 
 # ===================== публикация групп инструментов ========================
@@ -6823,23 +6978,16 @@ _ACTION_GROUP = {a: g for g, acts in _ACTIONS.items() for a in acts}
 _COMMON_ACTIONS = ('is_visible', 'is_enabled', 'get_context_menu', 'get_parent')
 
 
-_PARAM_NOTE = ('\nIn the signatures below a trailing * marks a REQUIRED parameter — the '
-               'group schema itself accepts every parameter as optional.')
+_PARAM_NOTE = ('\n* marks a required action parameter; the group schema treats action parameters '
+               'as optional. Pass action="name" and only that action\'s parameters.')
 
-_EFFECT_NOTE = ('\n`ok: true` means the client accepted the command, not that anything '
-                'changed — confirm an effect by reading the state back; `target_check: present` '
-                'is not proof of one either. Where the address can be checked the response '
-                'carries `target_check`: `present`, `unknown` (not checkable here) or `off` '
-                '(checking disabled). `target_hidden: true` appears ONLY when the target exists '
-                'and was NOT visible; it does NOT prove the absence of an effect — for '
-                'tc_field(action="activate") invisibility is the normal precondition — it '
-                'describes the ELEMENT itself and not an invisible container around it, and its '
-                'absence says nothing. A wrong address is refused with an error only where the '
-                'address can be checked: a read without a target marker cannot tell one from an '
-                'empty answer, and tc_table(action="get_cell_text") on a table that does '
-                'not exist returns text=null exactly as for an empty cell. '
-                'Interaction refusals may include failure_context: observed element state, '
-                'current table editor or open choices. complete=false means some diagnostics were unavailable.')
+_EFFECT_NOTE = ('\nok=true means accepted; verify effects by reading state. target_check: present, '
+                'unknown (uncheckable), off (disabled); present does not prove an effect. '
+                'target_hidden=true means the target exists but is invisible; it describes the element, '
+                'not its ancestors. Its absence says nothing; hidden targets may still act (e.g. activate). '
+                'Invalid addresses are rejected only where the address can be checked; an unverified '
+                'empty read may mean a missing target. failure_context describes state/editor/choices; '
+                'its complete=false means incomplete diagnostics.')
 
 
 
@@ -6853,7 +7001,7 @@ def _common_hint(group, acts, published):
         return ''                                  # группа не работает с объектами по адресу
     other = ['%s(action="%s")' % (published[a], a) for a in _COMMON_ACTIONS
              if published.get(a) and published[a] != group]
-    return ('\nCommon operations for objects of this type live elsewhere: %s.' % ', '.join(other)
+    return ('\nAlso available: %s.' % ', '.join(other)
             if other else '')
 
 
@@ -6881,8 +7029,8 @@ _ADDRESS_NOTES = {
         **dict.fromkeys(('prefix', 'off'), 'targets is an array of {key, handle} pairs returned by discovery.'),
     },
     'set_fields': {
-        'id': 'entries contains {ref, text} or {ref, checked} objects; use discovered references unchanged.',
-        **dict.fromkeys(('prefix', 'off'), 'entries contains {key, handle, text} or {key, handle, checked}; use discovered address pairs.'),
+        'id': 'entries contains {ref, text}, {ref, checked}, or {ref, select} objects; use discovered references unchanged.',
+        **dict.fromkeys(('prefix', 'off'), 'entries contains {key, handle, text}, {key, handle, checked}, or {key, handle, select}; use discovered address pairs.'),
     },
     'get_child_objects': {
         'id': 'Address the parent with ref; children contain ref values. '
@@ -6926,6 +7074,27 @@ def _fmt_action(name, fn):
     if minv and _ver_tuple(minv) > (8, 3, 1):
         lines[-1] = (lines[-1] if lines else '') + ' (1C %s+)' % minv
     return '\n'.join(['- %s(%s)' % (name, ', '.join(sp))] + ['    ' + l for l in lines])
+
+
+def _action_argument_error(fn, kw):
+    """Validate public argument names before resolving any UI references."""
+    public = list(_public_parameters(fn))
+    params = {p.name: p for p in public if p.kind not in
+              (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)}
+    supplied = {k for k, v in kw.items() if v is not None and k != 'action'}
+    unexpected = ([] if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in public)
+                  else sorted(supplied - params.keys()))
+    missing = [p.name for p in params.values()
+               if p.default is inspect.Parameter.empty and p.name not in supplied]
+    if not unexpected and not missing:
+        return None
+    signature = ', '.join(p.name if p.default is inspect.Parameter.empty else
+                          p.name + '=' + ('null' if p.default is None else repr(p.default))
+                          for p in params.values())
+    return dict(ok=False, code='invalid_arguments',
+                error='Use only the parameters of the selected action; supply all required parameters.',
+                unexpected_parameters=unexpected, missing_parameters=missing,
+                signature=f'{fn.__name__[3:]}({signature})')
 
 
 def _resolve_ref_arguments(fn, kw):
@@ -7004,6 +7173,9 @@ _LOG_CHANGING = _VERIFY_ACTIONS | frozenset({
     'goto_next_window', 'goto_previous_window', 'goto_start_page',
     'execute_command', 'answer_dialog', 'close_user_messages_panel', 'choose_user_message',
     'set_fields', 'set_row_values', 'add_rows', 'set_cell_text', 'set_area_text', 'run_scenario',
+    'get_list_settings', 'get_list_settings_fields', 'set_list_settings',
+    'select_value',
+    'search',
     'read_rows', 'find_rows', 'create_snapshot', 'compare_snapshot', 'get_context',
     'execute_code', 'execute_query', 'execute_custom_bsl_function',
 })
@@ -7060,7 +7232,7 @@ def _dispatch_connected_action(acts, group, kw, connection_id=None):
                 capture = None
                 released = (action in ('disconnect', 'stop_client') and isinstance(result, dict)
                             and result.get('ok') is True and _state.get('client') is None)
-                if action != 'run_scenario' and not released and (journal.mode == 'all' or (journal.mode == 'actions' and (action in _LOG_CHANGING or failed))):
+                if action not in ('run_scenario', 'run_compatible_scenario') and not released and (journal.mode == 'all' or (journal.mode == 'actions' and (action in _LOG_CHANGING or failed))):
                     def capture():
                         return _screenshots.capture(_state.get('client'))
                 journal.finish(call, capture)
@@ -7082,11 +7254,26 @@ def _dispatch_connected_action(acts, group, kw, connection_id=None):
 
 
 def _dispatch_connected_action_impl(acts, group, kw, connection_id=None):
+    echo_target = kw.get('ref', kw.get('key'))
     name = kw.pop('action', None)
     fn = acts.get(name)
     if fn is None:
         raise ValueError('%s: unknown action %r. Available: %s' % (group, name, ', '.join(sorted(acts))))
     kw = {k: v for k, v in kw.items() if v is not None}
+    argument_error = _action_argument_error(fn, kw)
+    if argument_error:
+        if connection_id is not None:
+            argument_error['connection_id'] = connection_id
+        _call_logging.observe(argument_error)
+        return _deliver(argument_error)
+    scenario = name in ('run_scenario', 'run_compatible_scenario')
+    result_mode = kw.get('result_mode', 'summary')
+    if scenario and result_mode not in ('summary', 'full'):
+        result = dict(ok=False, code='invalid_result_mode', error='result_mode must be summary or full.')
+        if connection_id is not None:
+            result['connection_id'] = connection_id
+        _call_logging.observe(result)
+        return _deliver(result)
     try:
         if _address_mode() == 'id':
             if any(k in kw for k in ('key', 'handle', 'root_key')):
@@ -7134,6 +7321,27 @@ def _dispatch_connected_action_impl(acts, group, kw, connection_id=None):
         res['profile'] = _state['profile']
     res = _profiles.redact(res)
     _call_logging.observe(res)
+    if scenario:
+        res = _response.scenario_result(res, result_mode)
+        journal = _state.get('_call_journal')
+        if _call_logging.CURRENT.get() is not None and journal is not None:
+            try:
+                status = journal.status()
+                res = dict(res, logging={k: status[k] for k in
+                           ('active', 'reason', 'journal', 'report', 'allure_results') if status.get(k) is not None})
+            except Exception:
+                pass  # Optional report links cannot replace the completed scenario result.
+    if _execution.get() is None:
+        pool = _connection_pool()
+        with pool.lock:
+            connection_count = len(pool.entries)
+        client = _state.get('client')
+        window_state = dict(vars(client).get('_mcp_window_state', {})) if client is not None else {}
+        res = _response.compact_result(res, name, echo_target, connection_count, window_state)
+        delivered = _deliver(res, addrs=('tc_' + name) in _response.ADDR_TOOLS)
+        if client is not None:
+            client._mcp_window_state = window_state
+        return delivered
     return _deliver(res, addrs=('tc_' + name) in _response.ADDR_TOOLS)
 
 
@@ -7159,6 +7367,16 @@ def _dispatch_action(acts, group, kw):
     try:
         if name not in acts:
             return _dispatch_connected_action(acts, group, kw)
+        if name in ('connect', 'launch_client', 'list_connections', 'list_profiles') or (
+                name == 'disconnect' and kw.get('force') is True):
+            # The processing path is a launch setting consumed below, not a handler argument.
+            arguments = ({k: v for k, v in kw.items() if k != 'code_epf'}
+                         if name in ('connect', 'launch_client') else kw)
+            argument_error = _action_argument_error(acts[name], arguments)
+            if argument_error:
+                return _deliver(argument_error)
+        if name == 'run_compatible_scenario' and kw.get('check_only') is True and connection_id is None:
+            return _dispatch_connected_action_impl(acts, group, kw)
         if name in ('list_connections', 'list_profiles'):
             if connection_id is not None:
                 raise _connections.ConnectionError('invalid_connection_id', f'{name} does not select a connection; omit connection_id.')
@@ -7182,6 +7400,9 @@ def _dispatch_action(acts, group, kw):
                 launch=launching, connection_id=connection_id,
                 base=params.get('base'), user=params.get('user'))
             kw['port'] = connection.port
+            if launching:
+                from _connections import database_key
+                connection.environment_base = database_key(params['base'], params.get('server', False))
         else:
             refs = [kw[k] for k in ('ref', 'root_ref') if kw.get(k) is not None]
             refs.extend(_batches.refs(name, kw))
@@ -7219,5 +7440,3 @@ def _dispatch_action(acts, group, kw):
     finally:
         if password_token is not None:
             _profiles.PASSWORD.reset(password_token)
-
-

@@ -3,6 +3,11 @@
 Сгенерированный файл — не редактировать вручную."""
 
 TOOL_MIN_VERSION = {
+    'tc_search':                             '8.3.12',
+    'tc_select_value':                       '8.3.12',
+    'tc_get_list_settings':                  '8.3.12',
+    'tc_get_list_settings_fields':           '8.3.12',
+    'tc_set_list_settings':                  '8.3.12',
     'tc_choose_user_message':                '8.3.3',
     'tc_activate_window':                    '8.3.3',
     'tc_begin_edit_current_area':            '8.3.1',

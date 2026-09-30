@@ -15,7 +15,7 @@ import _response
 import _screenshots
 
 CUSTOM_TOOLS = frozenset({'tc_list_custom_bsl_functions', 'tc_execute_custom_bsl_function'})
-SERVICE_TOOLS = CUSTOM_TOOLS | {'tc_execute_code', 'tc_execute_query', 'tc_get_metadata'}
+SERVICE_TOOLS = CUSTOM_TOOLS | {'tc_execute_code', 'tc_execute_query', 'tc_get_metadata', 'tc_run_compatible_scenario'}
 
 
 class TestpilotMCP(FastMCP):
@@ -88,6 +88,8 @@ def register(S):
     # строиться от одного и того же набора, иначе описание сошлётся на исключённое действие
     published = {}
     for group, actions in S._ACTIONS.items():
+        if group == 'tc_run_compatible_scenario' and not S._call_logging.enabled('TC1C_COMPATIBLE_SCENARIOS', 'false'):
+            continue
         if group == 'tc_execute_code' and not S._code_execution.SETTINGS.code:
             continue
         if group == 'tc_execute_query' and not S._code_execution.SETTINGS.query:
@@ -115,7 +117,7 @@ def register(S):
                                                        dict(action=_action, **kw)))
             execute_dispatch.__signature__ = inspect.Signature(params)
             execute_dispatch.__name__ = group
-            desc = inspect.getdoc(handler) + '\nconnection_id selects the client when several clients are connected.'
+            desc = inspect.getdoc(handler) + '\nSet connection_id when several clients are connected.'
             S.mcp.tool(name=group, description=desc)(execute_dispatch)
             tool = S.mcp._tool_manager._tools[group]
             tool.fn_metadata.arg_model.model_config['extra'] = 'forbid'
@@ -129,33 +131,42 @@ def register(S):
                   inspect.Parameter('connection_id', inspect.Parameter.KEYWORD_ONLY,
                                     default=None, annotation=str)]
         seen = set()
+        positions = {}
         for fn in acts.values():
             for p in S._public_parameters(fn):
                 if p.name not in seen:
                     seen.add(p.name)
+                    positions[p.name] = len(params)
                     params.append(inspect.Parameter(p.name, inspect.Parameter.KEYWORD_ONLY,
                                                     default=None, annotation=p.annotation))
+                else:
+                    i = positions[p.name]
+                    # Preserve integer JSON values when another action accepts fractional
+                    # values under the same parameter name (for example timeout).
+                    if {params[i].annotation, p.annotation} == {int, float}:
+                        params[i] = params[i].replace(annotation=int | float)
         notes = S._PARAM_NOTE + (S._EFFECT_NOTE if set(acts) & S._VERIFY_ACTIONS else '')
         desc = '%s%s%s\nActions:\n%s' % (S._GROUP_DOC.get(group, group),
                                          S._common_hint(group, acts, pub_group), notes,
                                          '\n'.join(S._fmt_action(a, acts[a]) for a in sorted(acts)))
-        desc += '\nconnection_id selects the client. '
+        desc += '\n'
         ref_params = [name for name in ('ref', 'root_ref') if name in seen]
         if S._response.REF_MODE == 'id' and ref_params:
-            desc += ('Passing %s selects the client automatically; otherwise, with several clients, '
-                     'connection_id is required. ' % '/'.join(ref_params))
+            desc += ('%s selects the client; otherwise set connection_id when several clients '
+                     'are connected. ' % '/'.join(ref_params))
             if set(acts) & S._batches.FIELD_ACTIONS.keys():
-                desc += 'References in targets/entries also select the client; all must belong to one connection. '
+                desc += 'targets/entries references also select it; all must belong to one connection. '
         else:
-            desc += 'With several clients, connection_id is required. '
+            desc += 'Set connection_id when several clients are connected. '
         desc += 'Use tc_session(action="list_connections").'
+        if S._response.DETAIL == 'compact':
+            desc += '\nSuccess may omit target/connection echoes and shorten window details.'
         if S._response.COMPACT and any(('tc_' + a) in S._response.ADDR_TOOLS for a in acts):
             desc += S._response.HINT
         if S._response.REF_MODE == 'id' and (ref_params or
                 any(a in S._refs.OBJECT_SLOTS or a == 'get_active_window' for a in acts)):
-            desc += ('\nPass reference values returned by the tools unchanged in %s. ' % '/'.join(ref_params)
-                     if ref_params else '\nReturned references can be passed unchanged to actions that accept them. ')
-            desc += 'If a reference expires, find the element again.'
+            desc += ('\nUse returned references unchanged in %s; re-find expired elements.' % '/'.join(ref_params)
+                     if ref_params else '\nUse returned references unchanged in actions accepting them; re-find expired elements.')
 
         async def dispatch(_acts=acts, _group=group, **kw):
             control = _group == 'tc_session' and (kw.get('action') == 'list_connections' or

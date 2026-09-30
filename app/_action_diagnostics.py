@@ -19,6 +19,7 @@ def failure(S, c, key, handle, result):
     if result.get('status_code') not in (9, 10, 11, 12) and result.get('code') not in {
         'column_not_current', 'row_edit_interrupted', 'input_pending', 'row_edit_pending',
         'value_not_confirmed', 'final_values_not_confirmed', 'inactive_page',
+        'row_edit_refused', 'column_focus_redirected', 'edit_state_unavailable',
     }:
         return result
     if 'failure_context' in result:
@@ -30,12 +31,12 @@ def failure(S, c, key, handle, result):
     deadline = time.monotonic() + 2
     reads = 0
 
-    def read(label, fn, *args):
+    def read(label, fn, *args, **kwargs):
         nonlocal reads
         if reads >= 24 or time.monotonic() >= deadline:
             raise RuntimeError('The diagnostic read budget was reached.')
         reads += 1
-        r = fn(*args)
+        r = fn(*args, **kwargs)
         if isinstance(r, dict) and r.get('ok') is False:
             out['errors'].append(dict(property=label, code=r.get('code', 'value_unavailable')))
             out['complete'] = False
@@ -66,8 +67,22 @@ def failure(S, c, key, handle, result):
         form_key = S._batches.owner(S, key)
         window = read('window', S._window, c)
         if not form_key or window.get('key') != S._collection_parent(form_key):
-            out.update(complete=False, code='active_window_changed')
+            out.update(complete=False, code='active_window_changed', window=window)
             return dict(result, failure_context=out)
+        if (S._guid_available(c, S.G.GET_USER_MESSAGE_TEXTS) and 'messages' not in result):
+            try:
+                reply = read('messages', c.send_cmd, S.G.GET_USER_MESSAGE_TEXTS, window['key'],
+                             kind='read', middle=S.RC)
+                parsed = S._user_messages_result(reply)
+                out.update(messages=parsed.get('messages') if parsed.get('ok') else None,
+                           messages_scope='window', messages_may_precede_action=True)
+            except S.tc1c.OperationError as exc:
+                out.update(messages=None, messages_code=exc.code)
+            except Exception as exc:
+                out.update(messages=None, complete=False)
+                out['errors'].append(dict(property='messages', error=str(exc)))
+                if getattr(c, '_pending', 0):
+                    return dict(result, failure_context=out)
         form = obj(form_key)
         focus = read('focus', S.tc_get_current_element, form_key, form.get('handle')).get('item', []) if form else []
         focused = focus[0] if len(focus) == 1 else None
@@ -112,8 +127,11 @@ def failure(S, c, key, handle, result):
             out['ancestors'] = ancestors
         # CurrentOpened is intentionally not used to infer a collapsed parent:
         # supported platform builds have been observed to return inverted values.
-        if read('window', S._window, c).get('key') != window.get('key'):
-            out.update(complete=False, code='active_window_changed')
+        current = read('window', S._window, c)
+        if current.get('key') != window.get('key'):
+            out.update(complete=False, code='active_window_changed', window=current)
+            if 'messages' in out:
+                out.update(messages=None, messages_code='active_window_changed')
     except Exception as exc:
         out['complete'] = False
         out['errors'].append(dict(property='context', error=str(exc)))
@@ -121,6 +139,16 @@ def failure(S, c, key, handle, result):
         c._track = track
         c._failure_diagnostic_busy = False
     return dict(result, failure_context=out)
+
+
+def choice_window(S, c, key):
+    """Read back a choice's window without turning an accepted choice into a failure."""
+    observation = collect(S, c, enabled=False)
+    window = observation.get('window', {})
+    form = S._batches.owner(S, key)
+    if window.get('ok') and form and window.get('key') == S._collection_parent(form):
+        return {}
+    return dict(window=window, window_changed=True if window.get('key') else None)
 
 
 def validate(enabled, wait):

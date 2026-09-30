@@ -11,7 +11,7 @@ from typing import Mapping
 import _runtime as R
 from _screenshots import Screenshot
 
-__all__ = ['Client', 'Element', 'ActionError', 'Screenshot']
+__all__ = ['Client', 'Element', 'SearchPage', 'ActionError', 'Screenshot']
 
 
 class ActionError(RuntimeError):
@@ -222,10 +222,14 @@ class Client:
 
     def find_objects(self, **criteria):
         with self._access('find_objects'):
-            return [Element(self, obj) for obj in self.call('find_objects', **criteria)['objects']]
+            result = self.call('find_objects', **criteria)
+            objects = [Element(self, obj) for obj in result['objects']]
+            return SearchPage(objects, result) if 'next_cursor' in result else objects
 
     def find_object(self, **criteria):
         """Find exactly one object; fail rather than choosing between ambiguous matches."""
+        if criteria.get('limit') is not None or criteria.get('cursor') is not None:
+            raise TypeError('find_object requires a complete search; use find_objects for paging.')
         objects = self.find_objects(**criteria)
         if len(objects) != 1:
             raise ActionError('find_object', dict(ok=False,
@@ -239,11 +243,12 @@ class Client:
             return self.call('read_fields', targets=[self._address(o) for o in targets], properties=properties)
 
     def set_fields(self, values: Mapping):
-        """Fill {Element: text_or_boolean}; the existing batch handles completion."""
+        """Fill {Element: text, boolean, or {"select": selection_options}} in order."""
         if not isinstance(values, Mapping):
-            raise TypeError('set_fields expects a mapping of Element to text or boolean.')
+            raise TypeError('set_fields expects a mapping of Element to text, boolean, or {"select": options}.')
         with self._access('set_fields'):
-            entries = [{**self._address(element), 'checked' if type(value) is bool else 'text': value}
+            entries = [{**self._address(element), **(dict(value) if isinstance(value, Mapping) and set(value) == {'select'}
+                        else {'checked' if type(value) is bool else 'text': value})}
                        for element, value in values.items()]
             return self.call('set_fields', entries=entries)
 
@@ -265,6 +270,16 @@ class Client:
             self._runtime.snapshots.size = 0
             self._closed = True
             self._generation += 1
+
+
+class SearchPage(list):
+    """A page of Elements; pass next_cursor to Client.find_objects for the next page."""
+    def __init__(self, objects, result):
+        super().__init__(objects)
+        self.total = result['total']
+        self.offset = result['offset']
+        self.has_more = result['has_more']
+        self.next_cursor = result['next_cursor']
 
 
 class Element:

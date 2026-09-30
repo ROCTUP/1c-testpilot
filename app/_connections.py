@@ -3,6 +3,7 @@ from collections.abc import MutableMapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 import os
+from pathlib import Path
 import math
 import socket
 import threading
@@ -184,19 +185,20 @@ class Pool:
             return None
 
     @contextmanager
-    def use(self, connection, action=None):
+    def use(self, connection, action=None, *, timeout=None):
+        wait = self.wait_timeout if timeout is None else max(0, min(self.wait_timeout, timeout))
         if connection is None:
-            if not self.legacy_lock.acquire(timeout=self.wait_timeout):
+            if not self.legacy_lock.acquire(timeout=wait):
                 raise ConnectionError('connection_busy', 'The previous action is still running.',
-                                      queue_timeout=self.wait_timeout)
+                                      queue_timeout=wait)
             try:
                 with self.state.bind(self.legacy_state()): yield
             finally:
                 self.legacy_lock.release()
             return
-        if not connection.lock.acquire(timeout=self.wait_timeout):
+        if not connection.lock.acquire(timeout=wait):
             raise ConnectionError('connection_busy', 'The previous action is still running. Check list_connections or disconnect with force=true.',
-                                  connection_id=connection.id, queue_timeout=self.wait_timeout, **connection.activity())
+                                  connection_id=connection.id, queue_timeout=wait, **connection.activity())
         previous = connection.active
         try:
             with self.lock:
@@ -290,3 +292,9 @@ class Pool:
             except Exception as exc: failures.append(exc)
         if failures:
             raise OSError('Could not release an isolated client: %s' % failures[0])
+
+
+def database_key(base, server=False):
+    if server:
+        return 'server:' + base.strip().replace('/', '\\').casefold()
+    return 'file:' + os.path.normcase(str(Path(base).expanduser().resolve()))

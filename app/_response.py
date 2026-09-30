@@ -7,7 +7,9 @@
 Формат и компактизация задаются окружением:
   TC1C_RESPONSE_FORMAT = toon (по умолчанию) | json
   TC1C_COMPACT_REFS    = id (по умолчанию) | prefix | off
+  TC1C_RESPONSE_DETAIL = compact (по умолчанию) | full
 """
+import copy
 import os, re, sys, uuid
 import _collection
 
@@ -17,6 +19,9 @@ except ImportError:
     _toon_encode = None
 
 _REQ_FMT = os.environ.get('TC1C_RESPONSE_FORMAT', 'toon').strip().lower()
+DETAIL = os.environ.get('TC1C_RESPONSE_DETAIL', 'compact').strip().lower()
+if DETAIL not in ('compact', 'full'):
+    raise ValueError('TC1C_RESPONSE_DETAIL must be compact or full')
 _REQ_REFS = os.environ.get('TC1C_COMPACT_REFS', 'id').strip().lower()
 REF_MODE = {'true': 'prefix', '1': 'prefix', 'yes': 'prefix',
             'false': 'off', '0': 'off', 'no': 'off'}.get(_REQ_REFS, _REQ_REFS)
@@ -42,18 +47,27 @@ _REF_RE = re.compile(r'^@[ph]:\d+')
 # значения подменять ссылками нельзя.
 ADDR_TOOLS = frozenset({
     'tc_click',
+    'tc_choose_from_drop_list', 'tc_execute_choice_from_choice_list',
     'tc_get_context',
     'tc_create_snapshot', 'tc_compare_snapshot',
     'tc_get_child_objects', 'tc_find_objects', 'tc_find_object', 'tc_get_context_menu',
     'tc_get_parent', 'tc_get_command_bar', 'tc_get_command_interface',
     'tc_get_current_page', 'tc_find_default_button', 'tc_get_current_item', 'tc_get_current_element',
     'tc_set_row_values', 'tc_add_rows',
+    'tc_get_list_settings', 'tc_get_list_settings_fields', 'tc_set_list_settings',
     'tc_get_linked_window', 'tc_get_current_area_field',
     'tc_start_choosing', 'tc_execute_command',
+    'tc_select_value',
+    'tc_search',
 })
 # Параметры инструментов, несущие адрес объекта: только их проверяем на неразвёрнутые ссылки,
 # чтобы не отклонять обычный текст, начинающийся с '@'.
 _ADDR_ARGS = ('key', 'handle', 'root_key')
+
+# Only these UI collections have a presentation schema. User results and table
+# values must retain absent properties, even when the response also has UI objects.
+_NODE_COLLECTIONS = frozenset({'objects', 'children', 'elements', 'item',
+                               'changes', 'observed', 'added', 'removed', 'errors'})
 
 HINT = ("\n\nResponse format is TOON. Addresses are compacted: a `key` starting with `@p:N` expands "
         "to base_prefixes[\"@p:N\"] + the rest of the key, and a `handle` of `@h:N` expands to "
@@ -168,7 +182,7 @@ def _compact_payload(payload):
     """Заменить повторяющиеся адреса ссылками. Легенды общие на ответ: base_prefixes/handles."""
     if not isinstance(payload, dict):
         return payload
-    lists = [(k, v) for k, v in payload.items() if _is_row_list(v)]
+    lists = [(k, v) for k, v in payload.items() if k in _NODE_COLLECTIONS and _is_row_list(v)]
     if not lists:
         return payload
     # внутри адресного ответа значение всё равно проверяется по грамматике: в коллекции узлов
@@ -234,13 +248,89 @@ def _compact_payload(payload):
 
 
 def _norm_payload(payload):
-    """Только приведение списков к однородной форме, без ссылок."""
+    """Приведение коллекций UI к однородной форме, без изменения пользовательских данных."""
     if not isinstance(payload, dict):
         return payload
     out = dict(payload)
     for k, v in payload.items():
-        if _is_row_list(v):
+        if k in _NODE_COLLECTIONS and _is_row_list(v):
             out[k] = _norm_rows(v)
+    return out
+
+
+_ECHO_ACTIONS = frozenset({'click', 'activate', 'input_text', 'clear', 'set_check',
+                         'goto_row', 'goto_first_row', 'goto_last_row', 'goto_next_row',
+                         'goto_previous_row', 'select_all_rows', 'deselect_all_rows',
+                         'set_cell_text', 'end_edit_row', 'cancel_edit_row'})
+_CONNECTION_ACTIONS = frozenset({'connect', 'launch_client', 'disconnect', 'stop_client',
+                               'list_connections'})
+
+
+def scenario_result(payload, mode):
+    """Summarize declared step collections, leaving scenario return values intact."""
+    if mode == 'full' or not isinstance(payload, dict):
+        return payload
+    out = dict(payload, result_mode='summary')
+    steps = out.pop('steps', None)
+    if isinstance(steps, list):
+        out['step_summary'] = dict(recorded=len(steps),
+            succeeded=sum(s.get('ok') is True and not s.get('skipped') for s in steps),
+            failed=sum(s.get('ok') is False and not s.get('skipped') for s in steps),
+            skipped=sum(bool(s.get('skipped')) for s in steps))
+        effects = [s['changed'] for s in steps if 'changed' in s]
+        if effects:
+            out['step_summary']['effects'] = dict(changed=sum(v is True for v in effects),
+                unchanged=sum(v is False for v in effects), unknown=sum(v is None for v in effects))
+        failures = [s for s in steps if s.get('ok') is False and not s.get('skipped')]
+        if failures:
+            out['last_failed_step'] = failures[-1]
+    if out.get('suite') and isinstance(out.get('tests'), list):
+        out['tests'] = [scenario_result(test, mode) for test in out['tests']]
+    return out
+
+
+_WINDOW_ACTIONS = {'click', 'execute_command', 'choose_from_drop_list', 'execute_choice_from_choice_list'}
+_WINDOW_FIELDS = {'ok', 'ref', 'key', 'handle', 'title', 'class', 'platform_version',
+                  'form_name', 'url', 'home_page', 'is_main', 'addressable'}
+
+
+def compact_result(payload, action, target=None, connection_count=1, window_state=None):
+    """MCP envelope only: never modify UI values, Python results or the journal."""
+    if DETAIL != 'compact' or not isinstance(payload, dict) or payload.get('ok') is not True:
+        if window_state is not None:
+            window_state.clear()
+        return payload
+    out = dict(payload)
+    if connection_count <= 1 and action not in _CONNECTION_ACTIONS:
+        out.pop('connection_id', None)
+    if action in _ECHO_ACTIONS:
+        if target is not None and out.get('target') == target:
+            out.pop('target', None)
+        if out.get('target_check') == 'present':
+            out.pop('target_check', None)
+    if action in _WINDOW_ACTIONS:
+        window = out.get('window')
+        previous = window_state.pop('window', None) if window_state is not None else None
+        if (isinstance(window, dict) and window.get('ok') is True
+                and not window.get('native') and window.get('addressable') is not False
+                and (window.get('ref') or window.get('key'))):
+            out['window'] = {k: v for k, v in window.items()
+                             if k not in ('ok', 'class', 'addressable', 'url', 'home_page', 'is_main')}
+            # Preserve uncertain/diagnostic responses on every call.
+            if (not (window.keys() - _WINDOW_FIELDS) and payload.get('complete') is not False
+                    and not any(payload.get(k) for k in ('code', 'error', 'errors', 'truncated'))):
+                out['window_changed'] = previous != out['window']
+                if window_state is not None:
+                    window_state['window'] = copy.deepcopy(out['window'])
+                if not out['window_changed']:
+                    out.pop('window')
+    elif window_state is not None and (action in ('get_active_window', 'close_window', 'run_scenario',
+                                                  'run_compatible_scenario')
+                                       or 'window' in out or 'form' in out):
+        # Other descriptions may have shown a different window to the caller.
+        window_state.clear()
+    if action == 'find_rows':
+        out.pop('scope_note', None)
     return out
 
 
@@ -254,7 +344,7 @@ def respond(payload, addrs=False):
     # output schema, подмена типа сломала бы валидацию структурированного вывода
     if not isinstance(payload, (dict, list)):
         return payload
-    data = _compact_payload(payload) if (COMPACT and addrs) else _norm_payload(payload)
+    data = (_compact_payload(payload) if COMPACT else _norm_payload(payload)) if addrs else payload
     return _toon_encode(data)
 
 

@@ -1,6 +1,6 @@
 [project]
 name = "1c-testpilot"
-version = "1.7.1"
+version = "1.8.0"
 description = "MCP-сервер для управления тест-клиентом 1С:Предприятие"
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -18,6 +18,7 @@ dependencies = [
     "Pillow>=10",
     "psutil>=6.0",
     "PyYAML>=6.0",
+    "regex>=2024.11.6",
     "python-dotenv>=1.0,<2",
     "python-xlib>=0.33; sys_platform == 'linux'",
 ]
@@ -41,4 +42,8 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 package-dir = { "" = "app" }
-py-modules = ["server", "_runtime", "_client_shutdown", "_mcp", "testpilot", "testpilot_pytest", "_cli", "tc1c", "guids", "_collection", "_response", "_refs", "_connections", "_profiles", "_code_execution", "_service_metadata", "_field_batches", "_row_search", "_snapshots", "_snapshot_tables", "_form_context", "_action_diagnostics", "_call_logging", "_log_reports", "_native_window", "_desktop_windows", "_desktop_linux", "_screenshots", "_screenshot_windows", "_screenshot_linux", "_screenshot_image", "tool_versions"]
+py-modules = ["server", "_runtime", "_client_shutdown", "_mcp", "testpilot", "testpilot_pytest", "_cli", "tc1c", "guids", "_collection", "_response", "_refs", "_connections", "_profiles", "_code_execution", "_service_metadata", "_field_batches", "_row_search", "_list_search", "_list_settings", "_value_selection", "_snapshots", "_snapshot_tables", "_form_context", "_context_changes", "_table_reading", "_find_pages", "_form_details", "_action_diagnostics", "_call_logging", "_log_reports", "_native_window", "_desktop_windows", "_desktop_linux", "_screenshots", "_screenshot_windows", "_screenshot_linux", "_screenshot_image", "tool_versions"]
+
+[tool.setuptools.packages.find]
+where = ["app"]
+include = ["compatible_scenarios*"]

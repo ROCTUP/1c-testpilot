@@ -50,6 +50,7 @@ class Settings:
     forbidden: frozenset
     metadata: str = 'auto'
     functions: bool = False
+    form_details: str = 'auto'
 
     @property
     def metadata_enabled(self):
@@ -57,10 +58,13 @@ class Settings:
 
     @property
     def enabled(self):
-        return self.code or self.query or self.metadata_enabled or self.functions
+        return self.code or self.query or self.metadata_enabled or self.functions or self.form_details == 'true'
 
 
 def settings():
+    form_details = os.environ.get('TC1C_FORM_DETAILS', 'auto').strip().lower()
+    if form_details not in ('auto', 'true', 'false'):
+        raise ValueError('TC1C_FORM_DETAILS must be auto, true or false')
     metadata = os.environ.get('TC1C_METADATA', 'auto').strip().lower()
     if metadata not in ('auto', 'true', 'false'):
         raise ValueError('TC1C_METADATA must be auto, true or false')
@@ -69,7 +73,7 @@ def settings():
                  words('TC1C_CODE_FORBIDDEN_WORDS')) - words('TC1C_CODE_ALLOWED_WORDS')
     return Settings(_flag('TC1C_CODE_EXECUTION'), _flag('TC1C_QUERY_EXECUTION'),
                     os.environ.get('TC1C_CODE_EPF', '').strip(),
-                    frozenset(forbidden | ALWAYS_FORBIDDEN), metadata, _flag('TC1C_FUNCTIONS'))
+                    frozenset(forbidden | ALWAYS_FORBIDDEN), metadata, _flag('TC1C_FUNCTIONS'), form_details)
 
 
 SETTINGS = settings()
@@ -301,6 +305,11 @@ def discover(R, client, *, startup=False):
             if not isinstance(capabilities, list) or any(not isinstance(item, str) for item in capabilities):
                 raise Failure('helper_protocol_error', 'The helper returned invalid capabilities.')
             service['capabilities'] = capabilities
+            service['separators'] = info.get('separators')
+            service['language'] = info.get('language')
+            service['locale'] = info.get('locale')
+            service['system_language'] = info.get('system_language')
+            service['date_sample'] = info.get('date_sample')
             service['functions'] = validate_registry(info.get('functions', []))
         client._testpilot_service = service
         return service, objects
@@ -386,7 +395,8 @@ def _remember_action_reply(pending, key, raw):
 def execute(R, client, *, mode, context, code=None, query=None, parameters=None, limit=100, timeout=180,
             check_permissions=True, options=None, name=None):
     permitted = {'code': SETTINGS.code, 'query': SETTINGS.query,
-                 'metadata': SETTINGS.metadata_enabled, 'function': SETTINGS.functions}
+                 'metadata': SETTINGS.metadata_enabled, 'function': SETTINGS.functions,
+                 'form_context': False, 'form_details': False}
     if mode not in permitted:
         raise Failure('invalid_execution_mode', 'Unknown execution mode.')
     if check_permissions and not permitted[mode]:
@@ -395,6 +405,8 @@ def execute(R, client, *, mode, context, code=None, query=None, parameters=None,
         raise Failure('execution_not_recordable', 'Finish XML scenario recording before using the Testpilot processing. Use Python tests for these calls.')
     if context not in ('client', 'server'):
         raise Failure('invalid_context', 'context must be client or server.')
+    if mode in ('form_context', 'form_details') and context != 'client':
+        raise Failure('invalid_context', 'Form properties are read in the client context.')
     if type(timeout) not in (int, float) or not 0 < timeout <= 3600:
         raise Failure('invalid_timeout', 'timeout must be greater than zero and at most 3600 seconds.')
     if mode == 'code':
@@ -408,7 +420,7 @@ def execute(R, client, *, mode, context, code=None, query=None, parameters=None,
     request_id = uuid.uuid4().hex
     request = dict(protocol=PROTOCOL, request_id=request_id, mode=mode, context=context,
                    code=code, query=query, parameters=parameters or {}, limit=limit)
-    if mode == 'metadata':
+    if mode in ('metadata', 'form_context', 'form_details'):
         request['options'] = options
     if mode == 'function':
         request['name'] = name
@@ -464,9 +476,12 @@ def execute(R, client, *, mode, context, code=None, query=None, parameters=None,
                 client._service_pending = None
                 return dict(ok=False, code='previous_execution_completed',
                             error='The previous execution completed. No new request was executed.', previous_result=response)
-            if mode in ('metadata', 'function'):
+            if mode in ('metadata', 'function', 'form_context', 'form_details'):
                 from _service_metadata import function_arguments
-                capability = 'metadata' if mode == 'metadata' else 'custom_functions'
+                capability = {'metadata': 'metadata', 'function': 'custom_functions',
+                              'form_context': 'form_context', 'form_details': 'form_details'}[mode]
+                if mode == 'metadata' and options and options.get('format') == 'tester':
+                    capability = 'tester_metadata'
                 if capability not in service.get('capabilities', []):
                     raise Failure('helper_version_mismatch', 'Rebuild or update Testpilot.epf to use this operation.')
                 if mode == 'function':
@@ -479,7 +494,7 @@ def execute(R, client, *, mode, context, code=None, query=None, parameters=None,
             client._track = None
             _checked(R.tc_input_html(**_address(fields[prefix + 'Request']),
                                     html='<pre>' + html.escape(payload) + '</pre>'))
-            client._service_pending = dict(request_id=request_id, field=prefix + 'Result')
+            client._service_pending = dict(request_id=request_id, field=prefix + 'Result', mode=mode)
             # Avoid public click readback: the result field itself synchronizes with 1C.
             button = fields['Run' + prefix]
             for kind in ('action', 'commit'):

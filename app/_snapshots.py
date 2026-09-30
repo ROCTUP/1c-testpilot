@@ -72,7 +72,7 @@ class Store:
             return dict(count=len(self.entries), limit=self.limit,
                         size_bytes=self.size, limit_bytes=self.memory_bytes)
 
-    def add(self, owner, generation, connection_id, form, capture):
+    def add(self, owner, generation, connection_id, form, capture, *, automatic=False, protected=()):
         # Immutable UTF-8 payload avoids retaining mutable live objects and makes storage
         # accounting independent of shared strings in the discovery registry.
         payload = json.dumps(capture, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
@@ -80,7 +80,8 @@ class Store:
         entry = dict(snapshot_id='s' + uuid.uuid4().hex, owner=owner, generation=generation,
                      connection_id=connection_id, key=form['key'], handle=form.get('handle'),
                      form_title=form.get('title'), created_at=stamp, last_used_at=stamp,
-                     element_count=len(capture['elements']), payload=payload, size_bytes=0)
+                     element_count=len(capture['elements']), payload=payload, size_bytes=0,
+                     automatic=automatic)
         entry.update(capture.get('options', table_rows.options(False, 500)))
         # Separate equal timestamps for conservative ownership accounting; include map overhead.
         entry['last_used_at'] = stamp.encode().decode()
@@ -88,9 +89,19 @@ class Store:
         with self.lock:
             if entry['size_bytes'] > self.memory_bytes:
                 raise Failure('snapshot_too_large', 'The snapshot exceeds TC1C_SNAPSHOT_MEMORY_MB; no snapshot was stored.')
-            while self.entries and (len(self.entries) >= self.limit or self.size + entry['size_bytes'] > self.memory_bytes):
-                _, old = self.entries.popitem(last=False)
-                self.size -= old['size_bytes']
+            remove = {sid for sid, old in self.entries.items() if automatic and old.get('automatic')
+                      and old['owner'] == owner and (old['key'] == form['key'] or old['generation'] != generation)}
+            size = self.size - sum(self.entries[sid]['size_bytes'] for sid in remove)
+            for sid, old in self.entries.items():
+                if len(self.entries) - len(remove) < self.limit and size + entry['size_bytes'] <= self.memory_bytes:
+                    break
+                if sid not in remove and sid not in protected:
+                    remove.add(sid)
+                    size -= old['size_bytes']
+            if len(self.entries) - len(remove) >= self.limit or size + entry['size_bytes'] > self.memory_bytes:
+                raise Failure('snapshot_storage_full', 'No room for an automatic baseline alongside the requested snapshot.')
+            for sid in remove:
+                self.size -= self.entries.pop(sid)['size_bytes']
             self.entries[entry['snapshot_id']] = entry
             self.size += entry['size_bytes']
             return self.info(entry)
@@ -110,7 +121,20 @@ class Store:
     def list(self, owner, key=None, generation=None):
         with self.lock:
             return [self.info(e) for e in reversed(self.entries.values()) if e['owner'] == owner
+                    and not e.get('automatic')
                     and (key is None or (e['key'] == key and e['generation'] == generation))]
+
+    def context(self, owner, key):
+        with self.lock:
+            return next((dict(e) for e in self.entries.values()
+                         if e.get('automatic') and e['owner'] == owner and e['key'] == key), None)
+
+    def drop_contexts(self, owner, window=None):
+        with self.lock:
+            for sid, entry in list(self.entries.items()):
+                if (entry.get('automatic') and entry['owner'] == owner
+                        and (window is None or entry['key'].startswith(window + '.'))):
+                    self.size -= self.entries.pop(sid)['size_bytes']
 
     def delete(self, snapshot_id, owner):
         with self.lock:
@@ -315,6 +339,8 @@ def run(S, action, key=None, snapshot_id=None, include_tables=False, max_rows=50
             return error
         if action == 'compare_snapshot':
             entry = store.get(snapshot_id, owner)
+            if entry.get('automatic'):
+                raise Failure('invalid_snapshot', 'Use create_snapshot or save_as_snapshot for a fixed comparison baseline.')
             if entry['generation'] != generation:
                 raise Failure('snapshot_connection_changed', 'The connection was re-established. Create a new snapshot.')
             if key is not None and key != entry['key']:

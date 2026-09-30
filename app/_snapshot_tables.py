@@ -1,4 +1,5 @@
 """Prepare all table selections before any final form-state reads."""
+import _table_reading
 
 
 def options(include_tables, max_rows):
@@ -108,15 +109,31 @@ def prepare(S, c, form, objects):
         raise Failure('snapshot_unstable', 'The active window changed during table preparation.')
     for t in tables.values():
         if t['status'] == 'pending':
+            # Earlier tables' selection handlers may have selected a row here.
+            # Only a fresh empty selection proves that SelectAllRows added this row.
+            before = checked(t, 'get_selected_rows')
+            if before is None:
+                continue
+            if before['rows']:
+                fail(t, dict(code='selection_changed', error='Selection changed before selecting all rows.'))
+                continue
             # Even a failed command may have changed selection.
             t['selection_left'] = None
-            checked(t, 'select_all_rows')
+            try:
+                reader = _table_reading.Reader(S, c, t['key'], t['handle'],
+                                              S._collection_parent(form['key']), t)
+                rows = reader.read(None, allow_sequential=False, selection_verified_empty=True)
+                t['_selection_count'] = len(rows)
+                t['selection_left'] = bool(rows)
+            except S._CellEditFailure as exc:
+                fail(t, dict(exc.details, error=str(exc)))
     return tables, errors
 
 
 def read(S, tables, max_rows):
     errors = []
     for t in tables.values():
+        expected_count = t.pop('_selection_count', None)
         if t['status'] != 'pending':
             continue
         r = S.tc_get_selected_rows(t['key'], t['handle'])
@@ -126,6 +143,11 @@ def read(S, tables, max_rows):
                                error=r.get('error') or 'Table rows could not be read.'))
             continue
         rows = r['rows']
+        if expected_count is None or len(rows) != expected_count:
+            t['status'] = 'error'
+            errors.append(dict(target(t), property='rows', code='selection_changed',
+                               error='Table selection changed after preparation; row completeness is unknown.'))
+            continue
         t.update(rows=rows[:max_rows], row_count=len(rows), selection_left=bool(rows),
                  status='read' if len(rows) <= max_rows else 'truncated')
         if len(rows) > max_rows:

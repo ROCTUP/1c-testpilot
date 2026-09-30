@@ -86,7 +86,7 @@ def testpilot(request, testpilot_artifacts):
         if (report and report.failed) or (setup and setup.failed):
             try:
                 # No table selection or editing during failure diagnostics.
-                diagnostics = client.call('get_context', check=False)
+                diagnostics = client.call('get_context', result_mode='full', check=False)
             except Exception as exc:
                 diagnostics = {'ok': False, 'error': str(exc)}
         try:

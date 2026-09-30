@@ -108,6 +108,7 @@ def for_client(client):
 # Only these response slots contain UI objects. Never rewrite table values, document
 # cells, text, HTML, attachments, criteria or recorded scenarios, even if they look like keys.
 OBJECT_SLOTS = {
+    'choose_from_drop_list': 'window', 'execute_choice_from_choice_list': 'window',
     'click': 'window',
     'get_child_objects': 'children', 'find_objects': 'objects', 'find_object': 'object',
     'wait_for_object_displayed': 'object',
@@ -128,7 +129,7 @@ _CONTEXT_RELATIONS = ('parent_key', 'current_column_key', 'current_page_key', 'f
 def context_pairs(payload, registry):
     """Only declared context addresses; field values and choice text are never addresses."""
     import _collection
-    nodes = [payload.get('form'), payload.get('input')]
+    nodes = [payload.get('form'), payload.get('input'), payload.get('root')]
     nodes.extend(v for field in _CONTEXT_LISTS for v in payload.get(field, []))
     pairs = {v['key']: v.get('handle') or registry.get(v['key']) for v in nodes
              if isinstance(v, dict) and _collection.is_object_key(v.get('key'))}
@@ -160,17 +161,21 @@ def _present_context(payload, registry):
     out = dict(payload)
     if 'current_key' in out:
         out['current_ref'] = refs.get(out.pop('current_key'))
-    for field in ('form', 'input'):
+    for field in ('form', 'input', 'root'):
         if field in out:
             out[field] = node(out[field])
     for field in (*_CONTEXT_LISTS, 'choices'):
         if field in out:
             out[field] = [node(v) for v in out[field]]
+    if 'removed' in out:
+        # These describe the previous state. Never publish a live ref for a removed object.
+        out['removed'] = [{k: v for k, v in obj.items() if k not in ('key', 'handle')}
+                          for obj in out['removed']]
     return out
 
 
 def _failure_objects(context):
-    nodes = [context.get('target'), context.get('focused_element'), context.get('table')]
+    nodes = [context.get('target'), context.get('focused_element'), context.get('table'), context.get('window')]
     nodes.extend(context.get('ancestors', []))
     table = context.get('table')
     if isinstance(table, dict):
@@ -252,7 +257,8 @@ def present(payload, action, registry):
             if key not in echoes.values():
                 pairs.pop(key, None)
                 missing_cell_refs.add(key)
-    if action in ('click', 'start_choosing', 'execute_command') and len(pairs) > registry.limit and isinstance(value, dict):
+    if action in ('click', 'start_choosing', 'execute_command', 'choose_from_drop_list',
+                  'execute_choice_from_choice_list') and len(pairs) > registry.limit and isinstance(value, dict):
         # The action has already happened. Losing an optional window ref must not
         # turn its response into a failed action that the caller might repeat.
         window_key = value.get('key')

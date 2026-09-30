@@ -2,6 +2,8 @@
 import time
 
 import _snapshots as snapshots
+import _form_details
+import _context_changes
 
 
 def interaction(S, c, form, elements, before):
@@ -82,13 +84,65 @@ def interaction(S, c, form, elements, before):
     return out
 
 
-def run(S, key=None, save_as_snapshot=False, include_tables=False, max_rows=500):
+def filter_result(S, result, root_key, visible_only, include_commands):
+    """Project a captured form without changing its snapshot or moving focus."""
+    if root_key is None and not visible_only and include_commands:
+        return
+    objects = {o['key']: o for o in result['elements']}
+    form_key = result['form']['key']
+    if root_key is not None and root_key != form_key and root_key not in objects:
+        raise snapshots.Failure('context_root_unavailable', 'The search root is not in the active form.')
+    active_pages = {p['key']: p.get('current_page_key') for p in result['pages']}
+
+    def included(obj):
+        key = obj['key']
+        if root_key and key != root_key and not key.startswith(root_key + '.'):
+            return False
+        while key and key != form_key:
+            node = objects.get(key, {})
+            parent = S._collection_parent(key)
+            if not include_commands and (node.get('class') in ('Button', 'CIButton') or
+                    (node.get('class') == 'Group' and node.get('type') in ('CommandBar', 'Popup'))):
+                return False
+            if visible_only:
+                if node.get('visible') is False:
+                    return False
+                if node.get('type') == 'Page' and active_pages.get(parent) not in (None, key):
+                    return False
+            key = parent
+        return True
+
+    rows = [o for o in result['elements'] if included(o)]
+    keys = {o['key'] for o in rows}
+    result['filter'] = dict(visible_only=visible_only, include_commands=include_commands,
+                            total_elements=len(objects), returned_elements=len(rows))
+    if root_key:
+        root = result['form'] if root_key == form_key else objects[root_key]
+        result['root'] = {k: root[k] for k in ('key', 'handle', 'name', 'title', 'class') if k in root}
+    result['elements'] = rows
+    if result.get('current_key') not in keys:
+        result['current_key'] = None
+    if result.get('input') and result['input']['key'] not in keys:
+        result['input'] = None
+    for field in ('tables', 'documents', 'pages', 'table_rows'):
+        if field in result:
+            result[field] = [o for o in result[field] if o.get('key') in keys]
+    result['choices'] = [o for o in result['choices'] if o.get('field_key') in keys]
+    # Errors remain visible: filtering the output must not turn an uncertain read into a complete one.
+
+
+def run(S, key=None, save_as_snapshot=False, include_tables=False, max_rows=500,
+        root_key=None, visible_only=False, include_commands=True, result_mode='changes'):
     start = time.perf_counter()
     c, error = S._need_ver('8.3.3')
     if error:
         return error
+    if result_mode not in ('changes', 'full'):
+        return dict(ok=False, code='invalid_argument', error='result_mode must be changes or full.')
     if type(save_as_snapshot) is not bool:
         return dict(ok=False, code='invalid_argument', error='save_as_snapshot must be a boolean.')
+    if type(visible_only) is not bool or type(include_commands) is not bool:
+        return dict(ok=False, code='invalid_argument', error='visible_only and include_commands must be booleans.')
     try:
         options = snapshots.table_rows.options(include_tables, max_rows)
     except ValueError as exc:
@@ -129,6 +183,7 @@ def run(S, key=None, save_as_snapshot=False, include_tables=False, max_rows=500)
                       **context, complete=not errors, errors=errors)
         if include_tables:
             result['table_rows'] = list(current['tables'].values())
+        filter_result(S, result, root_key, visible_only, include_commands)
         if S._address_mode() == 'id':
             registry = S._refs.for_client(c)
             if len(S._refs.context_pairs(result, registry)) > registry.limit:
@@ -141,6 +196,12 @@ def run(S, key=None, save_as_snapshot=False, include_tables=False, max_rows=500)
                 result.update(snapshot_id=saved['snapshot_id'], snapshot_complete=current['complete'])
             except snapshots.Failure as exc:
                 result['snapshot_error'] = dict(code=exc.code, message=str(exc))
+        _form_details.enrich(S, c, result)
+        signature = dict(root_key=root_key, visible_only=visible_only, include_commands=include_commands,
+                         include_tables=include_tables, max_rows=max_rows,
+                         form_details=_form_details.execution.SETTINGS.form_details,
+                         address_mode=S._address_mode())
+        result = _context_changes.present(S, c, result, signature, result_mode)
         result['seconds'] = round(time.perf_counter() - start, 4)
         return result
     except snapshots.Failure as exc:
