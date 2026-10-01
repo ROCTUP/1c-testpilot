@@ -18,6 +18,10 @@ def pytest_addoption(parser):
     group.addoption('--tc-reports', help='html, allure, html,allure, or none (JSONL only); default TC1C_LOG_REPORTS or html.')
     group.addoption('--tc-screenshots', choices=('off', 'actions', 'all'), default='off',
                     help='Call-journal screenshots; default off. Requires server screenshot settings to allow capture.')
+    group.addoption('--tc-shared-client', action='store_true',
+                    help='One client for the whole session instead of one per test: it is started on first '
+                         'use, restarted if its connection drops and stopped at the end. Artifacts and the '
+                         'call journal stay per test, but the application state is shared between tests.')
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -53,9 +57,60 @@ def testpilot_artifacts(request):
     return directory
 
 
+class _SharedClient:
+    """The --tc-shared-client session client: started on first use, restarted if its connection dropped."""
+
+    def __init__(self, profile):
+        self.profile = profile
+        self.client = None
+
+    def get(self):
+        from testpilot import Client
+        if self.client is not None and not self._connected():
+            logging.getLogger(__name__).warning('The shared Testpilot client lost its connection; restarting it.')
+            self.close(check=False)
+        if self.client is None:
+            client = Client(profile=self.profile)
+            client.start()
+            self.client = client
+        return self.client
+
+    def _connected(self):
+        """An open connection, not responsiveness: a crashed or closed client reports False."""
+        try:
+            entries = self.client.call('list_connections')['connections']
+        except Exception:
+            return False
+        return bool(entries) and bool(entries[0].get('connected'))
+
+    def close(self, check=True):
+        client, self.client = self.client, None
+        if client is None:
+            return
+        try:
+            client.close()
+        except Exception:
+            if check:
+                raise
+
+
+@pytest.fixture(scope='session')
+def _testpilot_shared(request):
+    shared = _SharedClient(request.config.getoption('--tc-profile'))
+    try:
+        yield shared
+    finally:
+        shared.close()
+
+
 @pytest.fixture
 def testpilot(request, testpilot_artifacts):
-    """A separate client per test; profile decides launch versus external connection."""
+    """A separate client per test, or one session client with --tc-shared-client.
+
+    The profile decides launch versus external connection. A shared client keeps the call journal
+    and artifacts per test; between tests it is not reset, so tests must leave or bring the
+    application to the state they need.
+    """
     profile = request.config.getoption('--tc-profile')
     if not profile:
         raise pytest.UsageError('The testpilot fixture requires --tc-profile and TC1C_PROFILES_FILE.')
@@ -65,7 +120,8 @@ def testpilot(request, testpilot_artifacts):
     mode = request.config.getoption('--tc-screenshots')
     if mode != 'off' and (not R.SCREENSHOTS or not R.LOGGING or not R._call_logging.enabled('TC1C_LOG_SCREENSHOTS')):
         raise pytest.UsageError('Screenshot logging must be enabled to use --tc-screenshots.')
-    client = Client(profile=profile)
+    shared = request.config.getoption('--tc-shared-client')
+    client = request.getfixturevalue('_testpilot_shared').get() if shared else Client(profile=profile)
     reports = getattr(request.config, '_testpilot_reports', None)
     allure_enabled = reports is not None and 'allure' in reports
     if R.LOGGING:
@@ -76,7 +132,8 @@ def testpilot(request, testpilot_artifacts):
     cleanup_error = None
     diagnostics = None
     try:
-        client.start()
+        if not shared:
+            client.start()
         if R.LOGGING:
             client.start_logging(screenshot_mode=mode)
         yield client
@@ -90,7 +147,11 @@ def testpilot(request, testpilot_artifacts):
             except Exception as exc:
                 diagnostics = {'ok': False, 'error': str(exc)}
         try:
-            client.close()
+            if not shared:
+                client.close()
+            elif R.LOGGING:
+                # The next test gets its own journal in its own artifact directory.
+                client.stop_logging()
         except Exception as exc:
             cleanup_error = str(exc)
         summary = {'test': request.node.nodeid,
