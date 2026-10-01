@@ -3002,7 +3002,8 @@ def tc_change_row(key: str, handle: str) -> dict:
 
 @_action('tc_table')
 def tc_switch_row_delete_mark(key: str, handle: str, confirm: bool = True) -> dict:
-    """Toggle the current row's deletion mark; confirm=true answers Yes, false No. dialog_answered
+    """Toggle the current row's deletion mark; confirm=true answers Yes, false No, null leaves the
+    question open. dialog_answered
     proves only a response; changed is always null (no readable mark flag). To verify, invoke the
     mark command again and read its question: mark means currently unmarked, remove mark means
     marked."""
@@ -3010,7 +3011,8 @@ def tc_switch_row_delete_mark(key: str, handle: str, confirm: bool = True) -> di
     ok = True
     for kind in ('action', 'commit'):
         ok = c.send_cmd(G.SWITCH_ROW_DELETE_MARK, key, kind=kind, middle=b'', handle=handle)['ok'] and ok
-    answered = _answer_confirm_dialog(c, confirm, max_wait=5.0)[0]  # ответить на «Пометить на удаление?»
+    # ответить на «Пометить на удаление?»; при confirm=None вопрос остаётся, как у copy_row и delete_rows
+    answered = _answer_confirm_dialog(c, confirm, max_wait=5.0)[0] if confirm is not None else None
     _state['window_key'] = None          # диалог мог остаться открытым — окно не то, что было
     return {'ok': ok, 'target': key, 'confirmed': confirm, 'dialog_answered': answered}
 
