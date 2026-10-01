@@ -66,7 +66,7 @@ for names, action, params, slot in [
     ('GetSelectedRows ПолучитьВыделенныеСтроки', 'get_selected_rows', (), 'rows'),
     ('SelectAllRows ВыделитьВсеСтроки', 'select_all_rows', (), None),
     ('GetCellText ПолучитьТекстЯчейки', 'get_cell_text', ('column',), 'text'),
-    ('AddRow ДобавитьСтроку', 'add_row', (), None),
+    ('AddRow ДобавитьСтроку', 'table_add_row', (), None),
     ('CopyRow СкопироватьСтроку', 'copy_row', (), None),
     ('SwitchRowDeleteMark ПереключитьПометкуУдаленияСтроки', 'switch_row_delete_mark', (), None),
     ('SetOrder УстановитьПорядок', 'set_order', ('column',), None),
