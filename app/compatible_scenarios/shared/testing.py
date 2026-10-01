@@ -14,7 +14,8 @@ for names, action, params, slot in [
     ('Disconnect Отключить', 'application_disconnect', (), None),
     ('GetActiveWindow ПолучитьАктивноеОкно', 'get_active_window', (), None),
     ('GetCurrentErrorInfo ПолучитьТекущуюИнформациюОбОшибке', 'get_current_error', (), None),
-    ('StartChoosing НачатьВыбор', 'start_choosing', (), None),
+    ('StartChoosing Выбрать НачатьВыбор', 'start_choosing', (), None),
+    ('Choose', 'choose_row', (), None),
     ('SelectOption ВыбратьВариант', 'select_option', ('value',), None),
     ('GotoValue ПерейтиКЗначению', 'goto_value', ('percent',), None),
     ('GetCommandInterface ПолучитьКомандныйИнтерфейс', 'get_command_interface', (), None),
@@ -29,8 +30,8 @@ for names, action, params, slot in [
     ('Activate Активизировать', 'activate', (), None),
     ('Click Нажать', 'click', (), None),
     ('InputText ВвестиТекст', 'input_text', ('text',), None),
-    ('InputHTML ВвестиHTML', 'input_html', ('html', 'attachments'), None),
-    ('GetDisplayedText ПолучитьТекст', 'get_text', (), 'text'),
+    ('InputHTML ВвестиHTML InputDocumentHTML ВвестиHTMLДокумента', 'input_html', ('html', 'attachments'), None),
+    ('GetDisplayedText ПолучитьОтображаемыйТекст ПолучитьТекст', 'get_text', (), 'text'),
     ('GetDataPresentation ПолучитьПредставлениеДанных', 'get_data_presentation', (), 'presentation'),
     ('GetAreaText ПолучитьТекстОбласти', 'get_area_text', ('area',), 'text'),
     ('GetCurrentAreaText ПолучитьТекстТекущейОбласти', 'get_current_area_text', ('area',), 'text'),
@@ -38,20 +39,20 @@ for names, action, params, slot in [
     ('GetCurrentAreaAddress ПолучитьАдресТекущейОбласти', 'get_current_area_address', (), 'address'),
     ('GetCurrentAreaField ПолучитьПолеТекущейОбласти', 'get_current_area_field', (), 'field'),
     ('BeginEditCurrentArea НачатьРедактированиеТекущейОбласти', 'begin_edit_current_area', (), None),
-    ('EndEditCurrentArea ЗавершитьРедактированиеТекущейОбласти', 'end_edit_current_area', ('cancel',), None),
+    ('EndEditCurrentArea ЗакончитьРедактированиеТекущейОбласти ЗавершитьРедактированиеТекущейОбласти', 'end_edit_current_area', ('cancel',), None),
     ('GotoFirstRow ПерейтиКПервойСтроке', 'goto_first_row', ('toggle_selection',), None),
     ('GotoLastRow ПерейтиКПоследнейСтроке', 'goto_last_row', ('toggle_selection',), None),
     ('GotoNextRow ПерейтиКСледующейСтроке', 'goto_next_row', ('toggle_selection',), None),
     ('GotoPreviousRow ПерейтиКПредыдущейСтроке', 'goto_previous_row', ('toggle_selection',), None),
     ('GotoRow ПерейтиКСтроке', 'goto_row', ('fields', 'direction'), 'found'),
-    ('CurrentModeIsEdit ТекущийРежимРедактирования', 'current_mode_is_edit', (), 'edit_mode'),
+    ('CurrentModeIsEdit ТекущийРежимРедактирование ТекущийРежимРедактирования', 'current_mode_is_edit', (), 'edit_mode'),
     ('GetSelectedRows ПолучитьВыделенныеСтроки', 'get_selected_rows', (), 'rows'),
     ('SelectAllRows ВыделитьВсеСтроки', 'select_all_rows', (), None),
     ('GetCellText ПолучитьТекстЯчейки', 'get_cell_text', ('column',), 'text'),
     ('AddRow ДобавитьСтроку', 'add_row', (), None),
-    ('EndEditRow ЗавершитьРедактированиеСтроки', 'end_edit_row', ('cancel',), None),
+    ('EndEditRow ЗакончитьРедактированиеСтроки ЗавершитьРедактированиеСтроки', 'end_edit_row', ('cancel',), None),
     ('ChangeRow ИзменитьСтроку', 'change_row', (), None),
-    ('SetCheck УстановитьФлажок', 'set_check', (), None),
+    ('SetCheck УстановитьОтметку УстановитьФлажок', 'set_check', (), None),
     ('Clear Очистить', 'clear', (), None),
     ('OpenDropList ОткрытьВыпадающийСписок', 'open_drop_list', (), None),
     ('ExecuteChoiceFromDropList ВыполнитьВыборИзВыпадающегоСписка', 'choose_from_drop_list', ('value',), None),
@@ -68,7 +69,8 @@ for names, action, params, slot in [
     ('GoOneLevelUp ПерейтиНаУровеньВверх', 'go_one_level_up', (), None),
     ('ClickFormattedStringHyperlink НажатьНаГиперссылкуВФорматированнойСтроке', 'click_formatted_string_hyperlink', ('index',), None),
     ('ExecuteChoiceFromChoiceList ВыполнитьВыборИзСпискаВыбора', 'execute_choice_from_choice_list', ('value',), None),
-    ('ExecuteChoiceFromMenu ВыполнитьВыборИзМеню', 'execute_choice_from_menu', ('index',), None),
+    ('ExecuteChoiceFromMenu ВыполнитьВыборИзМеню ExecuteChoiceFromDetailsMenu ВыполнитьВыборИзМенюРасшифровки',
+     'execute_choice_from_menu', ('index',), None),
     ('GotoNextItem ПерейтиКСледующемуЭлементу', 'goto_next_item', (), None),
     ('ExecuteCommand ВыполнитьКоманду', 'execute_command', ('command',), None),
 ]:
@@ -105,6 +107,10 @@ TESTED_CLASSES.update(dict.fromkeys(('testedclientapplicationwindow', 'testedcom
 def invoke_element(adapter, obj, name, args, action, params, slot):
     if action == 'goto_next_item' and obj.data.get('class') == 'ManagedForm':
         action = 'goto_next_element'
+    # The platform calls two different methods Выбрать: TestedFormTable.Choose (double click, Enter)
+    # and StartChoosing of an input or calendar field (the field's Select button).
+    if action == 'start_choosing' and name == 'выбрать' and obj.data.get('class') == 'Table':
+        action = 'choose_row'
     minimum = {'goto_first_row': 0, 'goto_last_row': 0, 'goto_next_row': 0, 'goto_previous_row': 0,
                'goto_row': 1, 'end_edit_row': 0, 'end_edit_current_area': 0,
                'get_area_text': 0, 'get_current_area_text': 0, 'input_html': 1}.get(action, len(params))
