@@ -411,6 +411,9 @@ class VM:
 
     def get(self, name):
         if name in self.env: return self.env[name]
+        if name in ('thisobject', 'этотобъект'):
+            from compatible_scenarios.shared.bsl.callbacks import ModuleContext
+            return ModuleContext(self)
         found, value = self.host.resolve_global(name)
         if found: return value
         self.fail(f'Variable {name!r} is not defined.')
@@ -497,6 +500,9 @@ class VM:
                     '*': operator.mul, '/': operator.truediv, '%': operator.mod}[op](a, b)
         if kind == 'new':
             name, expressions = args; values = [self.expr(a) for a in expressions]
+            if name in ('callbackdescription', 'описаниеоповещения'):
+                from compatible_scenarios.shared.bsl.callbacks import construct
+                return construct(self, values)
             from compatible_scenarios.shared.bsl.collections import CONSTRUCTORS, construct
             if name in CONSTRUCTORS: return construct(name, values)
             if name in ('map', 'соответствие'):
@@ -522,6 +528,21 @@ class VM:
             self.fail(f'Unsupported type {name}.')
         if kind == 'call':
             target, expressions = args
+            if target.kind == 'attr' and target.args[1] in ('getdocumenthtml', 'получитьhtmlдокумента'):
+                if len(expressions) != 2: self.fail('GetDocumentHTML requires two output arguments.')
+                obj = self.expr(target.args[0])
+                outputs = []
+                for arg in expressions:
+                    if arg.kind in ('name', 'attr', 'index'):
+                        if arg.kind == 'name': self.get(arg.args[0])
+                        outputs.append(self.assignment_target(arg))
+                    else:
+                        self.expr(arg)
+                        outputs.append(None)
+                html, attachments = self.host.method(obj, target.args[1], [])
+                for put, value in zip(outputs, (html, attachments)):
+                    if put is not None: put(value)
+                return None
             if target.kind == 'attr' and target.args[1] in ('property', 'свойство'):
                 obj = self.expr(target.args[0])
                 if isinstance(obj, Structure):
@@ -548,17 +569,7 @@ class VM:
             if target.kind == 'name':
                 name = target.args[0]
                 if name in self.program.functions:
-                    # Each function gets its own local scope.
-                    fn = self.program.functions[name]; params, body = fn.args
-                    if len(values) > len(params): self.fail(f'Too many arguments for {name}.')
-                    nested = VM(self.host, self.program)
-                    self.host.inherit_locals(self.env, nested.env)
-                    for i, (param, byval, default) in enumerate(params):
-                        if i < len(values) and values[i] is not None: val = values[i]
-                        elif default is not None: val = self.expr(default)
-                        else: val = None
-                        nested.env[param] = val
-                    return nested.run(body)
+                    return self.invoke_function(name, values)
                 if name in ('strfind', 'стрнайти', 'strsplit', 'стрразделить', 'round', 'окр'):
                     from compatible_scenarios.shared.bsl.strings import MISSING
                     values = [MISSING if exp.kind == 'omitted' else val for exp, val in zip(expressions, values)]
@@ -568,6 +579,18 @@ class VM:
                 return self.method(obj, name, values)
             self.fail('Indirect function calls are not supported.')
         self.fail(f'Unsupported expression {kind}.')
+
+    def invoke_function(self, name, values):
+        fn = self.program.functions[name]; params, body = fn.args
+        if len(values) > len(params): self.fail(f'Too many arguments for {name}.')
+        nested = VM(self.host, self.program)
+        self.host.inherit_locals(self.env, nested.env)
+        for i, (param, byval, default) in enumerate(params):
+            if i < len(values) and values[i] is not None: val = values[i]
+            elif default is not None: val = self.expr(default)
+            else: val = None
+            nested.env[param] = val
+        return nested.run(body)
 
     def method(self, obj, name, values):
         from compatible_scenarios.shared.bsl.collections import collection_method

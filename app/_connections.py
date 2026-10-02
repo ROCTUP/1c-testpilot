@@ -65,6 +65,14 @@ def free_port(port=None):
         return s.getsockname()[1]
 
 
+def client_connected(client):
+    """Whether the local transport is open; this does not probe the remote client."""
+    if client is None or getattr(client, 'closed', False) or getattr(client, '_interrupted', False):
+        return False
+    sock = getattr(client, 's', None)
+    return getattr(client, 's', True) is not None and (sock is None or sock.fileno() != -1)
+
+
 class Connection:
     def __init__(self, host, port, base=None, user=None):
         self.id = 'c' + uuid.uuid4().hex[:16]
@@ -85,13 +93,10 @@ class Connection:
 
     def info(self):
         c = self.state.get('client')
-        sock = getattr(c, 's', None)
         return {'connection_id': self.id, 'profile': self.state.get('profile'), 'host': self.host, 'port': self.port,
                 'base': self.base, 'user': self.user,
                 'version': getattr(c, 'platform_version', None),
-                'connected': (c is not None and getattr(c, 's', True) is not None
-                              and (sock is None or sock.fileno() != -1)
-                              and not getattr(c, '_interrupted', False)), 'starting': self.starting,
+                'connected': client_connected(c), 'starting': self.starting,
                 'launched': bool(self.state.get('launched_pid')),
                 'desktop': self.state.get('desktop'),
                 'recording': bool(self.state.get('rec_active')), **self.activity()}

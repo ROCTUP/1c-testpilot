@@ -716,13 +716,18 @@ class Adapter:
         return None
 
     def method(self, obj, name, args):
-        if isinstance(obj, Application) and name in ('connect', 'подключить', 'disconnect', 'отключить'):
+        if isinstance(obj, Application) and name in ('connect', 'установитьсоединение', 'disconnect', 'разорватьсоединение'):
             if args: raise Failure('scenario_failed', f'{name} takes no arguments.')
-            return self.host.operation('application_' + ('connect' if name in ('connect', 'подключить') else 'disconnect'), {},
+            return self.host.operation('application_' + ('connect' if name in ('connect', 'установитьсоединение') else 'disconnect'), {},
                                        lambda: self.host.connections.application_method(obj, name))
         self.check_owner(obj)
         from compatible_scenarios.tester.files import BinaryData, binary_method
         if isinstance(obj, BinaryData): return binary_method(self.host, obj, name, args)
+        from compatible_scenarios.shared.bsl.pictures import Picture
+        if isinstance(obj, Picture):
+            if name in ('getbinarydata', 'получитьдвоичныеданные') and not args:
+                return BinaryData(obj.data)
+            raise Failure('unsupported_scenario', f'Unsupported picture method {name}.')
         if isinstance(obj, Assertion):
             op = ASSERTIONS.get(name)
             if op == 'that' and 1 <= len(args) <= 2:
@@ -757,6 +762,9 @@ class Adapter:
         if isinstance(obj, MainWindow):
             from compatible_scenarios.tester.windows import main_window
             obj = main_window(self)
+        from compatible_scenarios.tester import platform_methods
+        if name in METHODS and METHODS[name][0] in platform_methods.SPECIAL:
+            return platform_methods.invoke(self, obj, name, args)
         if isinstance(obj, Application):
             action = METHODS.get(name, (None,))[0]
             if action == 'get_current_error':

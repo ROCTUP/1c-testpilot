@@ -429,12 +429,13 @@ def _field_scalar_text(c, key, r, cmd):
     if value is not None or not r.get('ok'):
         return value
     tails = {
-        G.GET_DISPLAYED_TEXT: b'\x81\x81\x81\xe1\x20\xa1\xa3',
-        G.GET_EDIT_TEXT: b'\x81\x81\x81\xe1\x20\xa1\xa3',
-        G.GET_PROPERTY: b'\x81\x81\x81\xe0\x4b\x53\x81\x20\x20\xa1\xa3',
+        G.GET_DISPLAYED_TEXT: b'\x81\x81\x81\xe1',
+        G.GET_EDIT_TEXT: b'\x81\x81\x81\xe1',
+        G.GET_PROPERTY: b'\x81\x81\x81\xe0\x4b\x53\x81\x20',
     }
     tail = tails.get(cmd)
-    if tail and r['raw'].startswith(b'\x42') and r['raw'].endswith(tail + tc1c.TR):
+    end = tc1c.result_end(r['raw'])
+    if tail and end >= len(tail) and r['raw'].startswith(b'\x42') and r['raw'][:end].endswith(tail):
         cls = _key_class(key)
         kind = _kind_of(c, key) if cls == 'EditField' else None
         if cls == 'EditField' and (kind == 'InputField' or
@@ -442,7 +443,7 @@ def _field_scalar_text(c, key, r, cmd):
             if '.Table[' not in key:
                 return ''
             p = tc1c._reply_status_offset(r['raw'], cmd)
-            if (p is not None and r['raw'][p:] == tail + tc1c.TR
+            if (p is not None and r['raw'][p:end] == tail
                     and _active_column_editor(c, key)):
                 return ''
         if (cls == 'Additional' and cmd == G.GET_EDIT_TEXT
@@ -2127,13 +2128,25 @@ def tc_get_html(key: str, handle: str) -> dict:
     """Read the HTML of a formatted/HTML-document field. After the form has put up a menu or a
     modal choice list, the platform stops returning this field's content until it is written
     again — an empty answer right after such a window does not mean the field is empty."""
-    c = _need()
+    return _get_html(key, handle)
+
+
+def _get_html(key, handle, *, attachments=False):
+    c, error = _need_ver(TOOL_MIN_VERSION['tc_get_html'])
+    if error: return error
+    _code_execution.guard(c, G.GET_HTML, key)
     error = _html_target(c, key)
     if error:
         return error
     r = c.send_cmd(G.GET_HTML, key, kind='read', middle=HTML_READ, handle=handle)
     html = tc1c.decode_html(r['raw']) if r.get('ok') else None
-    return _unavailable_read({'ok': r['ok'], 'html': html}, 'html')
+    result = _unavailable_read({'ok': r['ok'], 'html': html}, 'html')
+    if attachments and result.get('ok'):
+        pictures = tc1c.decode_html_attachments(r['raw'])
+        if pictures is None:
+            return dict(ok=False, code='state_unavailable', error='The complete HTML attachment map could not be read.')
+        result['attachments'] = {name: base64.b64encode(data).decode('ascii') for name, data in pictures.items()}
+    return result
 
 @_action('tc_field')
 def tc_get_context_menu(key: str, handle: str) -> dict:
@@ -3087,7 +3100,14 @@ def tc_get_command_bar(key: str, handle: str) -> dict:
     return {'ok': r['ok'], 'target': key, 'commandbar': _coll(r, key)}
 
 # ===================== окно: навигация / команды / сообщения ================
-def _winkey(c):
+def _winkey(c, key=None):
+    if key is not None:
+        if _key_class(key) not in ('MainFrame', 'SecondaryFrame', 'HomePage'):
+            raise ValueError('A client application window is required.')
+        _code_execution.guard(c, G.GET_ACTIVE_WINDOW, key)
+        if _ref_live_object(c, key) is None:
+            raise RuntimeError('The window is no longer available.')
+        return key
     window = _window(c)
     k = window['key']
     if window.get('code') == 'no_active_work_window':
@@ -3102,30 +3122,30 @@ def _winkey(c):
     return k
 
 @_action('tc_window')
-def tc_goto_next_window() -> dict:
-    """Go to the next open window from the active main application window. The client returns an error if navigation is unavailable."""
+def tc_goto_next_window(key: str = None, handle: str = None) -> dict:
+    """Go to the next open window from the addressed main window (active if omitted). The client returns an error if navigation is unavailable."""
     c = _need()
-    wk = _winkey(c); ok = True
+    wk = _winkey(c, key); ok = True
     for kind in ('action', 'commit'):
         ok = c.send_cmd(G.GOTO_NEXT_WINDOW, wk, kind=kind, middle=b'')['ok'] and ok
     _state['window_key'] = None          # активным стало ДРУГОЕ окно — кэш ключа недействителен
     return {'ok': ok, 'action': 'next_window'}
 
 @_action('tc_window')
-def tc_goto_previous_window() -> dict:
-    """Go to the previous open window from the active main application window. The client returns an error if navigation is unavailable."""
+def tc_goto_previous_window(key: str = None, handle: str = None) -> dict:
+    """Go to the previous open window from the addressed main window (active if omitted). The client returns an error if navigation is unavailable."""
     c = _need()
-    wk = _winkey(c); ok = True
+    wk = _winkey(c, key); ok = True
     for kind in ('action', 'commit'):
         ok = c.send_cmd(G.GOTO_PREVIOUS_WINDOW, wk, kind=kind, middle=b'')['ok'] and ok
     _state['window_key'] = None
     return {'ok': ok, 'action': 'prev_window'}
 
 @_action('tc_window')
-def tc_goto_start_page() -> dict:
-    """Go to the start page from the active main application window. The client returns an error if navigation is unavailable."""
+def tc_goto_start_page(key: str = None, handle: str = None) -> dict:
+    """Go to the start page from the addressed main window (active if omitted). The client returns an error if navigation is unavailable."""
     c = _need()
-    wk = _winkey(c); ok = True
+    wk = _winkey(c, key); ok = True
     for kind in ('action', 'commit'):
         ok = c.send_cmd(G.GOTO_START_PAGE, wk, kind=kind, middle=b'')['ok'] and ok
     _state['window_key'] = None
@@ -3282,14 +3302,14 @@ def tc_get_command_interface() -> dict:
     return {'ok': r['ok'], 'commands': _coll(r, wk)}
 
 @_action('tc_window')
-def tc_get_user_message_texts() -> dict:
-    """Get the user-message texts currently shown in the window → list of strings. They may
+def tc_get_user_message_texts(key: str = None, handle: str = None) -> dict:
+    """Get user-message texts from the addressed window (active if omitted) → list of strings. They may
     include earlier actions; the application can also replace the list with identical messages.
     To judge one action, call tc_close_user_messages_panel first, then the action, then this.
     Messages may appear after the action returns."""
     c = _need()
     try:
-        r = c.send_cmd(G.GET_USER_MESSAGE_TEXTS, _winkey(c), kind='read', middle=RC)
+        r = c.send_cmd(G.GET_USER_MESSAGE_TEXTS, _winkey(c, key), kind='read', middle=RC)
     except tc1c.OperationError as exc:
         if exc.status != 17:
             raise
@@ -3309,11 +3329,11 @@ def _user_messages_result(r):
 
 
 @_action('tc_window')
-def tc_choose_user_message(text: str) -> dict:
-    """Click the first user message matching text in the active window; * and ? are wildcards.
+def tc_choose_user_message(text: str, key: str = None, handle: str = None) -> dict:
+    """Click the first user message matching text in the addressed window (active if omitted); * and ? are wildcards.
     Use get_user_message_texts to read the available messages first."""
     c = _need()
-    wk = _winkey(c)
+    wk = _winkey(c, key)
     middle = tc1c.mk_command(text)
     mark = _native_composite_begin(c, 'choose_user_message')
     try:
@@ -3338,11 +3358,11 @@ def tc_answer_dialog(confirm: bool = True, timeout: int = 5) -> dict:
     return {'ok': True, 'answered': ans, 'question': question}
 
 @_action('tc_window')
-def tc_close_user_messages_panel() -> dict:
-    """Close the window's user-messages panel. This is also how you tell which messages belong
+def tc_close_user_messages_panel(key: str = None, handle: str = None) -> dict:
+    """Close the addressed window's user-messages panel (active if omitted). This is how you tell which messages belong
     to which action: clear the panel, perform the action, then read the messages."""
     c = _need()
-    wk = _winkey(c); ok = True
+    wk = _winkey(c, key); ok = True
     for kind in ('action', 'commit'):
         ok = c.send_cmd(G.CLOSE_USER_MESSAGES_PANEL, wk, kind=kind, middle=b'')['ok'] and ok
     return {'ok': ok}
@@ -3637,10 +3657,10 @@ def tc_text_within_area_bounds(key: str, handle: str, area: str = None) -> dict:
     c = _need()
     mid = tc1c.mk_area(area) if area else b'\xe1\x81'
     r = c.send_cmd(G.TEXT_WITHIN_AREA_BOUNDS, key, kind='read', middle=mid, handle=handle)
-    # булево — байт в позиции raw[-8] (хвост: <маркер> 20 a1 a3 <TR>). В контексте
-    # этого метода Да/Нет кодируется 82/81 (аналог скалярных e2/e1).
+    # В этом методе маркер перед эпилогом — 82/81 (аналог скалярных e2/e1).
     raw = _body(r)
-    b = raw[-8] if len(raw) >= 8 else None
+    end = tc1c.result_end(raw)
+    b = raw[end - 1] if end > 0 else None
     fits = True if b in (0x82, 0xe2) else (False if b in (0x81, 0xe1) else None)
     return _doc_read(c, key, handle, {'ok': r['ok'], 'fits': fits}, fits is None)
 
@@ -3739,13 +3759,12 @@ def _area_value(raw, area, cmd):
 
 def _area_size(raw, values):
     """Размер: компактное значение e1..ea либо eb/ed/ef + 1/2/4 байта числа."""
-    suffix = b'\x20\xa1\xa3' + tc1c.TR
+    end = tc1c.result_end(raw)
     pos = tc1c._reply_status_offset(raw)
     if pos is not None:
-        if not raw.startswith(b'\x81\x81\x81', pos) or not raw.endswith(suffix):
+        if not raw.startswith(b'\x81\x81\x81', pos) or end < pos:
             return None
         pos += 3
-        end = len(raw) - len(suffix)
         for tag, width in ((0xeb, 1), (0xed, 2), (0xef, 4)):
             if pos + 1 + width == end and raw[pos] == tag:
                 return int.from_bytes(raw[pos + 1:end], 'little', signed=width == 4)
@@ -3768,8 +3787,21 @@ def tc_get_doc_area_horizontal_size(key: str, handle: str) -> dict:
 def tc_get_state_presentation(key: str, handle: str) -> dict:
     """Read a form field's state presentation. An unavailable value is explained in the answer;
     null does not confirm that the field has no state presentation."""
-    c = _need()
+    return _get_state_presentation(key, handle)
+
+
+def _get_state_presentation(key, handle, *, structured=False):
+    c, error = _need_ver(TOOL_MIN_VERSION['tc_get_state_presentation'])
+    if error: return error
+    _code_execution.guard(c, G.GET_STATE_PRESENTATION, key)
     r = c.send_cmd(G.GET_STATE_PRESENTATION, key, kind='read', middle=RS, handle=handle)
+    if structured:
+        pos = tc1c._reply_status_offset(r['raw'])
+        end = tc1c.result_end(r['raw'])
+        if r.get('ok') and pos is not None and r['raw'][pos:end] == b'\x81\x81\x81\xe1':
+            return {'ok': True, 'presentation': None}
+        return {'ok': False, 'code': 'state_unavailable',
+                'error': 'The StatePresentation object could not be decoded.'}
     vals = _vals(r)
     return _unavailable_read({'ok': r['ok'], 'presentation': vals[-1] if vals else None}, 'presentation',
                              message='The state presentation could not be read; no conclusion about the field state is available.')
@@ -4468,7 +4500,7 @@ def tc_get_linked_window(key: str, handle: str) -> dict:
 
 # =========================== прочие / сессия ================================
 @_action('tc_app')
-def tc_set_max_action_time(seconds: int) -> dict:
+def tc_set_max_action_time(seconds: float) -> dict:
     """Set the max action-execution time in seconds: how long a result-returning action may take
     before the call gives up (0 = wait indefinitely). Stored on the client (no network call) and
     applied to every subsequent command."""
@@ -4485,9 +4517,14 @@ def tc_set_file_dialog_result(result: bool = True, filename: str | list = None,
     dialog. Each answer is consumed once. On 8.3.25+, replaces pending answers;
     clear_file_dialog_result clears unused ones. Older platforms cannot clear them: prepare only the
     next dialog."""
-    c = _need()
+    return _set_file_dialog_result(result, filename, filter_index)
+
+
+def _set_file_dialog_result(result, filename=None, filter_index=0, *, replace_pending=True):
+    c, error = _need_ver(TOOL_MIN_VERSION['tc_set_file_dialog_result'])
+    if error: return error
     middle = tc1c.mk_set_file_dialog_result(result, filename, filter_index)
-    can_clear = _guid_available(c, G.CLEAR_FILE_DIALOG_RESULT)
+    can_clear = replace_pending and _guid_available(c, G.CLEAR_FILE_DIALOG_RESULT)
     try:
         # Setting the next answer can succeed even while an already-open native dialog
         # blocks normal commands. Check responsiveness before changing the pending answer.
@@ -4978,8 +5015,13 @@ def _join_uilogs(parts):
 def tc_record_start() -> dict:
     """Start recording a scenario (uilog) that tc_run_scenario can replay later. Perform the real,
     effect-producing actions between start and tc_record_finish, then read the scenario from finish."""
-    c = _need()
-    _state['rec_mode'] = 'native' if os.environ.get('TC1C_RECORD_MODE', '').lower() == 'native' else 'synth'
+    return _record_start()
+
+
+def _record_start(mode=None):
+    c, error = _need_ver(TOOL_MIN_VERSION['tc_record_start'])
+    if error: return error
+    _state['rec_mode'] = mode or ('native' if os.environ.get('TC1C_RECORD_MODE', '').lower() == 'native' else 'synth')
     _rec_reset()                        # прежняя запись, если была, начисто снимается
     _state['rec_obs'] = []              # журнал наблюдений сеанса: пуст, пока ничего не сделано
     r = c.send_cmd(G.UILOG, None, kind='read818', middle=REC_START)

@@ -421,7 +421,27 @@ def mk_gotorow(column=None, value=None, toggle_selection=False, direction='down'
     rows = list(fields) if fields else ([(column, value)] if column is not None else [])
     return head + (mk_row_map(rows) if rows else b'\x55')
 
-_RESULT_EPILOGUE = b'\x20\xa1\xa3'   # хвост ответа: <значение> 20 a1 a3 <трейлер>
+def result_end(raw):
+    """Boundary before the reply epilogue, or -1 for an unknown/incomplete tail.
+
+    Known layouts: 20 a1 a3 <TR> and 20 a1 a4 91 <8 bytes> <TR>.
+    The additional field is opaque. Anchor both layouts to the frame end;
+    neither payload text nor bytes inside that field identify the boundary.
+    """
+    if not raw.endswith(TR):
+        return -1
+    end = len(raw) - len(TR)
+    ordinary = end >= 3 and raw[end - 3:end] == b'\x20\xa1\xa3'
+    if end >= 12 and raw[end - 12:end - 8] == b'\x20\xa1\xa4\x91':
+        candidate = end - 12
+        # Rare ambiguity: the opaque field can end with the ordinary epilogue,
+        # or a text value can contain the apparent extended header. Resolve it
+        # using the same value boundaries as the frame reader.
+        if not ordinary or _binary_frame_end(raw[:candidate]) == (None, candidate):
+            return candidate
+    if ordinary:
+        return end - 3
+    return -1
 
 
 def _reply_status_offset(raw, method_guid=None):
@@ -478,7 +498,8 @@ def empty_current_form_item(raw):
 def empty_object_reply(raw, method_guid):
     """Recognize the native successful null-object reply for a specific method."""
     p = _reply_status_offset(raw, method_guid)
-    return p is not None and raw[p:] == b'\x81\x81\x81\xe0\x4b\x55\x20\x20\xa1\xa3' + TR
+    end = result_end(raw)
+    return p is not None and end >= p and raw[p:end] == b'\x81\x81\x81\xe0\x4b\x55\x20'
 
 
 class ConnectionFailure(RuntimeError):
@@ -544,7 +565,7 @@ def decode_target_state(raw):
     Применимо только к CurrentVisible: у других read-методов признак лежит иначе либо
     отсутствует. Для неизвестного формата возвращается 'unknown' — состояние, которое нельзя
     подменять ни наличием объекта, ни его отсутствием."""
-    ep = raw.rfind(_RESULT_EPILOGUE)
+    ep = result_end(raw)
     if ep < 4:
         return 'unknown'
     b = raw[ep - 4]
@@ -559,7 +580,8 @@ def decode_goto_row(raw):
     правка его шаблона изменила бы их поведение. Якорь — 'cb 55', результат за 4 байта до него;
     признак приходит в ОБОИХ направлениях поиска, тогда как шаблон decode_bool '81 81 82'
     совпадает только при поиске вниз."""
-    cb = raw.rfind(b'\xcb\x55')
+    end = result_end(raw)
+    cb = raw.rfind(b'\xcb\x55', 0, end) if end >= 0 else -1
     if cb < 4:
         return None
     m = raw[cb - 4]
@@ -641,10 +663,13 @@ def decode_expanded(raw):
     if p is None or raw[p:p+3] != b'\x81\x81\x81':
         return None
     m = raw[p + 3:p + 4]
-    tail = raw[p + 4:]
-    if tail != b'\xcb\x55\x20\x20\xa1\xa3' + TR and not (
+    end = result_end(raw)
+    if end < p + 4:
+        return None
+    tail = raw[p + 4:end]
+    if tail != b'\xcb\x55\x20' and not (
             tail.startswith(b'\xcb\x23\x95' + _GOTOROW_MAPTYPE)
-            and tail.endswith(b'\x20\x20\x20\x20\x20\xa1\xa3' + TR)):
+            and tail.endswith(b'\x20\x20\x20\x20')):
         return None
     if m == b'\xe2': return True
     if m == b'\xe1': return False
@@ -652,17 +677,19 @@ def decode_expanded(raw):
 
 def decode_bool(raw):
     """Булев результат из ОТВЕТА. State-геттеры (CurrentVisible/Enable/ReadOnly/Check/
-    ModeIsEdit…) кодируют его МАРКЕРОМ перед эпилогом ' ¡£': e2=Да(True), e1=Нет(False)
+    ModeIsEdit…) кодируют его МАРКЕРОМ перед эпилогом: e2=Да(True), e1=Нет(False)
    . Иначе — строка Да/Нет (decode_result). None если нет."""
+    ep = result_end(raw)
+    if ep < 0:
+        return None
     r = decode_result(raw)
     if r in ('Да', 'Нет'):
         return r == 'Да'
-    ep = raw.rfind(_RESULT_EPILOGUE)
     if ep > 0:
         m = raw[ep-1]
         if m == 0xe2: return True
         if m == 0xe1: return False
-    j = raw.rfind(b'\x81\x81\x82')
+    j = raw.rfind(b'\x81\x81\x82', 0, ep)
     if j >= 4 and raw[j-4:j-1] == b'\x81\x81\x81':
         m = raw[j-1]
         if m == 0xe2: return True
@@ -671,11 +698,12 @@ def decode_bool(raw):
 
 def decode_result(raw):
     """Скалярный результат из ОТВЕТА (op 0x42): значение, чей конец совпадает с эпилогом
-    ' ¡£' (20 a1 a3). Кодирование варьируется (e0 41 81 81 b7… или f7… напрямую), но
+    ответа. Кодирование варьируется (e0 41 81 81 b7… или f7… напрямую), но
     значение всегда прилегает к эпилогу. Возвращает str/int (Да/Нет — как строку) или None.
     Устойчивее эвристики extract_strings для чтения возврата read-методов."""
-    ep = raw.rfind(_RESULT_EPILOGUE)
-    end = ep if ep >= 0 else (len(raw) - 4 if raw.endswith(TR) else len(raw))
+    end = result_end(raw)
+    if end < 0:
+        return None
     for pos in range(end - 2, max(end - 2200, 20), -1):
         t = raw[pos]; hi = t & 0xf0; lo = t & 0x0f
         try:
@@ -940,7 +968,7 @@ def extract_uilog(raw):
         return None
     p += 4
     size, text = _text_at(raw, p, compact=False)
-    if not size or raw[p + size:] != b'\x20\xa1\xa3' + TR:
+    if not size or p + size != result_end(raw):
         return None
     try:
         root = ET.fromstring(text)
@@ -951,6 +979,9 @@ def extract_uilog(raw):
 def extract_strings(raw, min_len=1):
     """Все строки-значения из кадра. Сканируем КАЖДУЮ позицию (+1), чтобы ложный
     тег перед значением не «съедал» реальную строку. Возможны наложения/дубли."""
+    end = result_end(raw) if raw.startswith(b'\x42') else -1
+    if end >= 0:
+        raw = raw[:end]
     out=[]; i=0; n=len(raw)
     while i<n-1:
         _, s = _text_at(raw, i, compact=False)
@@ -1029,12 +1060,16 @@ def decode_field_text(raw, *, property_value=False):
     """
     p = _reply_status_offset(raw)
     prefix = b'\x81\x81\x81' + (b'\xe0\x4b\x53' if property_value else b'')
-    suffix = (b'\x20\x20' if property_value else b'\x20') + b'\xa1\xa3' + TR
-    if p is None or not raw.startswith(prefix, p) or not raw.endswith(suffix):
+    end = result_end(raw)
+    if property_value:
+        if end < 1 or raw[end - 1] != 0x20:
+            return None
+        end -= 1
+    if p is None or end < p or not raw.startswith(prefix, p):
         return None
     p += len(prefix)
     size, text = _text_at(raw, p)
-    return text if size and p + size == len(raw) - len(suffix) else None
+    return text if size and p + size == end else None
 
 
 def decode_html(raw):
@@ -1045,6 +1080,29 @@ def decode_html(raw):
     p += 3
     size, value = _text_at(raw, p)
     return value if size and raw.startswith(b'\xcb', p + size) else None
+
+
+def decode_html_attachments(raw):
+    """Return the complete named-picture map, or None for an unreadable map."""
+    p = _reply_status_offset(raw)
+    if p is None or not raw.startswith(b'\x81\x81\x81', p): return None
+    size, _ = _text_at(raw, p + 3)
+    end = result_end(raw)
+    if not size or end < p + 3 + size: return None
+    data = raw[p + 3 + size:end]
+    if data.rstrip(b' ') == b'\xcb\x55': return {}
+    prefix = b'\xcb\x23\x95' + _STRUCT_TYPE
+    if not data.startswith(prefix) or len(data) <= len(prefix): return None
+    pos = len(prefix)
+    tag = data[pos]
+    if 0xc1 <= tag <= 0xca: count = tag - 0xc1
+    elif tag in (0xcb, 0xcd, 0xcf):
+        width = {0xcb: 1, 0xcd: 2, 0xcf: 4}[tag]
+        if pos + 1 + width > len(data): return None
+        count = int.from_bytes(data[pos + 1:pos + 1 + width], 'little')
+    else: return None
+    attachments = dec_attachments(data)
+    return attachments if len(attachments) == count else None
 
 
 def decode_user_messages(raw):
@@ -1083,14 +1141,17 @@ def decode_user_messages(raw):
             return None
         messages.append(text)
         p += size
-    end = b'\xa1\xa3' + TR
-    if not raw.endswith(end) or raw[p:-len(end)] not in (b' ', b'  ', b'   ', b'    '):
+    end = result_end(raw)
+    if end < p or raw[p:end] not in (b'', b' ', b'  ', b'   '):
         return None
     return messages
 
 
 def decode_cell_text(raw):
     """GetCellText returns text before the echoed column; compact bytes are characters."""
+    ep = result_end(raw)
+    if ep < 0:
+        return False, None
     marker = b'\x81\x81\x81\xe0\x4b\x53'
     start = 0
     while True:
@@ -1108,7 +1169,7 @@ def decode_cell_text(raw):
             if not column_size:
                 continue
             end = q + 2 + column_size
-            if raw[end:end + 4] != b'\x20\x20\xa1\xa3' or end + 8 != len(raw):
+            if end + 1 != ep or raw[end:ep] != b'\x20':
                 continue
             if raw[p] == 0x81:
                 return True, None
@@ -1126,10 +1187,11 @@ def decode_area_text(raw, area):
     This position contains data, so Unicode and key-like text must not be filtered.
     Unknown layouts return None for the caller's compatibility decoder.
     """
-    if not raw.startswith(b'\x42') or not raw.endswith(b'\x20\xa1\xa3' + TR):
+    end = result_end(raw)
+    if not raw.startswith(b'\x42') or end < 0:
         return None
     marker = b'\x81\x81\x81' + (_enc_like(0xf0, area) if area else b'\xe1')
-    start, end = 0, len(raw) - 7
+    start = 0
     while True:
         p = raw.find(marker, start)
         if p < 0:
@@ -1157,6 +1219,9 @@ def decode_rows(raw):
     i = _reply_status_offset(raw) if raw.startswith(b'\x42') else 0
     if i is None:
         raise ValueError('Cannot read table rows: unrecognized reply envelope')
+    end = result_end(raw) if raw.startswith(b'\x42') else -1
+    if end >= 0:
+        raw = raw[:end]
     rows = []; row = None
     while i < len(raw):
         # Collection/type identifiers in the body are binary GUID values too.
@@ -1216,11 +1281,10 @@ def is_key_like(s):
         return False
     return bool(_KEY_LIKE.search(s)) or ']' not in s.split('[', 1)[1]
 
-_TAIL_END      = b'\xa1\xa3'              # конец кадра перед 4-байтовым завершением
 _ONE_BYTE_TAGS = (0x8b, 0xab, 0xcb, 0xeb)   # семейство «значение в один байт»
 
 def decode_tail_byte(raw, pad):
-    """Компактная форма значения: <тег семейства> <байт> <pad байт 0x20> a1 a3 <4 байта>.
+    """Компактная форма значения: <тег семейства> <байт> <pad байт 0x20> <хвост ответа>.
     Возвращает САМ БАЙТ либо None, если формы нет. Что он означает — число (размер области)
     или символ (текст) — решает читатель, а не декодер: одна и та же форма встречается в обоих
     смыслах. Позиция фиксированная; сканировать кадр этой формой нельзя — байт тега часто
@@ -1230,11 +1294,12 @@ def decode_tail_byte(raw, pad):
     добивку по числу подряд идущих 0x20 нельзя: байт значения сам может равняться 0x20 либо
     совпасть с байтом тега, и тогда добивка выдаётся за значение. pad=0 формой не считается —
     такой ответ не встречается."""
-    if not pad or len(raw) < 8 + pad or raw[-6:-4] != _TAIL_END:
+    end = result_end(raw) + 1  # Include the first padding byte of the epilogue.
+    if not pad or pad < 0 or end < 2 + pad:
         return None
-    if any(b != 0x20 for b in raw[-6 - pad:-6]):
+    if any(b != 0x20 for b in raw[end - pad:end]):
         return None
-    return raw[-7 - pad] if raw[-8 - pad] in _ONE_BYTE_TAGS else None
+    return raw[end - 1 - pad] if raw[end - 2 - pad] in _ONE_BYTE_TAGS else None
 
 def clean_strings(raw, min_len=1):
     """extract_strings без байт-перевёрнутого мусора, без CJK-мусора (неверный декод) и без
@@ -1452,7 +1517,7 @@ class TestClient:
         mat = self._max_action_time
         if mat is None:
             return self.RECV_TIMEOUT
-        return None if int(mat) <= 0 else int(mat)
+        return None if mat <= 0 else float(mat)
 
     def _read_frame(self, timeout, *, binary=None):
         """Прочитать ОДИН кадр (до трейлера TR). timeout: секунды или None (без ограничения).
@@ -1736,8 +1801,9 @@ class TestClient:
             raise OperationError(status, key)
         if self._track is not None:
             self._track.append((method_guid, key, middle, kind))
+        end = result_end(r)
         return {'opcode': r[0], 'ok': r[0]==0x42, 'raw': r,
-                'values': decode_stream(r[:-4], 21)}
+                'values': decode_stream(r[:end if end >= 0 else -4], 21)}
 
     def interrupt(self):
         """Wake a blocked socket operation without changing worker-owned protocol state."""

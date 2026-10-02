@@ -128,7 +128,7 @@ class Connections:
         pool, entry, execution, client = record
         with self.bound(record, connecting=True):
             client = entry.state.get('client')
-            if client is None or getattr(client, 'closed', False) or getattr(client, '_interrupted', False):
+            if not _connections.client_connected(client):
                 entry.state['_launch_deadline'] = self.host.deadline
                 try:
                     result = self.R.tc_connect(host=endpoint[0], port=endpoint[1],
@@ -162,14 +162,14 @@ class Connections:
     def connected(self):
         if self.detached: return False
         client = self.host.client
-        if getattr(client, 'closed', False) or getattr(client, '_interrupted', False): return False
+        if not _connections.client_connected(client): return False
         if self.current is None: return client is not None
         pool, entry, _, _ = self.current
         return pool.entries.get(entry.id) is entry and entry.state.get('client') is client
 
     def application_method(self, obj, name):
         """Direct application methods retain the application object and its endpoint."""
-        if name in ('connect', 'подключить'):
+        if name in ('connect', 'установитьсоединение'):
             owner = obj.owner
             port, computer = getattr(owner, 'port', None), getattr(owner, 'host', None)
             if port is None or computer is None:

@@ -39,7 +39,7 @@ BUILTINS = aliases([
     'errorinfo ИнформацияОбОшибке', 'detailederrordescription ПодробноеПредставлениеОшибки',
     'brieferrordescription КраткоеПредставлениеОшибки',
 ])
-VALUE_METHODS = {'getid', 'получитьидентификатор', 'findbyid', 'найтипоидентификатору',
+VALUE_METHODS = {'getbinarydata', 'получитьдвоичныеданные', 'getid', 'получитьидентификатор', 'findbyid', 'найтипоидентификатору',
                  'move', 'сдвинуть', 'sortbyvalue', 'сортироватьпозначению', 'sortbypresentation', 'сортироватьпопредставлению',
                  'findbyvalue', 'найтипозначению', 'indexof', 'индекс', 'copy', 'скопировать',
                  'loadvalues', 'загрузитьзначения', 'unloadvalues', 'выгрузитьзначения', 'fillchecks', 'заполнитьпометки',
@@ -89,7 +89,7 @@ TYPES.update({'sortdirection':'sortdirection', 'направлениесорти
 TYPES.update(aliases(['testedclientapplicationwindow ТестируемоеОкноКлиентскогоПриложения',
                      'errorinfo ИнформацияОбОшибке', 'messagestatus СтатусСообщения', 'roundmode РежимОкругления',
                      'testedapplication ТестируемоеПриложение',
-                     'binarydata ДвоичныеДанные',
+                     'binarydata ДвоичныеДанные', 'picture Картинка', 'callbackdescription ОписаниеОповещения',
                      'testedcommandinterface ТестируемыйКомандныйИнтерфейс',
                      'testedcommandinterfacebutton ТестируемаяКнопкаКомандногоИнтерфейса',
                      'testedcommandinterfacegroup ТестируемаяГруппаКомандногоИнтерфейса']))
@@ -214,7 +214,7 @@ class Repository:
                 raise Failure('unsupported_scenario', 'The file has no executable scenario body; select a scenario, not a library/group container.', path=path)
         self.programs[path] = program  # Permit recursive calls; execution depth is bounded.
         for node in walk([program.tree, list(program.functions.values())]):
-            if node.kind == 'new' and node.args[0] not in (*CONSTRUCTORS, 'array', 'массив', 'structure', 'структура', 'map', 'соответствие'):
+            if node.kind == 'new' and node.args[0] not in (*CONSTRUCTORS, 'array', 'массив', 'structure', 'структура', 'map', 'соответствие', 'callbackdescription', 'описаниеоповещения'):
                 raise Failure('unsupported_scenario', f'Unsupported BSL type {node.args[0]!r}.', path=path, line=node.line)
             if node.kind != 'call': continue
             target, args = node.args
@@ -576,6 +576,10 @@ class Runner:
             from compatible_scenarios.tester.connections import AppData
             if isinstance(args[0], AppData): return TypeValue('structure')
             value = args[0]
+            from compatible_scenarios.shared.bsl.pictures import Picture
+            from compatible_scenarios.shared.bsl.callbacks import CallbackDescription
+            if isinstance(value, Picture): return TypeValue('picture')
+            if isinstance(value, CallbackDescription): return TypeValue('callbackdescription')
             if isinstance(value, ErrorInfo): return TypeValue('errorinfo')
             if isinstance(value, MessageStatus): return TypeValue('messagestatus')
             if isinstance(value, RoundMode): return TypeValue('roundmode')

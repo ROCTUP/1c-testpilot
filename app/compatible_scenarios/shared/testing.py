@@ -11,11 +11,41 @@ from .bsl.language import Failure, Structure, Map, value_in
 # Explicit method signatures and return slots; no dynamic forwarding to Python.
 METHODS = {}
 for names, action, params, slot in [
-    ('Connect Подключить', 'application_connect', (), None),
-    ('Disconnect Отключить', 'application_disconnect', (), None),
+    ('ChooseUserMessage ВыбратьСообщениеПользователю', 'choose_user_message', ('text',), None),
+    ('CloseUserMessagesPanel ЗакрытьПанельСообщенийПользователю', 'close_user_messages_panel', (), None),
+    ('GetUserMessageTexts ПолучитьТекстыСообщенийПользователю', 'get_user_message_texts', (), 'messages'),
+    ('GotoStartPage ПерейтиКНачальнойСтранице', 'goto_start_page', (), None),
+    ('GotoPreviousWindow ПерейтиКПредыдущемуОкну', 'goto_previous_window', (), None),
+    ('GotoNextWindow ПерейтиКСледующемуОкну', 'goto_next_window', (), None),
+    ('WriteContentToFile ЗаписатьСодержимоеВФайл', 'write_content_to_file', ('save_as',), None),
+    ('ClickViewStatusItem НажатьНаЭлементСостоянияПросмотра', 'click_view_status_item', ('index',), None),
+    ('DeleteViewStatusItem УдалитьЭлементСостоянияПросмотра', 'delete_view_status_item', ('index',), None),
+    ('GetViewStatusItemTexts ПолучитьТекстыЭлементовСостоянияПросмотра', 'get_view_status_item_texts', (), 'items'),
+    ('CurrentCheck ТекущееПометка', 'current_check', (), 'checked'),
+    ('GetLinkedWindow ПолучитьСвязанноеОкно', 'get_linked_window', (), 'window'),
+    ('GetCurrentPage ПолучитьТекущуюСтраницу', 'get_current_page', (), 'page'),
+    ('GetChoiceListPresentation ПолучитьПредставлениеСпискаВыбора', 'get_choice_list', (), 'items'),
+    ('GetStatePresentation ПолучитьОтображениеСостояния', 'get_state_presentation', (), 'presentation'),
+    ('GetDocumentHTML ПолучитьHTMLДокумента', 'get_html', ('html', 'attachments'), None),
+    ('StartUILogRecording НачатьЗаписьЖурналаДействийПользователя', 'record_start', (), None),
+    ('FinishUILogRecording ЗавершитьЗаписьЖурналаДействийПользователя', 'record_finish', (), 'uilog'),
+    ('CancelUILogRecording ПрерватьЗаписьЖурналаДействийПользователя', 'record_cancel', (), None),
+    ('PauseUILogRecording ПриостановитьЗаписьЖурналаДействийПользователя', 'record_pause', (), None),
+    ('ResumeUILogRecording ПродолжитьЗаписьЖурналаДействийПользователя', 'record_resume', (), None),
+    ('GetMaxActionExecutionTime ПолучитьМаксимальноеВремяВыполненияДействия', 'get_max_action_time', (), 'max_action_time'),
+    ('SetMaxActionExecutionTime УстановитьМаксимальноеВремяВыполненияДействия', 'set_max_action_time', ('seconds',), None),
+    ('GetAccumulatedPerformanceIndicators ПолучитьНакопленныеПоказателиПроизводительности', 'get_performance', ('clear',), 'indicators'),
+    ('ClearAccumulatedPerformanceIndicators ОчиститьНакопленныеПоказателиПроизводительности', 'clear_performance', (), None),
+    ('SetFileDialogResult УстановитьРезультатДиалогаВыбораФайла', 'set_file_dialog_result', ('result', 'filename', 'filter_index'), None),
+    ('ClearFileDialogResult ОчиститьРезультатДиалогаВыбораФайла', 'clear_file_dialog_result', (), None),
+    ('WaitForClosing ОжидатьЗакрытие', 'wait_for_closing', ('timeout',), None),
+    ('WaitForObjectDisplayed ОжидатьОтображениеОбъекта', 'wait_for_object_displayed', ('object_type', 'title', 'name', 'timeout'), None),
+    ('WaitForCondition ОжидатьСостояния', 'wait_for_condition', ('callback', 'timeout'), None),
+    ('Connect УстановитьСоединение', 'application_connect', (), None),
+    ('Disconnect РазорватьСоединение', 'application_disconnect', (), None),
     ('GetActiveWindow ПолучитьАктивноеОкно', 'get_active_window', (), None),
     ('GetCurrentErrorInfo ПолучитьТекущуюИнформациюОбОшибке', 'get_current_error', (), None),
-    ('StartChoosing Выбрать НачатьВыбор', 'start_choosing', (), None),
+    ('StartChoosing Выбрать', 'start_choosing', (), None),
     ('Choose', 'choose_row', (), None),
     ('StartChoosingFromChoiceList ВыбратьИзСпискаВыбора', 'start_choosing_from_choice_list', (), None),
     ('Open Открыть', 'open_field', (), None),
@@ -35,15 +65,15 @@ for names, action, params, slot in [
     ('FindObject НайтиОбъект', 'find_object', ('object_type', 'title', 'name', 'timeout'), None),
     ('FindObjects НайтиОбъекты', 'find_objects', ('object_type', 'title', 'name', 'timeout'), None),
     ('GetObject ПолучитьОбъект', 'get_object', ('object_type', 'title', 'name', 'timeout'), None),
-    ('GetChildObjects ПолучитьПодчиненныеОбъекты ПолучитьДочерниеОбъекты', 'get_child_objects', (), 'children'),
+    ('GetChildObjects ПолучитьПодчиненныеОбъекты', 'get_child_objects', (), 'children'),
     ('GetParent ПолучитьРодителя', 'get_parent', (), 'parent'),
     ('WaitForDropListGeneration ОжидатьФормированияВыпадающегоСписка', 'wait_for_drop_list_generation', ('timeout',), 'generated'),
     ('DeleteRow УдалитьСтроку', 'delete_rows', (), None),
     ('Activate Активизировать', 'activate', (), None),
     ('Click Нажать', 'click', (), None),
     ('InputText ВвестиТекст', 'input_text', ('text',), None),
-    ('InputHTML ВвестиHTML InputDocumentHTML ВвестиHTMLДокумента', 'input_html', ('html', 'attachments'), None),
-    ('GetDisplayedText ПолучитьОтображаемыйТекст ПолучитьТекст', 'get_text', (), 'text'),
+    ('InputDocumentHTML ВвестиHTMLДокумента', 'input_html', ('html', 'attachments'), None),
+    ('GetDisplayedText ПолучитьОтображаемыйТекст', 'get_text', (), 'text'),
     ('GetEditText ПолучитьТекстРедактирования', 'get_edit_text', (), 'text'),
     ('GetDataPresentation ПолучитьПредставлениеДанных', 'get_data_presentation', (), 'presentation'),
     ('GetAreaText ПолучитьТекстОбласти', 'get_area_text', ('area',), 'text'),
@@ -56,13 +86,13 @@ for names, action, params, slot in [
     ('IncludedInMergedArea ВходитВОбъединеннуюОбласть', 'included_in_merged_area', ('address',), 'merged_area'),
     ('TextIsWithinAreaBounds ТекстВПределахГраницОбласти', 'text_within_area_bounds', ('area',), 'fits'),
     ('BeginEditCurrentArea НачатьРедактированиеТекущейОбласти', 'begin_edit_current_area', (), None),
-    ('EndEditCurrentArea ЗакончитьРедактированиеТекущейОбласти ЗавершитьРедактированиеТекущейОбласти', 'end_edit_current_area', ('cancel',), None),
+    ('EndEditCurrentArea ЗакончитьРедактированиеТекущейОбласти', 'end_edit_current_area', ('cancel',), None),
     ('GotoFirstRow ПерейтиКПервойСтроке', 'goto_first_row', ('toggle_selection',), None),
     ('GotoLastRow ПерейтиКПоследнейСтроке', 'goto_last_row', ('toggle_selection',), None),
     ('GotoNextRow ПерейтиКСледующейСтроке', 'goto_next_row', ('toggle_selection',), None),
     ('GotoPreviousRow ПерейтиКПредыдущейСтроке', 'goto_previous_row', ('toggle_selection',), None),
     ('GotoRow ПерейтиКСтроке', 'goto_row', ('fields', 'direction'), 'found'),
-    ('CurrentModeIsEdit ТекущийРежимРедактирование ТекущийРежимРедактирования', 'current_mode_is_edit', (), 'edit_mode'),
+    ('CurrentModeIsEdit ТекущийРежимРедактирование', 'current_mode_is_edit', (), 'edit_mode'),
     ('GetSelectedRows ПолучитьВыделенныеСтроки', 'get_selected_rows', (), 'rows'),
     ('SelectAllRows ВыделитьВсеСтроки', 'select_all_rows', (), None),
     ('GetCellText ПолучитьТекстЯчейки', 'get_cell_text', ('column',), 'text'),
@@ -70,9 +100,9 @@ for names, action, params, slot in [
     ('CopyRow СкопироватьСтроку', 'copy_row', (), None),
     ('SwitchRowDeleteMark ПереключитьПометкуУдаленияСтроки', 'switch_row_delete_mark', (), None),
     ('SetOrder УстановитьПорядок', 'set_order', ('column',), None),
-    ('EndEditRow ЗакончитьРедактированиеСтроки ЗавершитьРедактированиеСтроки', 'end_edit_row', ('cancel',), None),
+    ('EndEditRow ЗакончитьРедактированиеСтроки', 'end_edit_row', ('cancel',), None),
     ('ChangeRow ИзменитьСтроку', 'change_row', (), None),
-    ('SetCheck УстановитьОтметку УстановитьФлажок', 'set_check', (), None),
+    ('SetCheck УстановитьОтметку', 'set_check', (), None),
     ('Clear Очистить', 'clear', (), None),
     ('OpenDropList ОткрытьВыпадающийСписок', 'open_drop_list', (), None),
     ('ExecuteChoiceFromDropList ВыполнитьВыборИзВыпадающегоСписка', 'choose_from_drop_list', ('value',), None),
@@ -144,7 +174,8 @@ FORM_ACTIONS = {'goto_next_item': 'goto_next_element', 'goto_previous_item': 'go
                 'get_current_item': 'get_current_element'}
 # Actions answering with tested objects; the value is the result key that holds them.
 OBJECT_RESULTS = {'get_current_item': 'item', 'get_current_element': 'item', 'get_command_bar': 'commandbar',
-                  'get_context_menu': 'menu', 'find_default_button': 'button'}
+                  'get_context_menu': 'menu', 'find_default_button': 'button',
+                  'get_linked_window': 'window', 'get_current_page': 'page'}
 
 
 def invoke_element(adapter, obj, name, args, action, params, slot):
@@ -156,7 +187,7 @@ def invoke_element(adapter, obj, name, args, action, params, slot):
     minimum = {'goto_first_row': 0, 'goto_last_row': 0, 'goto_next_row': 0, 'goto_previous_row': 0,
                'goto_row': 1, 'end_edit_row': 0, 'end_edit_current_area': 0,
                'get_area_text': 0, 'get_current_area_text': 0, 'input_html': 1,
-               'text_within_area_bounds': 0}.get(action, len(params))
+               'text_within_area_bounds': 0, 'write_content_to_file': 0}.get(action, len(params))
     if action in ('expand', 'collapse', 'is_expanded', 'can_be_expanded'): minimum = 0
     if action == 'wait_for_drop_list_generation': minimum = 0
     if not minimum <= len(args) <= len(params): raise Failure('unsupported_scenario', f'{name} expects {minimum}..{len(params)} arguments.')
@@ -170,6 +201,16 @@ def invoke_element(adapter, obj, name, args, action, params, slot):
         kw['row_column'], kw['row_value'] = next(iter(description.items()))
     if action == 'get_current_area_field': return adapter.area_field(obj)
     if action == 'input_text': kw['finish'] = False
+    if action == 'write_content_to_file':
+        from .bsl.language import boolean
+        kw['save_as'] = boolean(args[0]) if args and args[0] is not None else False
+    if action == 'input_html' and 'attachments' in kw:
+        import base64
+        from .bsl.pictures import Picture
+        if not isinstance(kw['attachments'], (Map, Structure)):
+            raise Failure('scenario_failed', 'HTML attachments require a Map.')
+        kw['attachments'] = {name: base64.b64encode(value.data).decode('ascii') if isinstance(value, Picture) else value
+                             for name, value in kw['attachments'].items()}
     if action == 'delete_rows': kw.update(scope='current', confirm=None)
     # Like DeleteRow, the confirmation question stays for the following steps of the scenario.
     if action == 'switch_row_delete_mark': kw['confirm'] = None
@@ -186,4 +227,7 @@ def invoke_element(adapter, obj, name, args, action, params, slot):
         return UIObject(found[0], obj) if found else None
     # The platform returns a string; Testpilot reports an empty tooltip as None.
     if action == 'get_tooltip' and result[slot] is None: return ''
+    if action == 'get_view_status_item_texts':
+        from .bsl.language import FixedArray
+        return FixedArray(value_in(result[slot]))
     return value_in(result[slot]) if slot else None
