@@ -82,6 +82,9 @@ class Adapter:
             raise Failure('connection_mismatch', 'This object belongs to another client. Switch back or find an object in the current client.')
 
     def action(self, action, obj=None, **kw):
+        if action == 'get_user_message_texts':
+            # Native reads must not reopen messages already handled by the scenario.
+            kw['open_if_closed'] = False
         if obj is not None:
             self.check_owner(obj)
             if not isinstance(obj, UIObject): raise Failure('scenario_failed', 'A tested UI object was expected.')

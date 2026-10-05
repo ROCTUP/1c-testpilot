@@ -482,6 +482,10 @@ class VM:
             if op == 'and': return boolean(a) and boolean(self.expr(args[2]))
             if op == 'or': return boolean(a) or boolean(self.expr(args[2]))
             b = self.expr(args[2])
+            if op in ('=', '<>') and (isinstance(a, (*COLLECTIONS, ValueListItem))
+                                     or isinstance(b, (*COLLECTIONS, ValueListItem))):
+                equal = value_equal(a, b)
+                return equal if op == '=' else not equal
             if op == '+' and isinstance(a, str) and b is NULL: return a
             if op in ('<', '>', '<=', '>=') and (a is NULL or b is NULL):
                 self.fail('Null does not support ordered comparisons.')

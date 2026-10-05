@@ -104,10 +104,16 @@ class Reader:
             if had_current:
                 self.fail('selection_state_unavailable', 'The existing current row could not be selected.')
             return []
-        if len(current) != 1:
-            self.fail('selection_state_unavailable', 'A single current row could not be selected.')
         if not had_current:
             self.result['cursor_repositioned'] = True
+            if len(current) > 1:
+                # GotoFirstRow with selection can extend an existing range. Rows now
+                # prove that navigation reached a populated table; collapse the range
+                # before probing bulk selection, without treating it as the full table.
+                self.call('goto_row')
+                current = self.rows()
+        if len(current) != 1:
+            self.fail('selection_state_unavailable', 'A single current row could not be selected.')
         if state is None:
             self.clear_current()
             self.call('select_all_rows')

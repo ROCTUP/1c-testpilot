@@ -254,8 +254,14 @@ def capture_linux(request):
         raise CaptureError('screenshot_desktop_unavailable', 'Set DISPLAY and XAUTHORITY for the client graphical session. Native Wayland capture is not supported.')
     if not re.fullmatch(r'(?:unix/?)?:\d+(?:\.\d+)?', os.environ['DISPLAY']):
         raise CaptureError('screenshot_desktop_unavailable', 'Use the local client DISPLAY (for example :0). Forwarded or remote X displays cannot identify the local client reliably.')
-    process = psutil.Process(request['pid'])
-    if process.create_time() != request['created'] or process.name() not in ('1cv8', '1cv8c'):
+    try:
+        process = psutil.Process(request['pid'])
+        current = (process.is_running() and process.create_time() == request['created']
+                   and process.name() in ('1cv8', '1cv8c'))
+    except psutil.Error as exc:
+        raise CaptureError('screenshot_client_unavailable',
+                           'The connected 1C process is no longer available or cannot be inspected.') from exc
+    if not current:
         raise CaptureError('screenshot_client_changed', 'The connected 1C process changed before capture.')
     desktop = Desktop(process.pid)
     try:

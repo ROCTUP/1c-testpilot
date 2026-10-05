@@ -18,6 +18,8 @@ import _action_diagnostics
 import _row_search
 import _table_reading
 import _find_pages
+import _command_interface
+import _user_messages
 import _list_search
 import _list_settings
 import _value_selection
@@ -148,8 +150,11 @@ def _with_operation_errors(fn):
             client = _state.get('client')
             if client is not None and vars(client).get('_service_roots'):
                 arguments = sig.bind(*args, **kwargs).arguments
-                for name in ('key', 'root_key'):
-                    _code_execution.guard(client, None, arguments.get(name))
+                cached_menu = fn.__name__ == 'tc_get_command_interface' and _command_interface.is_cached(
+                    client, arguments.get('key'), arguments.get('all_sections'), arguments.get('refresh'))
+                if not cached_menu:
+                    for name in ('key', 'root_key'):
+                        _code_execution.guard(client, None, arguments.get(name))
             result = fn(*args, **kwargs)
         except tc1c.OperationError as exc:
             result = exc.result()
@@ -2037,6 +2042,8 @@ def _click_guid(key):
 @_action('tc_field')
 def tc_click(key: str, handle: str, diagnostics: bool = False, diagnostics_wait: float = 2.0) -> dict:
     """Click a button, field, group, decoration or command-interface button.
+    For submenus, find descendant Buttons and click them directly, even through nested menus;
+    opening the menus first is unnecessary.
     Use activate to focus inputs/cells/pages. window, when present, is the active window afterwards.
     window_changed=false means the previous window description still applies.
     diagnostics=true also reads messages, possibly from earlier actions.
@@ -2059,6 +2066,14 @@ def tc_click(key: str, handle: str, diagnostics: bool = False, diagnostics_wait:
         for kind in ('action', 'commit'):
             r = c.send_cmd(guid, key, kind=kind, middle=b'', handle=handle)
             ok = ok and r['ok']
+    except tc1c.OperationError as exc:
+        if exc.status == 8 and _key_class(key) == 'Group' and _kind_of(c, key) == 'Popup':
+            return dict(exc.result(), code='submenu_click_unsupported',
+                        error='Click cannot open this submenu. Use find_objects with this submenu '
+                              'as root_ref and cls="Button", then click the desired button directly. '
+                              'This includes nested submenus; opening the menus first is unnecessary.',
+                        suggested_action='find_objects')
+        raise
     finally:
         if mark is not None:
             _native_composite_end(c, mark, 'click')
@@ -3294,30 +3309,42 @@ def tc_execute_command(command: str) -> dict:
     return result
 
 @_action('tc_window')
-def tc_get_command_interface() -> dict:
-    """Get the window's command interface → collection of buttons/groups."""
-    c = _need()
-    wk = _winkey(c)
-    r = c.send_cmd(G.GET_COMMAND_INTERFACE, wk, kind='read', middle=RC)
-    return {'ok': r['ok'], 'commands': _coll(r, wk)}
+def tc_get_command_interface(key: str = None, all_sections: bool = False,
+                             section: str = None, search: str = None,
+                             limit: int = 50, offset: int = 0,
+                             refresh: bool = False, timeout: float = 120) -> dict:
+    """Read the current command tree of key (default: main application window), without clicking.
+    all_sections=true scans all sections-panel buttons and returns command counts; it changes menus, then
+    attempts to restore them. Stops if a section changes application windows; check complete/restored.
+    With all_sections=true, section (returned identifier or exact title) or search (path substring)
+    returns cached commands, paged by limit=1..200 and offset; continue with next_offset.
+    Commands contain title, path and url: pass url to execute_command. refresh=true repeats the scan;
+    catalogues are kept until disconnect (up to 20 windows). timeout limits a scan in seconds (0 < timeout <= 3600)."""
+    return _command_interface.get(sys.modules[__name__], _need(), key, all_sections,
+                                  section, search, limit, offset, refresh, timeout)
 
 @_action('tc_window')
-def tc_get_user_message_texts(key: str = None, handle: str = None) -> dict:
-    """Get user-message texts from the addressed window (active if omitted) → list of strings. They may
-    include earlier actions; the application can also replace the list with identical messages.
-    To judge one action, call tc_close_user_messages_panel first, then the action, then this.
-    Messages may appear after the action returns."""
+def tc_get_user_message_texts(key: str = None, handle: str = None, open_if_closed: bool = True) -> dict:
+    """Read messages from key (active window if omitted). A closed panel is temporarily opened
+    with Ctrl+Shift+Z and closed again; this requires local desktop access and the addressed
+    window to be active (foreground on a shared desktop). Remote clients require an open panel.
+    open_if_closed=false reads without opening; a closed panel returns user_messages_unavailable.
+    Messages can belong to earlier actions or appear late; closing the panel does not erase them.
+    A restore failure returns the messages with ok=false and panel_restored=false."""
     c = _need()
-    try:
-        r = c.send_cmd(G.GET_USER_MESSAGE_TEXTS, _winkey(c, key), kind='read', middle=RC)
-    except tc1c.OperationError as exc:
-        if exc.status != 17:
-            raise
-        return dict(exc.result(), code='user_messages_unavailable', messages=None,
-                    error='The user-message panel is unavailable in this window.',
-                    message='The message panel is closed or unavailable in this window. '
-                            'This does not establish that the last action had no validation errors.')
-    return _user_messages_result(r)
+    wk = _winkey(c, key)
+    if not open_if_closed:
+        return _user_messages.read(c, wk)
+    return _user_messages.panel(sys.modules[__name__], c, wk)
+
+
+@_action('tc_window')
+def tc_open_user_messages_panel(key: str = None, handle: str = None) -> dict:
+    """Open key's user-message panel (active window if omitted); an open panel is left open.
+    Uses Ctrl+Shift+Z: requires a local client and the addressed window active, foreground
+    on a shared desktop. Remote/inaccessible clients return a refusal. Returns opened and panel_open."""
+    c = _need()
+    return _user_messages.panel(sys.modules[__name__], c, _winkey(c, key), keep_open=True)
 
 
 def _user_messages_result(r):
@@ -3359,8 +3386,8 @@ def tc_answer_dialog(confirm: bool = True, timeout: int = 5) -> dict:
 
 @_action('tc_window')
 def tc_close_user_messages_panel(key: str = None, handle: str = None) -> dict:
-    """Close the addressed window's user-messages panel (active if omitted). This is how you tell which messages belong
-    to which action: clear the panel, perform the action, then read the messages."""
+    """Close the addressed window's user-messages panel (active if omitted). This hides the panel;
+    previous messages can reappear when it is reopened. It does not clear message history."""
     c = _need()
     wk = _winkey(c, key); ok = True
     for kind in ('action', 'commit'):
@@ -4010,7 +4037,8 @@ def tc_create(key: str, handle: str) -> dict:
 
 @_action('tc_field')
 def tc_cancel_edit(key: str, handle: str) -> dict:
-    """Cancel editing an input field."""
+    """Cancel pending input, like Esc. Does not undo values accepted by input_text(finish=true)
+    or other actions that finish editing."""
     c = _need()
     ok = True
     for kind in ('action', 'commit'):
@@ -7006,7 +7034,8 @@ _GROUP_DOC = {
     'tc_field':    'Actions on a form field, button, group or element addition. Choose `action`.',
     'tc_table':    'Read and edit table or tree rows, manage selection and expand or collapse nodes. Choose `action`.',
     'tc_doc':      'Actions on document fields and spreadsheet areas. Choose `action`.',
-    'tc_calendar': 'Actions on a calendar field.',
+    'tc_calendar': 'Actions on type="CalendarField" only. For a regular date input field, '
+                   'use tc_field(action="input_text").',
     'tc_window':   'Actions on the client application window.',
     'tc_form':     'Actions on the managed form itself, including navigation between form elements '
                    'and reading the focused element. Choose `action`.',
@@ -7152,6 +7181,12 @@ def _resolve_ref_arguments(fn, kw):
         if internal not in params:
             raise _refs.RefError('invalid_ref_argument', public + ' is not accepted by this action')
         key, handle = registry.resolve(out.pop(public))
+        # Catalogue pages read saved data, not the current UI object. Resolving
+        # ownership is sufficient and must not trigger a live membership probe.
+        if fn.__name__ == 'tc_get_command_interface' and _command_interface.is_cached(
+                _state.get('client'), key, out.get('all_sections'), out.get('refresh')):
+            out[internal] = key
+            continue
         # Exact membership check also protects reads against a form closed outside MCP.
         c = _state['client']
         track = getattr(c, '_track', None)
@@ -7215,7 +7250,8 @@ def _ref_live_object(c, key):
 _LOG_CHANGING = _VERIFY_ACTIONS | frozenset({
     'connect', 'launch_client', 'disconnect', 'stop_client', 'close_window', 'activate_window',
     'goto_next_window', 'goto_previous_window', 'goto_start_page',
-    'execute_command', 'answer_dialog', 'close_user_messages_panel', 'choose_user_message',
+    'execute_command', 'answer_dialog', 'close_user_messages_panel', 'open_user_messages_panel',
+    'get_user_message_texts', 'choose_user_message',
     'set_fields', 'set_row_values', 'add_rows', 'set_cell_text', 'set_area_text', 'run_scenario',
     'get_list_settings', 'get_list_settings_fields', 'set_list_settings',
     'select_value',

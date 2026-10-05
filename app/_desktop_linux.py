@@ -114,11 +114,19 @@ class IsolatedProcess:
                 raise OSError('Could not release all isolated desktop resources.')
 
     def call(self, action, request, timeout=10):
-        if action != 'screenshot':
+        from _screenshots import CaptureError
+        if action not in ('screenshot', 'keyboard'):
             raise OSError('This isolated desktop operation is not supported on Linux.')
-        if self.poll() is not None or request['pid'] != self.pid or request['created'] != self.created:
-            raise OSError('The isolated client is no longer running.')
-        result = self._request(dict(action=action, request=request, timeout=timeout), timeout + 3)
+        if self.poll() is not None:
+            raise CaptureError('screenshot_desktop_unavailable', 'The isolated desktop is no longer running.')
+        try:
+            # The launcher may be a wrapper. The capture helper validates the connected
+            # process separately and only reads its windows on this private display.
+            result = self._request(dict(action=action, request=request, timeout=timeout,
+                                        launch_pid=self.pid, launch_created=self.created), timeout + 3)
+        except OSError as exc:
+            raise CaptureError('screenshot_desktop_unavailable',
+                               'The isolated desktop supervisor is unavailable. Restart the test client.') from exc
         if result.get('timed_out'):
             raise subprocess.TimeoutExpired('screenshot', timeout)
         return result
@@ -242,10 +250,12 @@ def _supervise(channel):
                 continue
             message = _receive(channel)
             request = message.get('request', {})
-            if message.get('action') != 'screenshot' or request.get('pid') != client.pid or request.get('created') != created:
+            if (message.get('action') not in ('screenshot', 'keyboard') or message.get('launch_pid') != client.pid
+                    or message.get('launch_created') != created):
                 raise ValueError('The request does not belong to this isolated client.')
             try:
-                result = subprocess.run([sys.executable, str(Path(__file__).with_name('_screenshot_linux.py')), json.dumps(request)],
+                helper = '_keyboard.py' if message['action'] == 'keyboard' else '_screenshot_linux.py'
+                result = subprocess.run([sys.executable, str(Path(__file__).with_name(helper)), json.dumps(request)],
                     stdin=subprocess.DEVNULL, capture_output=True, timeout=min(10, message['timeout']))
                 if result.returncode or len(result.stdout) > MAX_MESSAGE:
                     raise OSError('The screenshot helper failed.')
@@ -253,7 +263,9 @@ def _supervise(channel):
             except subprocess.TimeoutExpired:
                 answer = dict(timed_out=True)
             except (ValueError, OSError):
-                answer = dict(ok=False, code='screenshot_failed', error='The isolated client screenshot could not be captured.')
+                answer = (dict(ok=False, code='keyboard_failed', error='The isolated client shortcut could not be delivered.')
+                          if message['action'] == 'keyboard' else
+                          dict(ok=False, code='screenshot_failed', error='The isolated client screenshot could not be captured.'))
             _send(channel, answer)
     except EOFError:
         return 0

@@ -173,6 +173,9 @@ def _worker(message):
     if message['action'] == 'screenshot':
         from _screenshot_windows import capture_windows
         return capture_windows(dict(request, isolated=True))
+    if message['action'] == 'keyboard':
+        from _keyboard import dispatch
+        return dispatch(dict(request, isolated=True))
     from _native_window import active_secondary_window, close_secondary_window
     if message['action'] == 'active_window':
         return {'window': active_secondary_window(request['pid'])}

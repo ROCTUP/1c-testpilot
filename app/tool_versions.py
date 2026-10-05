@@ -29,6 +29,7 @@ TOOL_MIN_VERSION = {
     'tc_click_view_status_item':             '8.3.16',
     'tc_close_drop_list':                    '8.3.6',
     'tc_close_user_messages_panel':          '8.3.6',
+    'tc_open_user_messages_panel':           '8.3.6',
     'tc_compare_snapshot':                   '8.3.3',
     'tc_close_window':                       '8.3.3',
     'tc_collapse':                           '8.3.1',

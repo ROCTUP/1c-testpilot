@@ -1836,6 +1836,8 @@ class TestClient:
         self._buf = b''
         self._pending = 0
         vars(self).pop('_pending_reply_callback', None)
+        vars(self).pop('_command_catalogues', None)
+        vars(self).pop('_command_main_window', None)
         self._direct_session = False
         self._first_binary = False
 
