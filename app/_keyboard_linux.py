@@ -44,7 +44,17 @@ def send(request):
             raise KeyboardError('keyboard_window_changed', 'The focused window is not the addressed 1C window.')
         if attributes.map_state != X.IsViewable:
             raise KeyboardError('keyboard_window_unavailable', 'The client window is not visible.')
-        names = {'ENTER': 'Return', 'ESC': 'Escape', 'TAB': 'Tab', 'SPACE': 'space'}
+        names = {'ENTER': 'Return', 'ESC': 'Escape', 'TAB': 'Tab', 'SPACE': 'space',
+                 'BACKSPACE': 'BackSpace', 'INSERT': 'Insert', 'DELETE': 'Delete',
+                 'HOME': 'Home', 'END': 'End', 'PAGEUP': 'Prior', 'PAGEDOWN': 'Next',
+                 'LEFT': 'Left', 'RIGHT': 'Right', 'UP': 'Up', 'DOWN': 'Down',
+                 'BACKQUOTE': 'grave', 'MINUS': 'minus', 'EQUALS': 'equal',
+                 'LBRACKET': 'bracketleft', 'RBRACKET': 'bracketright', 'BACKSLASH': 'backslash',
+                 'SEMICOLON': 'semicolon', 'QUOTE': 'apostrophe', 'COMMA': 'comma',
+                 'PERIOD': 'period', 'SLASH': 'slash', 'NUMPAD_ADD': 'KP_Add',
+                 'NUMPAD_SUBTRACT': 'KP_Subtract', 'NUMPAD_MULTIPLY': 'KP_Multiply',
+                 'NUMPAD_DIVIDE': 'KP_Divide', 'NUMPAD_DECIMAL': 'KP_Decimal',
+                 'NUMPAD_ENTER': 'KP_Enter', **{f'NUMPAD_{i}': f'KP_{i}' for i in range(10)}}
         key = request['keys'][-1]
         keysym = XK.string_to_keysym(names.get(key, key.lower() if len(key) == 1 else key))
         code = d.keysym_to_keycode(keysym)

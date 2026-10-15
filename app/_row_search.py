@@ -107,7 +107,9 @@ def search(S, c, key, handle, conditions, columns, case_sensitive, max_rows, max
                     message='Search could not be completed. No conclusion about absent rows can be drawn.')
     rows = read.get('rows')
     count = read.get('row_count')
-    if (not isinstance(rows, list) or type(count) is not int or count < len(rows)
+    count_valid = ((count is None and read.get('truncated') is True)
+                   or (type(count) is int and isinstance(rows, list) and count >= len(rows)))
+    if (not isinstance(rows, list) or not count_valid
             or any(not isinstance(r, dict) for r in rows)):
         return fail('rows_unavailable', 'The table read did not return a usable row set.')
     available = list(dict.fromkeys(k for r in rows for k in r))

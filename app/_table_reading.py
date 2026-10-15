@@ -35,14 +35,19 @@ def helper_state(R, c, key):
 
 
 class Reader:
-    def __init__(self, R, c, key, handle, window, result):
+    def __init__(self, R, c, key, handle, window, result, *, deadline=None, restore_deadline=None):
         self.R, self.c, self.key, self.handle = R, c, key, handle
         self.window, self.result = window, result
+        self.deadline, self.restore_deadline = deadline, restore_deadline
+        self.complete = True
 
-    def call(self, name, **kw):
-        deadline = vars(self.c).get('_io_deadline')
+    def check_time(self):
+        deadline = self.deadline if self.deadline is not None else vars(self.c).get('_io_deadline')
         if deadline is not None and time.monotonic() >= deadline:
             self.fail('row_read_timeout', 'The table reading deadline expired.')
+
+    def call(self, name, **kw):
+        self.check_time()
         return self.R._cell_step(getattr(self.R, 'tc_' + name)(self.key, handle=self.handle, **kw),
                                  'Table reading failed: ' + name)
 
@@ -53,7 +58,9 @@ class Reader:
         return self.call('get_selected_rows')['rows']
 
     def guard(self):
+        self.check_time()
         self.R._cell_window(self.c, self.window)
+        self.check_time()
         if self.R._cell_flag(self.c, self.R.G.CURRENT_MODE_IS_EDIT, self.key, self.handle) is not False:
             self.fail('row_edit_pending', 'Row editing started during table reading.')
 
@@ -66,12 +73,14 @@ class Reader:
             self.fail('selection_cleanup_failed', 'The current row selection was not cleared.')
 
     def current_exists(self, state):
+        self.check_time()
         if state is not None:
             return state['has_current_row']
         if self.R._guid_available(self.c, self.R.G.GET_CURRENT_ROW):
             return bool(self.call('get_current_row')['row'])
         # A successful, non-null cell read proves a current row, including empty text.
         for column in self.R._table_columns(self.c, self.key):
+            self.check_time()
             try:
                 value = self.R.tc_get_cell_text(self.key, handle=self.handle, column=column['name'])
             except tc1c.OperationError as exc:
@@ -84,10 +93,18 @@ class Reader:
                 self.R._cell_step(value, 'The current table row could not be checked.')
         return False
 
-    def read(self, state, *, allow_sequential=True, selection_verified_empty=False):
+    def bulk_rows(self):
+        self.call('select_all_rows')
+        # On Linux a newly opened dynamic list can initially select only the two
+        # endpoints. Repeat selection before fetching the rows; no intermediate
+        # read is needed, so even a large list is transferred only once.
+        # Do not infer the client's OS from the host running this Python process.
+        self.call('select_all_rows')
+        return self.rows()
+
+    def read(self, state, *, allow_sequential=True, selection_verified_empty=False, max_rows=None):
         if state is None or state['selection_mode'] == 'multiple':
-            self.call('select_all_rows')
-            rows = self.rows()
+            rows = self.bulk_rows()
             if len(rows) > 1 or state is not None or (selection_verified_empty and rows):
                 return rows
         # Never address an unavailable current row with an unqualified GotoRow.
@@ -116,17 +133,16 @@ class Reader:
             self.fail('selection_state_unavailable', 'A single current row could not be selected.')
         if state is None:
             self.clear_current()
-            self.call('select_all_rows')
-            rows = self.rows()
+            rows = self.bulk_rows()
             if rows:
                 return rows
             self.call('goto_row')
         if not allow_sequential:
             self.fail('table_requires_sequential_read',
                       'This table requires sequential row reading. Use read_rows; its rows cannot be included in a stable form snapshot.')
-        return self.walk(current[0])
+        return self.walk(current[0], max_rows=max_rows)
 
-    def walk(self, original):
+    def walk(self, original, *, max_rows=None):
         # Selection marks movement, not row contents: identical rows are distinct.
         offset = 0
         at_first = False
@@ -153,6 +169,11 @@ class Reader:
                     return result
                 if len(rows) != 1:
                     self.fail('selection_state_unavailable', 'Single-row navigation selected multiple rows.')
+                if max_rows is not None and len(result) >= max_rows:
+                    # This additional row proves truncation without counting the
+                    # rest of the list or inventing an exact total.
+                    self.complete = False
+                    return result
                 if len(result) >= SCAN_LIMIT:
                     self.fail('row_scan_limit', 'Sequential table reading exceeds 10000 rows.')
                 result.extend(rows)
@@ -165,6 +186,7 @@ class Reader:
             # with an unread answer makes further navigation unsafe.
             if at_first and not vars(self.c).get('_pending'):
                 try:
+                    self.deadline = self.restore_deadline
                     self.guard()
                     self.call('goto_first_row')
                     for _ in range(offset):

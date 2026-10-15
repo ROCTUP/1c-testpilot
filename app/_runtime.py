@@ -100,7 +100,7 @@ class Runtime:
     def call(self, action, arguments):
         group = _ACTION_GROUP[action]
         offline_check = action == 'run_compatible_scenario' and arguments.get('check_only') is True
-        if action not in ('connect', 'launch_client', 'list_connections', 'list_profiles') and not offline_check and not self.pool.entries:
+        if action not in ('connect', 'launch_client', 'list_connections', 'list_profiles', 'list_shortcuts') and not offline_check and not self.pool.entries:
             return {'ok': False, 'code': 'not_connected', 'error': 'Connect to or launch a test client first.'}
         token = _execution.set(self)
         try:
@@ -2495,8 +2495,9 @@ def tc_deselect_all_rows(key: str, handle: str) -> dict:
 def tc_read_rows(key: str, handle: str, max_rows: int = 500,
                  columns: _row_search.Columns = None,
                  text_format: typing.Literal['plain', 'raw'] = 'plain') -> dict:
-    """Read selectable rows within current filters/collapsed groups: row_count and at most max_rows (0:
-    count only), unordered. columns selects returned titles; plain strips known search highlighting,
+    """Read up to max_rows within current filters/collapsed groups (0: full count only), unordered.
+    row_count is null when a sequential read is truncated; truncated signals more rows.
+    columns selects returned titles; plain strips known search highlighting,
     raw retains it. Temporarily selects rows, then clears ALL previous selection. Keeps a usable
     current row; older platforms may move an unavailable cursor to first (cursor_repositioned=true).
     Single-selection tables are read sequentially (10000-row, 180-second scan limits), restoring
@@ -2517,11 +2518,18 @@ def tc_read_rows(key: str, handle: str, max_rows: int = 500,
         return dict(error, selection_changed=False)
     result = {'ok': False, 'target': key, 'rows': [], 'row_count': None,
               'selection_cleared': None, 'scope': 'selectable_rows'}
+    rows = None
     attempted = False
     window = None
     record_mark = None
     old_deadline = vars(c).get('_io_deadline')
-    c._io_deadline = min(old_deadline or float('inf'), time.monotonic() + 180)
+    started = time.monotonic()
+    c._io_deadline = min(old_deadline if old_deadline is not None else float('inf'), started + 180)
+    budget = max(0, c._io_deadline - started)
+    # Stop starting read steps before the transport deadline, leaving time for
+    # cursor restoration and cleanup. In-flight requests retain the full deadline.
+    read_deadline = c._io_deadline - min(30, budget / 4)
+    restore_deadline = c._io_deadline - min(5, budget / 10)
     try:
         error = _table_page_error(c, key)
         if error:
@@ -2551,15 +2559,19 @@ def tc_read_rows(key: str, handle: str, max_rows: int = 500,
         if not _guid_available(c, G.DESELECT_ALL_ROWS):
             _table_activate(c, key, handle, window)
         attempted = True
-        rows = _table_reading.Reader(sys.modules[__name__], c, key, handle, window, result).read(selection_state)
-        result.update(row_count=len(rows))
+        reader = _table_reading.Reader(sys.modules[__name__], c, key, handle, window, result,
+                                      deadline=read_deadline, restore_deadline=restore_deadline)
+        rows = reader.read(selection_state, max_rows=max_rows or None)
+        result.update(row_count=len(rows) if reader.complete else None)
         selected = _row_search.project(rows[:max_rows], columns, text_format, titles) if max_rows else []
-        result.update(ok=True, rows=selected, row_count=len(rows),
-                      returned_rows=min(len(rows), max_rows), truncated=len(rows) > max_rows)
+        result.update(ok=True, rows=selected,
+                      returned_rows=min(len(rows), max_rows), truncated=not reader.complete or len(rows) > max_rows)
     except Exception as exc:
         details = exc.result() if isinstance(exc, tc1c.OperationError) else getattr(exc, 'details', {})
         if isinstance(exc, _row_search.OutputError):
             details = {'code': exc.code}
+        elif isinstance(exc, TimeoutError):
+            details = {'code': 'row_read_timeout'}
         result.update(details, ok=False, error=str(exc))
     finally:
         if attempted:
@@ -2571,7 +2583,11 @@ def tc_read_rows(key: str, handle: str, max_rows: int = 500,
                     raise RuntimeError('Row editing started or could not be checked; it was left untouched.')
                 if _guid_available(c, G.DESELECT_ALL_ROWS):
                     _cell_step(tc_deselect_all_rows(key, handle), 'Selection could not be cleared.')
-                elif _cell_step(tc_get_selected_rows(key, handle), 'Selection could not be checked.')['rows']:
+                elif (bool(rows) if rows is not None else
+                      bool(_cell_step(tc_get_selected_rows(key, handle), 'Selection could not be checked.')['rows'])):
+                    # A successful read already establishes whether rows exist.
+                    # Fetching selection here would transfer the entire table again.
+                    # Failed reads still need a fresh check before addressing a row.
                     # No search condition: the cursor stays on the same row, even for duplicate rows.
                     reduced = tc_goto_row(key, handle=handle)
                     if (not reduced.get('ok') and reduced.get('status_code') == 13
@@ -2599,11 +2615,15 @@ def tc_read_rows(key: str, handle: str, max_rows: int = 500,
                     raise RuntimeError('The table still has selected rows.')
                 result['selection_cleared'] = True
             except Exception as exc:
+                cleanup_error = 'Table selection could not be cleared: ' + str(exc)
                 if result.get('error'):
-                    result['read_error'] = result['error']
-                result.update(ok=False, code='selection_cleanup_failed', selection_cleared=False,
-                              error='Table selection could not be cleared: ' + str(exc),
-                              suggested_action='get_selected_rows')
+                    result.setdefault('code', 'table_read_failed')
+                    result['selection_cleanup_error'] = cleanup_error
+                else:
+                    result.update(code='selection_cleanup_failed', error=cleanup_error,
+                                  suggested_action='get_selected_rows')
+                result.update(ok=False, selection_cleared=False,
+                              response_pending=bool(vars(c).get('_pending')))
         if record_mark is not None:
             try:
                 _native_composite_end(c, record_mark)
@@ -3314,14 +3334,58 @@ def tc_get_command_interface(key: str = None, all_sections: bool = False,
                              limit: int = 50, offset: int = 0,
                              refresh: bool = False, timeout: float = 120) -> dict:
     """Read the current command tree of key (default: main application window), without clicking.
-    all_sections=true scans all sections-panel buttons and returns command counts; it changes menus, then
-    attempts to restore them. Stops if a section changes application windows; check complete/restored.
+    all_sections=true waits for stable windows/menu, then scans sections and returns command counts; it changes menus, then
+    attempts to restore them. Stops on window changes; check complete/restored and window_changes inside scan_error/restoration_error.
+    Incomplete results stay cached; inspect the window state before refresh=true. No section read means ok=false.
     With all_sections=true, section (returned identifier or exact title) or search (path substring)
     returns cached commands, paged by limit=1..200 and offset; continue with next_offset.
     Commands contain title, path and url: pass url to execute_command. refresh=true repeats the scan;
     catalogues are kept until disconnect (up to 20 windows). timeout limits a scan in seconds (0 < timeout <= 3600)."""
     return _command_interface.get(sys.modules[__name__], _need(), key, all_sections,
                                   section, search, limit, offset, refresh, timeout)
+
+@_action('tc_keyboard')
+def tc_list_shortcuts(search: str = None, category: str = None, limit: int = 20, offset: int = 0) -> dict:
+    """Browse standard 1C shortcuts offline (omit connection_id): search English/Russian descriptions or key names;
+    category filters by a returned category. Page with limit=1..100 and next_offset.
+    Each alternatives entry is a keys array for send_keys. Context/focus matters; the catalogue
+    contains standard managed-application PC shortcuts; availability depends on the platform version and configuration."""
+    from _keyboard_shortcuts import catalogue
+    return catalogue(search, category, limit, offset)
+
+
+@_action('tc_keyboard')
+def tc_send_keys(keys: list[str], key: str = None, handle: str = None) -> dict:
+    """Send one chord to local 1C. Without key, use the active window and focused control.
+    key addresses a window, managed form, input field or table: activates its window and,
+    for fields/tables, verifies focus before sending. Table columns are not targets.
+    Activation can finish pending input and switch pages; previous focus is not restored.
+    keys: zero or more CTRL/SHIFT/ALT modifiers followed by one key, e.g. ["CTRL","SHIFT","BACKQUOTE"]
+    toggles panels. Letters A..Z, digits, F1..F12, ENTER/ESC/TAB, arrows, HOME/END,
+    PAGEUP/PAGEDOWN, INSERT/DELETE/BACKSPACE and punctuation/keypad names from list_shortcuts.
+    Requires Windows or Linux/X11 and local desktop access; on a shared desktop 1C must have focus.
+    Successful delivery does not prove command success: read the resulting state.
+    May edit data, open dialogs or close windows.
+    Not text input; use input_text for text. Chords need not appear in list_shortcuts."""
+    import _keyboard
+    try:
+        chord = _keyboard.combination(keys)
+        c = _need()
+        if key is not None:
+            # Check before activating even the owning window: a focus change can
+            # otherwise discard the evidence of a lost editing buffer.
+            error = _check_pending_text_input(c)
+            if error:
+                return error
+        wk = (_keyboard.activate_target(sys.modules[__name__], c, key, handle)
+              if key is not None else _winkey(c))
+        _keyboard.send_shortcut(sys.modules[__name__], c, wk, chord)
+        return dict(ok=True, sent=True, keys=list(chord))
+    except _keyboard.KeyboardError as exc:
+        return dict(ok=False, code=exc.code, error=str(exc))
+    finally:
+        _state['window_key'] = None
+
 
 @_action('tc_window')
 def tc_get_user_message_texts(key: str = None, handle: str = None, open_if_closed: bool = True) -> dict:
@@ -7043,6 +7107,7 @@ _GROUP_DOC = {
     'tc_session':  'Connect to, launch or stop the 1C test client.',
     'tc_scenario': 'Record and replay UI scenarios.',
     'tc_app':      'Application-level state: active window, child objects, errors, dialogs, limits.',
+    'tc_keyboard': 'Send a keyboard chord to the local 1C client or browse standard shortcuts offline.',
 }
 _ACTION_GROUP = {a: g for g, acts in _ACTIONS.items() for a in acts}
 
@@ -7251,7 +7316,7 @@ _LOG_CHANGING = _VERIFY_ACTIONS | frozenset({
     'connect', 'launch_client', 'disconnect', 'stop_client', 'close_window', 'activate_window',
     'goto_next_window', 'goto_previous_window', 'goto_start_page',
     'execute_command', 'answer_dialog', 'close_user_messages_panel', 'open_user_messages_panel',
-    'get_user_message_texts', 'choose_user_message',
+    'get_user_message_texts', 'choose_user_message', 'send_keys',
     'set_fields', 'set_row_values', 'add_rows', 'set_cell_text', 'set_area_text', 'run_scenario',
     'get_list_settings', 'get_list_settings_fields', 'set_list_settings',
     'select_value',
@@ -7447,7 +7512,7 @@ def _dispatch_action(acts, group, kw):
     try:
         if name not in acts:
             return _dispatch_connected_action(acts, group, kw)
-        if name in ('connect', 'launch_client', 'list_connections', 'list_profiles') or (
+        if name in ('connect', 'launch_client', 'list_connections', 'list_profiles', 'list_shortcuts') or (
                 name == 'disconnect' and kw.get('force') is True):
             # The processing path is a launch setting consumed below, not a handler argument.
             arguments = ({k: v for k, v in kw.items() if k != 'code_epf'}
@@ -7457,10 +7522,10 @@ def _dispatch_action(acts, group, kw):
                 return _deliver(argument_error)
         if name == 'run_compatible_scenario' and kw.get('check_only') is True and connection_id is None:
             return _dispatch_connected_action_impl(acts, group, kw)
-        if name in ('list_connections', 'list_profiles'):
+        if name in ('list_connections', 'list_profiles', 'list_shortcuts'):
             if connection_id is not None:
                 raise _connections.ConnectionError('invalid_connection_id', f'{name} does not select a connection; omit connection_id.')
-            if name == 'list_profiles':
+            if name in ('list_profiles', 'list_shortcuts'):
                 return _dispatch_connected_action_impl(acts, group, kw)
             return _dispatch_connected_action(acts, group, kw)
         if name in ('connect', 'launch_client'):

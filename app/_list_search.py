@@ -31,9 +31,11 @@ def search_fields(S, objects, key):
 
 def fingerprint(result):
     rows, count = result.get('rows'), result.get('row_count')
-    if (not isinstance(rows, list) or type(count) is not int or count < len(rows)
+    count_valid = ((count is None and result.get('truncated') is True)
+                   or (type(count) is int and isinstance(rows, list) and count >= len(rows)
+                       and result.get('truncated') == (count > len(rows))))
+    if (not isinstance(rows, list) or not count_valid
             or type(result.get('truncated')) is not bool
-            or result['truncated'] != (count > len(rows))
             or any(not isinstance(row, dict) or any(not isinstance(k, str) or not isinstance(v, str)
                                                   for k, v in row.items()) for row in rows)):
         raise B.Failure('rows_unavailable', 'The table did not return a usable row set.')

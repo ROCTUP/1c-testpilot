@@ -46,7 +46,15 @@ def send(request):
         raise KeyboardError('keyboard_window_not_foreground', 'Bring the addressed 1C window to the foreground and retry.')
     modifiers = {'CTRL': (C.VK_CONTROL, C.VK_LCONTROL), 'SHIFT': (C.VK_SHIFT, C.VK_LSHIFT),
                  'ALT': (C.VK_MENU, C.VK_LMENU)}
-    special = {'ENTER': C.VK_RETURN, 'ESC': C.VK_ESCAPE, 'TAB': C.VK_TAB, 'SPACE': C.VK_SPACE}
+    special = {'ENTER': 13, 'ESC': 27, 'TAB': 9, 'SPACE': 32, 'BACKSPACE': 8,
+               'INSERT': 45, 'DELETE': 46, 'HOME': 36, 'END': 35, 'PAGEUP': 33,
+               'PAGEDOWN': 34, 'LEFT': 37, 'UP': 38, 'RIGHT': 39, 'DOWN': 40,
+               'BACKQUOTE': 0xC0, 'MINUS': 0xBD, 'EQUALS': 0xBB, 'LBRACKET': 0xDB,
+               'RBRACKET': 0xDD, 'BACKSLASH': 0xDC, 'SEMICOLON': 0xBA,
+               'QUOTE': 0xDE, 'COMMA': 0xBC, 'PERIOD': 0xBE, 'SLASH': 0xBF,
+               'NUMPAD_ADD': 107, 'NUMPAD_SUBTRACT': 109, 'NUMPAD_MULTIPLY': 106,
+               'NUMPAD_DIVIDE': 111, 'NUMPAD_DECIMAL': 110, 'NUMPAD_ENTER': 13,
+               **{f'NUMPAD_{i}': 96+i for i in range(10)}}
     key = request['keys'][-1]
     vk = special.get(key) or (C.VK_F1 + int(key[1:]) - 1 if len(key) > 1 and key.startswith('F') else ord(key))
     if not request.get('isolated') and any(u.GetAsyncKeyState(k) & 0x8000 for k in
@@ -61,9 +69,13 @@ def send(request):
     pressed = False
     scan = win32api.MapVirtualKey(vk, 0)
     alt = 'ALT' in request['keys'][:-1]
-    down = C.WM_SYSKEYDOWN if alt else C.WM_KEYDOWN
-    up = C.WM_SYSKEYUP if alt else C.WM_KEYUP
-    flags = 1 | (scan << 16) | ((1 << 29) if alt else 0)
+    # F10 also uses system-key messages, even without Alt (Win32 WM_SYSKEYDOWN).
+    system = alt or key == 'F10'
+    down = C.WM_SYSKEYDOWN if system else C.WM_KEYDOWN
+    up = C.WM_SYSKEYUP if system else C.WM_KEYUP
+    extended = key in ('INSERT', 'DELETE', 'HOME', 'END', 'PAGEUP', 'PAGEDOWN',
+                       'LEFT', 'RIGHT', 'UP', 'DOWN', 'NUMPAD_DIVIDE', 'NUMPAD_ENTER')
+    flags = 1 | (scan << 16) | (int(extended) << 24) | ((1 << 29) if alt else 0)
     try:
         captured = bool(u.GetKeyboardState(old))
         if not captured:

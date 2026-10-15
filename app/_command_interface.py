@@ -10,12 +10,44 @@ import guids as G
 MAX_WINDOWS = 20
 MAX_ELEMENTS = 10000
 MAX_BYTES = 4 * 1024 * 1024
+# A quiet interval reduces startup races; it cannot rule out a later application event.
+STABLE_SECONDS = 2.0
+POLL_INTERVAL = 0.5
 
 
 class Failure(RuntimeError):
-    def __init__(self, code, message):
+    def __init__(self, code, message, **details):
         super().__init__(message)
         self.code = code
+        self.details = details
+
+
+def _pause(client):
+    remaining = client._io_deadline - time.monotonic()
+    if remaining <= 0:
+        raise Failure('command_interface_not_ready',
+                      'Windows and the command interface did not settle before the deadline. Retry when startup finishes.')
+    time.sleep(min(POLL_INTERVAL, remaining))
+
+
+def _window_description(row):
+    return dict(key=row[0], title=row[1], url=row[2])
+
+
+def _window_changes(before, after):
+    old, new = ({row[0]: row for row in state[1]} for state in (before, after))
+    changes = {}
+    for name, source, other in (('opened', new, old), ('closed', old, new)):
+        rows = [_window_description(row) for key, row in source.items() if key not in other]
+        if rows:
+            changes[name] = rows
+    updated = [dict(before=_window_description(old[key]), after=_window_description(row))
+               for key, row in new.items() if key in old and old[key] != row]
+    if updated:
+        changes['updated'] = updated
+    if before[0] != after[0]:
+        changes['active_window'] = dict(before=before[0], after=after[0])
+    return changes
 
 
 def is_cached(client, key=None, all_sections=False, refresh=False):
@@ -110,6 +142,46 @@ class Reader:
         return active['key'], sorted((w['key'], w.get('title') or '', w.get('url') or '')
                                      for w in self.R._read_open_windows(self.c))
 
+    def stable(self):
+        previous, since = None, None
+        while time.monotonic() < self.c._io_deadline:
+            before = self.windows()
+            items = self.tree()
+            after = self.windows()
+            state = after, _signature(items)
+            now = time.monotonic()
+            if before != after or state != previous:
+                since = now
+            elif now - since >= STABLE_SECONDS:
+                return items, after
+            previous = state
+            _pause(self.c)
+        raise Failure('command_interface_not_ready',
+                      'Windows and the command interface did not settle before the deadline. Retry when startup finishes.')
+
+    def check_windows(self, before, *, restoring=False):
+        after = self.windows()
+        if after == before:
+            return
+        changes = _window_changes(before, after)
+        # Identify new forms only on failure, without adding reads to normal scanning.
+        for window in changes.get('opened', []):
+            if (getattr(self.c, '_pending', 0) or time.monotonic() >= self.c._io_deadline
+                    or not hasattr(self.R, '_form_title')):
+                break
+            try:
+                title, form = self.R._form_title(self.c, window['key'])
+                if title and not window['title']:
+                    window['title'] = title
+                if form:
+                    window['form_name'] = form
+            except Exception:
+                break  # Keep the observed change even if its optional description fails.
+        raise Failure('window_changed' if restoring else 'section_changed_window',
+                      'Window state changed; the original menu was not restored.' if restoring else
+                      'Window state changed during the scan. Inspect window_changes; no form was closed.',
+                      window_changes=changes)
+
     def click(self, section):
         try:
             for kind in ('action', 'commit'):
@@ -120,25 +192,26 @@ class Reader:
             self.R._state['window_key'] = None
 
     def scan(self):
-        initial = self.tree()
+        initial, before = self.stable()
         sections = _sections(initial)
         selected = _selected(initial, sections)
-        before = self.windows()
         catalogue = dict(sections=[dict(section=_section_id(s), title=s.get('title') or '',
                                          command_count=None, read=False) for s in sections],
                          entries=[], complete=False, restored=False)
         current_section = None
         try:
+            if not sections:
+                raise Failure('sections_unavailable', 'No section buttons are available in this window.')
             for section, row in zip(sections, catalogue['sections']):
                 current_section = section
                 current = self.tree()
                 opened = _selected(current, sections)
+                self.check_windows(before)
                 if opened is None or opened['key'] != section['key']:
                     self.click(section)
-                if self.windows() != before:
-                    raise Failure('section_changed_window',
-                                  'Opening this section changed application windows. Inspect the active window; no form was closed.')
+                self.check_windows(before)
                 current = self.tree()
+                self.check_windows(before)
                 opened = _selected(current, sections)
                 if opened is None or opened['key'] != section['key']:
                     raise Failure('section_menu_unavailable', 'The section did not expose its command menu.')
@@ -151,30 +224,45 @@ class Reader:
             catalogue['complete'] = True
         except Exception as exc:
             catalogue['scan_error'] = dict(code=getattr(exc, 'code', 'section_scan_failed'), error=str(exc),
-                                           section=_section_id(current_section) if current_section else None)
+                                           section=_section_id(current_section) if current_section else None,
+                                           **getattr(exc, 'details', {}))
         # Never send more commands after a timeout or after a section opened a form.
         try:
+            changes = catalogue.get('scan_error', {}).get('window_changes')
+            if changes:
+                raise Failure('window_changed', 'Window state changed; the original menu was not restored.',
+                              window_changes=changes)
             if getattr(self.c, '_pending', 0) or time.monotonic() >= self.c._io_deadline:
                 raise Failure('restoration_unavailable', 'No safe time remains to restore the menu.')
-            if self.windows() != before:
-                raise Failure('window_changed', 'Application windows changed; the new window was left open.')
+            self.check_windows(before, restoring=True)
             current = self.tree()
             opened = _selected(current, sections)
             if selected is None and opened is not None:
                 self.click(opened)
             elif selected is not None and (opened is None or selected['key'] != opened['key']):
                 self.click(selected)
-            catalogue['restored'] = self.windows() == before and _signature(self.tree()) == _signature(initial)
+            self.check_windows(before, restoring=True)
+            restored = _signature(self.tree()) == _signature(initial)
+            self.check_windows(before, restoring=True)
+            catalogue['restored'] = restored
             if not catalogue['restored']:
                 raise Failure('restoration_unverified', 'The original window and command menu state could not be verified.')
         except Exception as exc:
-            catalogue['restoration_error'] = dict(code=getattr(exc, 'code', 'restoration_failed'), error=str(exc))
+            catalogue['restoration_error'] = dict(code=getattr(exc, 'code', 'restoration_failed'), error=str(exc),
+                                                  **getattr(exc, 'details', {}))
         return catalogue
 
 
 def page(catalogue, section, search, limit, offset):
     result = {k: deepcopy(v) for k, v in catalogue.items() if k != 'entries'}
     result.update(ok=True, total_commands=len(catalogue['entries']))
+    if not catalogue['complete']:
+        result.update(refresh_required=True,
+                      message='The saved catalogue is incomplete. Inspect scan_error and the window state, then call '
+                              'get_command_interface with all_sections=true, refresh=true. Search and paging do not retry the scan.')
+        if not any(s['read'] for s in catalogue['sections']):
+            result.update(ok=False, code='command_catalogue_incomplete',
+                          error='No section was read. See scan_error for the reason; this is not an empty catalogue.')
     if section is None and search is None:
         return result
     entries = catalogue['entries']
@@ -212,8 +300,20 @@ def get(R, c, key, all_sections, section, search, limit, offset, refresh, timeou
             if key is not None:
                 window = R._winkey(c, key)
             else:
-                mains = [w for w in R._read_open_windows(c) if w.get('class') == 'MainFrame'
-                         and not R._code_execution.protected(c, w.get('key'))]
+                while True:
+                    try:
+                        windows = R._read_open_windows(c)
+                    except RuntimeError as exc:
+                        # This received startup refusal is safe to retry; transport failures are not.
+                        if (not all_sections or getattr(c, '_pending', 0)
+                                or str(exc) != 'Could not read application windows.'):
+                            raise
+                        windows = []
+                    mains = [w for w in windows if w.get('class') == 'MainFrame'
+                             and not R._code_execution.protected(c, w.get('key'))]
+                    if mains or not all_sections:
+                        break
+                    _pause(c)
                 if len(mains) != 1:
                     raise Failure('main_window_unavailable', 'Specify the application window explicitly.')
                 window = mains[0]['key']
@@ -232,4 +332,4 @@ def get(R, c, key, all_sections, section, search, limit, offset, refresh, timeou
         finally:
             c._io_deadline = old_deadline
     except Failure as exc:
-        return dict(ok=False, code=exc.code, error=str(exc))
+        return dict(ok=False, code=exc.code, error=str(exc), **exc.details)
