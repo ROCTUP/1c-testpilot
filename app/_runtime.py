@@ -3382,7 +3382,7 @@ def tc_send_keys(keys: list[str], key: str = None, handle: str = None) -> dict:
         _keyboard.send_shortcut(sys.modules[__name__], c, wk, chord)
         return dict(ok=True, sent=True, keys=list(chord))
     except _keyboard.KeyboardError as exc:
-        return dict(ok=False, code=exc.code, error=str(exc))
+        return dict(ok=False, code=exc.code, error=str(exc), **exc.details)
     finally:
         _state['window_key'] = None
 
