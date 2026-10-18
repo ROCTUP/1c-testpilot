@@ -20,9 +20,10 @@ SUPPORTED_KEYS = tuple('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') + tuple(
 
 
 class KeyboardError(RuntimeError):
-    def __init__(self, code, message):
+    def __init__(self, code, message, **details):
         super().__init__(message)
         self.code = code
+        self.details = details
 
 
 def combination(keys):
@@ -99,7 +100,8 @@ def activate_target(runtime, client, key, handle=None):
         active = runtime._window(client)
         if not active.get('ok') or not _same_window(active.get('key'), window_key):
             raise KeyboardError('keyboard_window_not_active',
-                                'The addressed window did not become active. No keys were sent; inspect the active window.')
+                                'The addressed window did not become active. No keys were sent; inspect the active window.',
+                                expected_window=window_key, active_window=active.get('key'))
 
     activate(window_key)
     verify_window()
@@ -121,7 +123,8 @@ def send_shortcut(runtime, client, window_key, keys):
     pid, created = _local_process(client)
     active = runtime._window(client)
     if not active.get('ok') or not _same_window(active.get('key'), window_key):
-        raise KeyboardError('keyboard_window_not_active', 'Activate the addressed 1C window before sending a shortcut.')
+        raise KeyboardError('keyboard_window_not_active', 'Activate the addressed 1C window before sending a shortcut.',
+                            expected_window=window_key, active_window=active.get('key'))
     request = dict(pid=pid, created=created, keys=keys, title=active.get('title') or '')
     remaining = 5.0
     deadline = getattr(client, '_io_deadline', None)
