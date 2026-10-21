@@ -39,8 +39,8 @@ def combination(keys):
 
 
 def _local_process(client):
-    if sys.platform not in ('win32', 'linux'):
-        raise KeyboardError('keyboard_platform_unsupported', 'Local shortcuts require Windows or Linux with X11.')
+    if sys.platform not in ('win32', 'linux', 'darwin'):
+        raise KeyboardError('keyboard_platform_unsupported', 'Local shortcuts require Windows, Linux with X11 or macOS.')
     try:
         pid, created = resolve_process(client)
     except CaptureError as exc:
@@ -150,11 +150,13 @@ def dispatch(request):
     try:
         request = dict(request, keys=combination(request['keys']))
         process = psutil.Process(request['pid'])
-        names = ('1cv8', '1cv8c') if sys.platform == 'linux' else ('1cv8.exe', '1cv8c.exe')
+        names = ('1cv8.exe', '1cv8c.exe') if sys.platform == 'win32' else ('1cv8', '1cv8c')
         if process.create_time() != request['created'] or process.name().lower() not in names:
             raise KeyboardError('keyboard_client_changed', 'The connected client process changed.')
         if sys.platform == 'win32':
             from _keyboard_windows import send
+        elif sys.platform == 'darwin':
+            from _keyboard_macos import send
         else:
             from _keyboard_linux import send
         send(request)
