@@ -431,7 +431,7 @@ tc_table(action="set_list_settings", ref="…",
 | `connect` | `ТестируемоеПриложение` · УстановитьСоединение (`Connect`) | `ТестируемоеПриложение` | `port=None, host='127.0.0.1', version=None, profile=None` |
 | `disconnect` | `ТестируемоеПриложение` · РазорватьСоединение (`Disconnect`) | `ТестируемоеПриложение` | `—` |
 | `get_logging_status` | Состояние журнала MCP-вызовов | — | `—` |
-| `launch_client` | — | — | `base=None, port=None, server=False, user=None, password=None, version=None, exe=None, extra_args=None, wait=60, connect=True, desktop='default', profile=None` |
+| `launch_client` | — | — | `base=None, port=None, server=False, user=None, password=None, version=None, exe=None, extra_args=None, wait=120, connect=True, desktop='default', profile=None` |
 | `list_connections` | — | — | `—` |
 | `list_profiles` | — | — | `—` |
 | `start_logging` | Начать журнал вызовов: JSONL и выбранные HTML/Allure-отчёты | — | `screenshot_mode=None, reports=None` |
