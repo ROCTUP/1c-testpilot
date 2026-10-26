@@ -2644,7 +2644,9 @@ def tc_search(key: str, handle: str, text: str, max_rows: int = 500,
     input readback and two equal row reads settle_time seconds apart; stability is not a platform
     completion signal. max_rows=1..10000; truncated means more rows. 0<settle_time<timeout<=3600;
     timeout covers the action. columns selects titles; raw retains search highlighting. Reading
-    clears selection; unfinished edits refuse."""
+    clears selection; unfinished edits refuse. An external search string is located with Ctrl+F
+    on a local client; this changes focus. A newly opened native Find dialog is closed without
+    searching and returns search_dialog_required. Remote clients require a search string inside the table."""
     c = _need()
     return _list_search.run(sys.modules[__name__], c, key, handle, text, max_rows, timeout, settle_time,
                             columns, text_format)
@@ -2656,8 +2658,9 @@ def tc_find_rows(key: str, handle: str, conditions: _row_search.Conditions,
                  max_rows: int = 500, max_matches: int = 50,
                  text_format: typing.Literal['plain', 'raw'] = 'plain') -> dict:
     """Search selectable rows of the CURRENT table, respecting filters/collapsed groups;
-    never a database-wide search. conditions is an AND-list of {column: displayed TITLE, text, match:
-    exact/contains/starts_with/ends_with}; literal, case-insensitive by default. Ignore search
+    never a database-wide search. Example: conditions=[{"column":"Name","text":"Bolt","match":"exact"}].
+    Supply 1–32 conditions; all must match. column is the displayed column TITLE; text is a string.
+    match: exact (default), contains, starts_with, ends_with; literal, case-insensitive by default. Ignore search
     highlighting for comparison; plain removes it in results, raw retains it. Empty text matches
     displayed emptiness. columns selects returned titles. max_rows bounds checked rows, not client
     response; max_matches bounds matches. complete covers this table; matches_truncated marks
@@ -3364,7 +3367,7 @@ def tc_send_keys(keys: list[str], key: str = None, handle: str = None) -> dict:
     toggles panels. Letters A..Z, digits, F1..F12, ENTER/ESC/TAB, arrows, HOME/END,
     PAGEUP/PAGEDOWN, INSERT/DELETE/BACKSPACE and punctuation/keypad names from list_shortcuts.
     Requires Windows, Linux/X11 or macOS and local desktop access; on a shared Windows/Linux desktop
-    1C must have focus. macOS needs Accessibility permission, sends CTRL as Command, ALT as Option, no INSERT.
+    1C must have focus. macOS needs Accessibility permission; CTRL sends Command, ALT sends Option; INSERT is unavailable.
     Successful delivery does not prove command success: read the resulting state.
     May edit data, open dialogs or close windows.
     Not text input; use input_text for text. Chords need not appear in list_shortcuts."""
@@ -3407,7 +3410,8 @@ def tc_get_user_message_texts(key: str = None, handle: str = None, open_if_close
 def tc_open_user_messages_panel(key: str = None, handle: str = None) -> dict:
     """Open key's user-message panel (active window if omitted); an open panel is left open.
     Uses Ctrl+Shift+Z: requires a local client and the addressed window active, foreground
-    on a shared desktop. Remote/inaccessible clients return a refusal. Returns opened and panel_open."""
+    on a shared Windows/Linux desktop. macOS needs Accessibility permission.
+    Remote/inaccessible clients return a refusal. Returns opened and panel_open."""
     c = _need()
     return _user_messages.panel(sys.modules[__name__], c, _winkey(c, key), keep_open=True)
 
@@ -4279,6 +4283,11 @@ def tc_get_cell_text(key: str, column: str | int, handle: str) -> dict:
     error = _column_error(c, key, column, resolved=resolved)
     if error:
         return error
+    return _read_cell_text(c, key, handle, column, resolved=resolved)
+
+
+def _read_cell_text(c, key, handle, column, *, resolved=()):
+    """Read a cell after the caller has resolved its column in this operation."""
     r = c.send_cmd(G.GET_CELL_TEXT, key, kind='read', middle=tc1c.mk_cell(column), handle=handle)
     decoded, text = tc1c.decode_cell_text(r['raw']) if r.get('ok') else (False, None)
     if not decoded:

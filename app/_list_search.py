@@ -4,6 +4,7 @@ import math
 import time
 
 import _field_batches as B
+import _keyboard
 import _row_search
 
 
@@ -65,6 +66,90 @@ class Search:
         self.check_time()
         self.S._cell_window(self.c, self.window)
 
+    def readable_fields(self, candidates):
+        readable = []
+        for candidate in candidates:
+            try:
+                before = self.call('get_edit_text', candidate).get('text')
+            except B.Failure as exc:
+                # Generated placeholders may refuse GetEditText even though the
+                # explicitly placed search addition is readable.
+                if exc.code in ('unsupported_element_type', 'unsupported_receiver'):
+                    continue
+                raise
+            if not isinstance(before, str):
+                raise B.Failure('search_text_unavailable', 'The current search text could not be read.')
+            readable.append((candidate, before))
+        return readable
+
+    def changed_window(self, active, previous_windows):
+        S, c = self.S, self.c
+        key = active.get('key')
+        if key and key not in previous_windows:
+            self.check_time()
+            forms = [o for o in S._search_objects(c, key) if o.get('class') == 'ManagedForm']
+            if (len(forms) == 1 and forms[0].get('form_name') == 'UniversalListFindExtForm'
+                    and S._collection_parent(forms[0]['key']) == key):
+                # Only the new native search dialog belongs to this operation.
+                # Never close an existing dialog or an arbitrary application form.
+                self.stage = 'close_search_dialog'
+                self.check_time()
+                S._cell_window(c, key)
+                closed = S.tc_close_window(key=key)
+                self.result['dialog_closed'] = closed.get('ok') is True
+                require(closed)
+                self.active()
+                raise B.Failure('search_dialog_required',
+                                'The table opened the advanced search dialog instead of a search string. '
+                                'The dialog was closed without entering text; search through this dialog is not supported.')
+        raise B.Failure('search_window_changed',
+                        'The active window changed while locating the search string. No text was entered; inspect the active window.',
+                        details={'active_window': key})
+
+    def external_field(self, obj, form_key):
+        S, c = self.S, self.c
+        self.stage = 'locate_search_field'
+        self.check_time()
+        objects = S._search_objects(c, form_key)
+        external = [o for o in search_fields(S, objects, None) if B.owner(S, o['key']) == form_key]
+        readable = self.readable_fields(external)
+        if not readable:
+            raise B.Failure('search_field_unavailable', 'The table has no readable standard search-string control.')
+        form = S._ref_live_object(c, form_key)
+        if not form or not form.get('handle'):
+            raise B.Failure('form_unavailable', 'The owning form is no longer available.')
+        # Fail for remote/unavailable clients before changing focus.
+        try:
+            _keyboard._local_process(c)
+        except _keyboard.KeyboardError as exc:
+            raise B.Failure(exc.code, str(exc), details=exc.details) from exc
+        self.check_time()
+        previous_windows = {o['key'] for o in S._read_open_windows(c)}
+        S._table_activate(c, obj['key'], obj['handle'], self.window)
+        self.call('send_keys', obj, keys=['CTRL', 'F'])
+        self.result['search_shortcut_sent'] = True
+        until = min(c._io_deadline, time.monotonic() + 3)
+        while True:
+            self.check_time()
+            active = require(S._window(c))
+            if active.get('key') != self.window:
+                self.changed_window(active, previous_windows)
+            focused = self.call('get_current_element', form).get('item', [])
+            if len(focused) == 1:
+                selected = next((o for o, _ in readable if o['key'] == focused[0].get('key')
+                                 and o['handle'] == focused[0].get('handle')), None)
+                if selected:
+                    self.active()  # An inactive form can report its remembered focus.
+                    B.live(S, c, selected)
+                    current = self.readable_fields([selected])
+                    if current:
+                        return current[0]
+                    raise B.Failure('search_text_unavailable', 'The focused search string is no longer readable.')
+            if time.monotonic() >= until:
+                raise B.Failure('search_field_unavailable',
+                                'The table did not focus a readable external search string. No text was entered.')
+            time.sleep(min(0.1, max(0, until - time.monotonic())))
+
     def prepare(self):
         S, c = self.S, self.c
         self.check_time()
@@ -83,25 +168,16 @@ class Search:
         if S._cell_flag(c, S.G.CURRENT_MODE_IS_EDIT, obj['key'], obj['handle']) is not False:
             raise B.Failure('row_edit_pending', 'Finish or cancel row editing before searching.')
         children = S._search_objects(c, obj['key'])
-        readable = []
-        for candidate in search_fields(S, children, obj['key']):
-            try:
-                before = self.call('get_edit_text', candidate).get('text')
-            except B.Failure as exc:
-                # With an explicitly placed addition, the generated placeholder
-                # can still be enumerated, but refuses GetEditText (status 10).
-                if exc.code in ('unsupported_element_type', 'unsupported_receiver'):
-                    continue
-                raise
-            if not isinstance(before, str):
-                raise B.Failure('search_text_unavailable', 'The current search text could not be read.')
-            readable.append((candidate, before))
-        if len(readable) != 1:
+        readable = self.readable_fields(search_fields(S, children, obj['key']))
+        if len(readable) > 1:
             raise B.Failure('search_field_unavailable', 'The table has no unique readable standard search-string control.')
-        self.field, before = readable[0]
+        if readable:
+            self.field, before = readable[0]
+            # Checks unfinished input in another table/document before focus moves.
+            S._table_activate(c, obj['key'], obj['handle'], self.window)
+        else:
+            self.field, before = self.external_field(obj, form)
         self.result.update(text_before=before, search_field=self.field.get('name'))
-        # Also checks unfinished input in another table/document before focus moves.
-        S._table_activate(c, obj['key'], obj['handle'], self.window)
 
     def check_text(self):
         self.active()
@@ -114,6 +190,8 @@ class Search:
 
     def run(self):
         self.prepare()
+        self.active()
+        B.live(self.S, self.c, self.field)
         self.stage = 'enter_search'
         self.result['input_attempted'] = True
         # A standard addition may be hidden while still accepting native InputText.

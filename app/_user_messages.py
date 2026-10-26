@@ -44,7 +44,7 @@ def panel(runtime, client, key, *, keep_open=False):
             _keyboard.send_shortcut(runtime, client, key, ('CTRL', 'SHIFT', 'Z'))
         except _keyboard.KeyboardError as exc:
             return dict(initial, reason=exc.code, error=str(exc),
-                        message='Open the panel in the addressed 1C window with Ctrl+Shift+Z, then retry. '
+                        message='The panel could not be opened automatically in the addressed 1C window. '
                                 'Unreadable messages do not mean that the action had no validation errors.')
         # Only read while waiting. A second shortcut could close a panel that opened late.
         until = min(client._io_deadline, time.monotonic() + 2)

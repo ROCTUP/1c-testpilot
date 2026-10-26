@@ -36,6 +36,7 @@ def send(request):
         raise KeyboardError('keyboard_key_unavailable', 'The macOS 1C client does not receive this key; use the form command instead.')
     cg = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
     cf = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+    cg.CGPreflightPostEventAccess.argtypes = []
     cg.CGPreflightPostEventAccess.restype = ctypes.c_bool
     cg.CGEventSourceFlagsState.argtypes = [ctypes.c_int32]
     cg.CGEventSourceFlagsState.restype = ctypes.c_uint64
@@ -46,8 +47,11 @@ def send(request):
     cg.CGEventGetFlags.argtypes = [ctypes.c_void_p]
     cg.CGEventGetFlags.restype = ctypes.c_uint64
     cg.CGEventSetFlags.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+    cg.CGEventSetFlags.restype = None
     cg.CGEventPostToPid.argtypes = [ctypes.c_int, ctypes.c_void_p]
+    cg.CGEventPostToPid.restype = None
     cf.CFRelease.argtypes = [ctypes.c_void_p]
+    cf.CFRelease.restype = None
     # Only check: CGRequestPostEventAccess would open a system prompt from a helper process.
     if not cg.CGPreflightPostEventAccess():
         raise KeyboardError('keyboard_permission_required',
@@ -62,26 +66,23 @@ def send(request):
     if not source:
         raise KeyboardError('keyboard_desktop_unavailable', 'Cannot create a keyboard event source.')
 
-    def post(down):
-        event = cg.CGEventCreateKeyboardEvent(source, code, down)
-        if not event:
-            raise KeyboardError('keyboard_failed', 'Cannot create the keyboard event.')
-        try:
-            # Keep the keypad/function flags macOS sets for the key; replace only modifiers.
-            cg.CGEventSetFlags(event, cg.CGEventGetFlags(event) & ~HELD | flags)
-            cg.CGEventPostToPid(request['pid'], event)
-        finally:
-            cf.CFRelease(event)
-
-    pressed = False
+    events = []
     try:
-        post(True)
-        pressed = True
-        time.sleep(.05)
-    finally:
+        # Prepare both events before sending: allocation failure must not leave a key down.
+        for down in (True, False):
+            event = cg.CGEventCreateKeyboardEvent(source, code, down)
+            if not event:
+                raise KeyboardError('keyboard_failed', 'Cannot create the keyboard event. No shortcut was sent.')
+            events.append(event)
+            # Keep the keypad/function flags macOS sets for the key; replace only modifiers.
+            cg.CGEventSetFlags(event, (cg.CGEventGetFlags(event) & ~HELD) | flags)
         try:
-            if pressed:
-                post(False)
-                time.sleep(.05)
+            cg.CGEventPostToPid(request['pid'], events[0])
+            time.sleep(.05)
         finally:
-            cf.CFRelease(source)
+            cg.CGEventPostToPid(request['pid'], events[1])
+            time.sleep(.05)
+    finally:
+        for event in reversed(events):
+            cf.CFRelease(event)
+        cf.CFRelease(source)

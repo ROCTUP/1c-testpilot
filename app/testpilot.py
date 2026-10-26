@@ -213,7 +213,13 @@ class Client:
                     TypeAdapter(annotation).validate_python(value, strict=True)
                 except ValidationError:
                     # ValidationError's text includes the input, possibly a password.
-                    raise TypeError(f'{action}: invalid value for parameter {name!r}') from None
+                    message = f'{action}: invalid value for parameter {name!r}'
+                    if action == 'find_rows' and name == 'conditions':
+                        message += ('. Expected a list of 1–32 objects: '
+                                    '[{"column": "Name", "text": "Bolt", "match": "exact"}]. '
+                                    'column is a nonempty displayed column title; text is a string. '
+                                    'match is optional: exact (default), contains, starts_with, ends_with.')
+                    raise TypeError(message) from None
 
     def __getattr__(self, name):
         if name in R._ACTION_GROUP:

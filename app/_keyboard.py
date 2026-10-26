@@ -53,12 +53,6 @@ def _local_process(client):
     return pid, created
 
 
-def _same_window(active_key, window_key):
-    """While the home page is shown, the main window is reported active as HomePage[same GUID]."""
-    return active_key == window_key or (
-        (window_key or '').startswith('MainFrame[') and active_key == 'HomePage' + window_key[len('MainFrame'):])
-
-
 def activate_target(runtime, client, key, handle=None):
     """Activate an addressed window/control and verify actual, not remembered, focus."""
     _local_process(client)  # Reject remote clients before changing their UI.
@@ -98,31 +92,35 @@ def activate_target(runtime, client, key, handle=None):
 
     def verify_window():
         active = runtime._window(client)
-        if not active.get('ok') or not _same_window(active.get('key'), window_key):
+        active_key = active.get('key')
+        # The main window can report its home page as the active window.
+        home_page = window_key.startswith('MainFrame[') and active_key == 'HomePage' + window_key[len('MainFrame'):]
+        if not active.get('ok') or (active_key != window_key and not home_page):
             raise KeyboardError('keyboard_window_not_active',
                                 'The addressed window did not become active. No keys were sent; inspect the active window.',
-                                expected_window=window_key, active_window=active.get('key'))
+                                expected_window=window_key, active_window=active_key)
+        return active_key
 
     activate(window_key)
-    verify_window()
+    active_window = verify_window()
     if cls == 'ManagedForm':
         activate(key, target['handle'])
-        verify_window()
+        active_window = verify_window()
     elif control:
         activate(key, target['handle'])
         verify_window()
         if runtime._input_current(client, form) != key:
             raise KeyboardError('keyboard_focus_not_confirmed',
                                 'The addressed control did not receive focus. No keys were sent; inspect the current element.')
-        verify_window()  # An inactive form can report its remembered current element.
-    return window_key
+        active_window = verify_window()  # An inactive form can report its remembered current element.
+    return active_window
 
 
 def send_shortcut(runtime, client, window_key, keys):
     keys = combination(keys)
     pid, created = _local_process(client)
     active = runtime._window(client)
-    if not active.get('ok') or not _same_window(active.get('key'), window_key):
+    if not active.get('ok') or active.get('key') != window_key:
         raise KeyboardError('keyboard_window_not_active', 'Activate the addressed 1C window before sending a shortcut.',
                             expected_window=window_key, active_window=active.get('key'))
     request = dict(pid=pid, created=created, keys=keys, title=active.get('title') or '')

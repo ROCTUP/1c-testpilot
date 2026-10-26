@@ -2,6 +2,7 @@
 import re
 import sys
 import time
+from collections import Counter
 
 import _code_execution as execution
 import tc1c
@@ -79,10 +80,14 @@ class Reader:
         if self.R._guid_available(self.c, self.R.G.GET_CURRENT_ROW):
             return bool(self.call('get_current_row')['row'])
         # A successful, non-null cell read proves a current row, including empty text.
-        for column in self.R._table_columns(self.c, self.key):
+        columns = self.R._table_columns(self.c, self.key)
+        names = Counter(column['name'] for column in columns)
+        for column in columns:
             self.check_time()
+            if names[column['name']] != 1:
+                self.fail('ambiguous_column', 'Use a column element name returned by find_objects for this table.')
             try:
-                value = self.R.tc_get_cell_text(self.key, handle=self.handle, column=column['name'])
+                value = self.R._read_cell_text(self.c, self.key, self.handle, column['name'], resolved=[column])
             except tc1c.OperationError as exc:
                 if exc.status not in (11, 13):
                     raise
