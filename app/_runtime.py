@@ -3363,7 +3363,8 @@ def tc_send_keys(keys: list[str], key: str = None, handle: str = None) -> dict:
     keys: zero or more CTRL/SHIFT/ALT modifiers followed by one key, e.g. ["CTRL","SHIFT","BACKQUOTE"]
     toggles panels. Letters A..Z, digits, F1..F12, ENTER/ESC/TAB, arrows, HOME/END,
     PAGEUP/PAGEDOWN, INSERT/DELETE/BACKSPACE and punctuation/keypad names from list_shortcuts.
-    Requires Windows or Linux/X11 and local desktop access; on a shared desktop 1C must have focus.
+    Requires Windows, Linux/X11 or macOS and local desktop access; on a shared Windows/Linux desktop
+    1C must have focus. macOS needs Accessibility permission, sends CTRL as Command, ALT as Option, no INSERT.
     Successful delivery does not prove command success: read the resulting state.
     May edit data, open dialogs or close windows.
     Not text input; use input_text for text. Chords need not appear in list_shortcuts."""
