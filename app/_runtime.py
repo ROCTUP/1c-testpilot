@@ -7048,7 +7048,8 @@ def tc_add_rows(key: str, handle: str, rows: _batches.RowEntries) -> dict:
 def tc_set_row_values(key: str, handle: str, cells: _batches.CellEntries) -> dict:
     """Fill 1..100 cells of the current row: {column: element NAME, text} or {column, checked}.
     Matching checkboxes are not toggled. Continues editing, finishes once after all entries, then
-    reads back. Refusal/unexpected editor stops with earlier edits preserved for completion/cancel.
+    reads back. Checkbox-only updates can remain outside row editing when applied immediately.
+    Refusal/unexpected editor stops with earlier edits preserved for completion/cancel.
     completed counts entries; edit_finished confirms row completion; final_verified=null may mean
     numeric equivalence. Results use 0-based input order. Does not add rows, alter selection or
     save."""
