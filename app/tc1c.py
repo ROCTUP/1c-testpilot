@@ -1439,6 +1439,22 @@ def _set_percall(frame, guid_le):
     pos = _percall_pos(frame)
     return frame if pos is None else frame[:pos] + guid_le + frame[pos+16:]
 
+def _current_user_name():
+    """Resolve the handshake identity when Windows environment names are absent."""
+    import getpass
+    try:
+        return getpass.getuser()
+    except (OSError, ImportError):
+        if os.name != 'nt':
+            raise
+        import ctypes
+        value = ctypes.create_unicode_buffer(257)
+        size = ctypes.c_ulong(len(value))
+        if not ctypes.windll.advapi32.GetUserNameW(value, ctypes.byref(size)):
+            raise ctypes.WinError()
+        return value.value
+
+
 # ---------- клиент ----------
 class TestClient:
     def __init__(self, host='127.0.0.1', port=1538):
@@ -1657,11 +1673,10 @@ class TestClient:
     def connect(self, retries=20):
         """Рукопожатие строится программно (build_scom/intro_ticket/build_session_frame):
         intro -> при необходимости NTLM -> установка сессии."""
-        import os, getpass
         self.close()
         self._interrupted = False
         pc = (os.environ.get('COMPUTERNAME') or socket.gethostname()).strip()
-        user = getpass.getuser()
+        user = _current_user_name()
         ver = self.platform_version or self.DEFAULT_VER
         conn_guid = _SCOM_CONN; sub_guid = _SCOM_SUB   # ФИКСИРОВАННЫЕ (не случайные!)
         num = [22548]
