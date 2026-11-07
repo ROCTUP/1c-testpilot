@@ -6532,8 +6532,8 @@ def _possibly_rounded(wanted, actual):
         return any(left.quantize(unit, rounding=mode) == right for mode in (ROUND_HALF_UP, ROUND_HALF_EVEN))
 
 
-def _verify_empty_cell(c, key, handle, col, window):
-    """Read the committed value behind conditional text, then cancel only our readback edit.
+def _read_cell_editor_text(c, key, handle, col, window):
+    """Read committed editor text behind formatting, then cancel only our readback edit.
 
     Verification is excluded from both recording modes: replay needs the accepted input,
     not another edit/cancel cycle. Native fragments before and after it remain intact.
@@ -6548,7 +6548,7 @@ def _verify_empty_cell(c, key, handle, col, window):
     current()
     if _cell_flag(c, G.CURRENT_MODE_IS_EDIT, key, handle) is not False:
         raise _CellEditFailure('The row must be out of edit mode before verifying its empty value.')
-    mark = _native_composite_begin(c, 'verify_empty_cell')
+    mark = _native_composite_begin(c, 'verify_cell_editor_text')
     track, observations = c._track, _state.get('rec_obs')
     attempted = False
     try:
@@ -6559,7 +6559,7 @@ def _verify_empty_cell(c, key, handle, col, window):
         if _cell_flag(c, G.CURRENT_MODE_IS_EDIT, key, handle) is not True:
             raise _CellEditFailure('The cell editor is unavailable for verification.')
         r = tc_get_data_presentation(col['key'], col['handle'])
-        return r.get('ok') and r.get('presentation') == ''
+        return r.get('presentation') if r.get('ok') else None
     finally:
         try:
             if attempted:
@@ -6575,12 +6575,16 @@ def _verify_empty_cell(c, key, handle, col, window):
                         raise _CellEditFailure('The row edit mode is unavailable after verification.')
                 except Exception as exc:
                     raise _CellEditFailure(
-                        'Empty-cell verification could not restore the editor state; inspect the current window.',
+                        'Cell-value verification could not restore the editor state; inspect the current window.',
                         {'code': 'verification_cleanup_failed', 'edit_mode': None}) from exc
         finally:
             c._track, _state['rec_obs'] = track, observations
             if mark is not None:
-                _native_composite_end(c, mark, 'verify_empty_cell')
+                _native_composite_end(c, mark, 'verify_cell_editor_text')
+
+
+def _verify_empty_cell(c, key, handle, col, window):
+    return _read_cell_editor_text(c, key, handle, col, window) == ''
 
 
 @_action('tc_table')
@@ -6588,7 +6592,9 @@ def tc_set_cell_text(key: str, column: str, text: str, handle: str) -> dict:
     """Set current-row column by element NAME; manages focus, continues existing row edits, finishes
     without discarding other cells, then reads back. Empty text clears. Returns verified/changed and
     displayed value_before/value_after; empty_value confirms emptiness despite formatting;
-    numeric_equivalent may give verified=null. row_edit_pending means validation/reference choice
+    numeric_equivalent may give verified=null. A hidden zero is read from the committed editor;
+    editor_value records that text, and numeric_editor_equivalent may also give verified=null.
+    row_edit_pending means validation/reference choice
     kept editing: continue at the returned editor or end_edit_row(cancel=true).
     value_verification_inconclusive means editing finished but rounded output prevents exact
     verification."""
@@ -6670,6 +6676,18 @@ def tc_set_cell_text(key: str, column: str, text: str, handle: str) -> dict:
                 result.pop('error', None)
                 result.update(ok=True, verified=True, verification='empty_value')
                 return result
+        if after == '' and _numeric_value(text) == 0:
+            stage = 'verify_zero'
+            committed = _read_cell_editor_text(c, key, handle, col, window)
+            result = _cell_result(key, before, after, text, 'done')
+            if committed == text or _numeric_equivalent(text, committed):
+                exact = committed == text
+                result.pop('error', None)
+                result.update(ok=True, verified=True if exact else None, editor_value=committed,
+                              verification='editor_value' if exact else 'numeric_editor_equivalent')
+                if not exact:
+                    result['message'] = 'The committed editor text is numerically equivalent; exact text is not verified.'
+            return result
         return _cell_result(key, before, after, text, 'done')
     except _CellEditFailure as exc:
         result = _cell_result(key, before, after, text, stage, str(exc))
