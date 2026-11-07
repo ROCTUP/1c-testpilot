@@ -3148,8 +3148,8 @@ def _winkey(c, key=None):
         return key
     window = _window(c)
     k = window['key']
-    if window.get('code') == 'no_active_work_window':
-        # Application navigation belongs to the main window when only the helper is active.
+    if not k and not window.get('native') and window.get('code') in (None, 'no_active_work_window'):
+        # A connected client can expose its main window before any work window is active.
         mains = [w for w in _read_open_windows(c) if w.get('class') == 'MainFrame'
                  and not _code_execution.protected(c, w.get('key'))]
         if len(mains) == 1:
