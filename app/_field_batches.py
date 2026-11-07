@@ -633,6 +633,7 @@ def write(S, entries=None, key=None, handle=None, cells=None):
         out['edit_finished'] = None
     mark, current, window = None, None, None
     record_token = None
+    immediate_checks = False
     try:
         with observations(c):
             if row:
@@ -657,6 +658,7 @@ def write(S, entries=None, key=None, handle=None, cells=None):
                 if mode is None:
                     raise Failure('edit_state_unavailable', 'The row edit mode could not be read.')
                 out['edit_finished'] = not mode
+                immediate_checks = mode is False and all('checked' in obj for obj in objects)
         mark = begin_record(S, c, action)
         if mark is not None:
             record_token = _NATIVE_RECORD_OWNER.set(c)
@@ -683,12 +685,12 @@ def write(S, entries=None, key=None, handle=None, cells=None):
                 out['edit_finished'] = None if mode is None else not mode
                 if [o.get('key') for o in selected.get('item', [])] != [obj['key']]:
                     raise Failure('column_not_current', 'The form focused another column. Inspect the current editor.')
-                if mode is False and current['index'] == 0:
+                if mode is False and current['index'] == 0 and not immediate_checks:
                     out['edit_finished'] = None
                     require_result(S.tc_change_row(key, handle))
                     mode = S._cell_flag(c, S.G.CURRENT_MODE_IS_EDIT, key, handle)
                 out['edit_finished'] = None if mode is None else not mode
-                if mode is not True:
+                if mode is not True and not (immediate_checks and mode is False):
                     raise Failure('row_edit_interrupted', 'Row editing did not start or was interrupted. Inspect the table.')
             current['status'] = 'attempted'
             if 'select' in obj:
@@ -709,7 +711,8 @@ def write(S, entries=None, key=None, handle=None, cells=None):
                     selected = S.tc_get_current_item(key, handle)
                     mode = S._cell_flag(c, S.G.CURRENT_MODE_IS_EDIT, key, handle)
                     out['edit_finished'] = None if mode is None else not mode
-                    if [o.get('key') for o in selected.get('item', [])] != [obj['key']] or mode is not True:
+                    accepted_mode = mode is True or (immediate_checks and mode is False)
+                    if [o.get('key') for o in selected.get('item', [])] != [obj['key']] or not accepted_mode:
                         raise Failure('row_edit_interrupted', 'The editor changed while entering text. Inspect the table.')
                     actual = read_property(S, c, obj, 'text' if 'checked' in obj else 'edit_text')
                     checked(S, current, obj, actual)
@@ -723,7 +726,10 @@ def write(S, entries=None, key=None, handle=None, cells=None):
         current = None
         if row:
             out['edit_finished'] = None
-            require_result(S.tc_end_edit_row(key, handle))
+            with observations(c):
+                mode = S._cell_flag(c, S.G.CURRENT_MODE_IS_EDIT, key, handle)
+            if mode is True:
+                require_result(S.tc_end_edit_row(key, handle))
             with observations(c):
                 S._cell_window(c, window)
                 mode = S._cell_flag(c, S.G.CURRENT_MODE_IS_EDIT, key, handle)
